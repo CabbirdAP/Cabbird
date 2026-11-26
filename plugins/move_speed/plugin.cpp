@@ -253,9 +253,21 @@ void RememberPlayer(const std::uintptr_t handle) noexcept {
 }
 
 // Ask the host which entity it resolved as the controlled player.  Runs from `Update` (the game
-// domain, once per frame), never from the scaling detour: a host call 1400 times a second would
-// cost more than the feature is worth.
+// domain, never from the scaling detour: a host call 1400 times a second would cost more than the
+// feature is worth).
+//
+// NOT EVERY FRAME once the id is known.  `snapshot()` takes the adapter's state mutex and renews
+// a 250 ms demand window, and the entity walk takes that same mutex -- calling it 60 times a
+// second only to re-learn a number that changes when the player switches characters is work with
+// no answer behind it.  Once a value is held it is refreshed about twice a second; while nothing
+// is held every frame is tried, because that is the start of the session and the id is what the
+// feature is waiting for.
 void RefreshPlayerFromHost() noexcept {
+    static std::uint64_t s_tick = 0;
+    ++s_tick;
+    const bool known = g_player_entity_id.load(std::memory_order_relaxed) != 0;
+    if (known && (s_tick % 30) != 0) return;
+
     const CabbirdUnityPlayerServiceV1* const service = g_player;
     if (service == nullptr || service->snapshot == nullptr) return;
     CabbirdUnityPlayerSnapshotV1 snapshot{};

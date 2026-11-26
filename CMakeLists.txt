@@ -1533,6 +1533,19 @@ cabbird_add_plugin(cabbird_move_speed
     PACKAGE_NAME MoveSpeed)
 
 # ---------------------------------------------------------------------------
+# Story Tools -- skip / speed / auto-choice for the story systems.
+#
+# Every feature is a behavioural override on a method the game already calls, rather than an
+# invoke into objects the plugin cannot name a path to: `StoryManager` has no singleton accessor,
+# and `StorySection` / `BranchFragment` are components created per story.  A detour receives
+# `this` in RCX, so the instance is captured for free and the plugin can also decide the answer.
+# ---------------------------------------------------------------------------
+cabbird_add_plugin(cabbird_story_tools
+    SOURCES plugins/story_tools/plugin.cpp
+    MANIFEST plugins/story_tools/manifest.json
+    PACKAGE_NAME StoryTools)
+
+# ---------------------------------------------------------------------------
 # Entity Teleport -- move ANY entity, not just the local player.
 #
 # It composes `cabbird.unity.entities` (which entity, and its data address) with
