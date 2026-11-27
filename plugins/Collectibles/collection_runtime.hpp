@@ -428,7 +428,7 @@ public:
         failure_.clear();
         return true;
     }
-    bool BeginScan(const Runtime& runtime, bool chests, bool collections) {
+    bool BeginScan(const Runtime& runtime, bool chests, bool collections, bool skipCompleteChests) {
         Object *world{}, *map{}, *local{}, *manager{};
         if (!WorldState(runtime, world, map, local, manager)) return false;
         std::int32_t worldId{};
@@ -441,6 +441,7 @@ public:
         if (collections) scanKinds_.insert(scanKinds_.end(), collections_.begin(), collections_.end());
         stats_.kinds = scanKinds_;
         collectCatalog_ = collections;
+        skipCompleteChests_ = skipCompleteChests;
         catalog_.Begin();
         scanChests_ = chests;
         loadedPickups_.clear(); loadedChests_.clear(); loadedChestIndex_.clear(); loadedChestMerge_ = 0;
@@ -514,10 +515,9 @@ public:
                 if (completion == CompletionState::Unavailable) return ScanError("ServerMap.GetObjectServerCompleteState unavailable");
                 if (completion == CompletionState::Complete) {
                     ++stats_.kinds[scanKind_].complete;
-                    // Chest lifecycle completion can coexist with a visible,
-                    // unopened reward action. Keep it until the exact native
-                    // action and this request's reward response are checked.
-                    if (!target.chest) { ++stats_.completeExcluded; continue; }
+                    // A completed object is already collected or opened. Completed chests are
+                    // normally empty registrations, so they are dropped unless the caller keeps them.
+                    if (!target.chest || skipCompleteChests_) { ++stats_.completeExcluded; continue; }
                 }
                 if (completion == CompletionState::Unknown) ++stats_.kinds[scanKind_].unknown;
                 target.completion = completion;
@@ -1195,6 +1195,7 @@ private:
     mutable std::string failure_;
     mutable std::string interactionDetails_;
     mutable bool lastHitCollection_{};
+    bool skipCompleteChests_{true};
     mutable CabbirdIl2CppGCHandleV1 puzzleGraphs_{}, puzzleNodes_{}, puzzleSelected_{}, puzzleSelectedGraph_{}, puzzleOwner_{};
     mutable std::vector<CabbirdIl2CppGCHandleV1> puzzleChildren_;
     mutable std::unordered_set<std::uintptr_t> puzzleVisited_;

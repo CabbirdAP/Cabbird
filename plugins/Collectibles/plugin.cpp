@@ -22,18 +22,26 @@ using namespace collectibles;
 using Json = nlohmann::json;
 using Clock = std::chrono::steady_clock;
 constexpr auto kConfig = "settings";
-constexpr auto kSchema = R"({"type":"object","required":["chests","collections","settleSeconds"],"additionalProperties":false,"properties":{"chests":{"type":"integer","minimum":0,"maximum":1},"collections":{"type":"integer","minimum":0,"maximum":1},"settleSeconds":{"type":"number","minimum":0.2,"maximum":3},"page":{"type":"integer","minimum":0,"maximum":1000000},"categories":{"type":"array","items":{"type":"integer","minimum":0},"maxItems":64}}})";
+constexpr auto kSchema = R"({"type":"object","required":["chests","collections","settleSeconds"],"additionalProperties":false,"properties":{"chests":{"type":"integer","minimum":0,"maximum":1},"collections":{"type":"integer","minimum":0,"maximum":1},"settleSeconds":{"type":"number","minimum":0.2,"maximum":3},"page":{"type":"integer","minimum":0,"maximum":1000000},"categories":{"type":"array","items":{"type":"integer","minimum":0},"maxItems":64},"readySeconds":{"type":"number","minimum":4,"maximum":30},"skipCompleteChests":{"type":"integer","minimum":0,"maximum":1},"startIndex":{"type":"integer","minimum":1,"maximum":1000000}}})";
 struct Settings {
     int chests{1}, collections{1};
     float settleSeconds{.8f};
+    // How long a target gets to become interactable after arrival, so a slow AOI load is not skipped.
+    float readySeconds{10.f};
+    // Keep completed chests in the route (they are usually already-opened, empty registrations).
+    int skipCompleteChests{1};
+    // 1-based queue position the next start begins at.
+    std::uint32_t startIndex{1};
     std::uint32_t page{};
     // Enabled collection categories (TDWorldCollectingType ids). Empty means "every category".
     std::vector<std::int32_t> categories;
 
     bool operator==(const Settings&) const = default;
 };
-void to_json(Json& j, const Settings& s) { j = {{"chests",s.chests},{"collections",s.collections},{"settleSeconds",s.settleSeconds},{"page",s.page},{"categories",s.categories}}; }
-void from_json(const Json& j, Settings& s) { j.at("chests").get_to(s.chests); j.at("collections").get_to(s.collections); j.at("settleSeconds").get_to(s.settleSeconds); s.page = j.value("page", 0u);
+void to_json(Json& j, const Settings& s) { j = {{"chests",s.chests},{"collections",s.collections},{"settleSeconds",s.settleSeconds},{"readySeconds",s.readySeconds},{"skipCompleteChests",s.skipCompleteChests},{"startIndex",s.startIndex},{"page",s.page},{"categories",s.categories}}; }
+void from_json(const Json& j, Settings& s) { j.at("chests").get_to(s.chests); j.at("collections").get_to(s.collections); j.at("settleSeconds").get_to(s.settleSeconds); s.readySeconds = j.value("readySeconds", 10.f);
+    s.skipCompleteChests = j.value("skipCompleteChests", 1);
+    s.startIndex = j.value("startIndex", 1u); s.page = j.value("page", 0u);
     s.categories.clear();
     if (const auto found = j.find("categories"); found != j.end() && found->is_array())
         for (const auto& id : *found) if (id.is_number_integer()) s.categories.push_back(id.get<std::int32_t>()); }
@@ -41,6 +49,8 @@ bool Valid(const Settings& s) {
     if (s.categories.size() > 64) return false;
     return (s.chests == 0 || s.chests == 1) && (s.collections == 0 || s.collections == 1) &&
         std::isfinite(s.settleSeconds) && s.settleSeconds >= .2f && s.settleSeconds <= 3 &&
+        std::isfinite(s.readySeconds) && s.readySeconds >= 4 && s.readySeconds <= 30 &&
+        (s.skipCompleteChests == 0 || s.skipCompleteChests == 1) && s.startIndex >= 1 && s.startIndex <= 1000000 &&
         s.page <= 1000000;
 }
 bool CategoryEnabled(const Settings& settings, const Target& target) {
@@ -64,6 +74,8 @@ struct Model {
     bool scanValid{};
     // Targets walked past because their category is switched off; the progress line subtracts them.
     std::uint32_t filtered{};
+    // List position (0-based) the run started at, so the visible number matches the list.
+    std::size_t listStart{};
     std::vector<CategoryRow> categories;
     bool operator==(const Model&) const = default;
 };
@@ -81,6 +93,9 @@ struct Context {
     const CabbirdUnityPlayerServiceV1* player{};
     const CabbirdUnityPlayerTeleportServiceV1* teleport{};
     ConfigSaveQueue saves;
+    // One-shot teleport request raised by a row button, resolved on the game thread.
+    std::atomic<bool> manualRequested{false};
+    std::atomic<std::int32_t> manualTarget{0};
     CabbirdGenerationHandleV1 window{};
     Settings settings;
     Collector collector;
@@ -341,7 +356,7 @@ CabbirdStatusV1 Execute(Work& work, const CabbirdIl2CppApiV1& api) {
     }
     if (work.command == Command::Scan) {
         const auto settings = c.options.load();
-        if (!c.collector.BeginScan(runtime, settings->chests != 0, settings->collections != 0)) {
+        if (!c.collector.BeginScan(runtime, settings->chests != 0, settings->collections != 0, settings->skipCompleteChests != 0)) {
             Fail(c, Failure::Scan);
             return Status(CABBIRD_STATUS_V1_UNAVAILABLE);
         }
@@ -382,15 +397,27 @@ CabbirdStatusV1 Execute(Work& work, const CabbirdIl2CppApiV1& api) {
             Fail(c, Failure::Scene);
             return Status(CABBIRD_STATUS_V1_UNAVAILABLE);
         }
-        // A fresh scan always starts from the top; so does a run whose category selection changed,
-        // because the old progress described a different set of targets.
-        if (c.game.phase == Phase::Ready || c.runCategories != c.settings.categories) {
+        // A run that is not being resumed begins at the configured target number, counted in the
+        // list the user sees (the category filter decides which targets that list holds).
+        const bool fresh = c.game.phase != Phase::Stopped && c.game.phase != Phase::Unavailable ||
+            c.runCategories != c.settings.categories;
+        if (fresh) {
+            if (c.viewDirty || c.viewRevision != c.queueRevision) RebuildView(c);
             c.game.visited = 0;
+            c.game.listStart = 0;
+            const auto position = c.settings.startIndex > 0 ? c.settings.startIndex - 1 : 0;
+            if (position < c.view.size() && !c.view.empty() && !c.queue.empty()) {
+                const auto index = static_cast<std::size_t>(c.view[position] - c.queue.data());
+                if (index < c.queue.size()) { c.game.visited = index; c.game.listStart = position; }
+            }
             c.game.completed = c.game.skipped = c.game.unknownSkipped = 0;
             c.runCategories = c.settings.categories;
         }
         // The selection only decides what the route runs; the scan and the queue stay complete.
-        c.game.filtered = 0;
+        // "filtered" counts skipped targets so that visited - filtered is the position in the list;
+        // starting at a later list position means the disabled targets before it already count.
+        c.game.filtered = c.game.visited > c.game.listStart
+            ? static_cast<std::uint32_t>(c.game.visited - c.game.listStart) : 0;
         c.game.phase = c.game.visited < c.queue.size() ? Phase::Moving : Phase::Complete;
         c.game.failure = Failure::None;
         c.lastFailure.clear();
@@ -507,7 +534,8 @@ CabbirdStatusV1 Execute(Work& work, const CabbirdIl2CppApiV1& api) {
                 target.route = RouteState::Waiting; Changed(c, c.game.visited);
                 c.settled = now + std::chrono::duration_cast<Clock::duration>(
                     std::chrono::duration<double>(c.options.load()->settleSeconds));
-                c.deadline = now + std::chrono::seconds(10);
+                c.deadline = now + std::chrono::duration_cast<Clock::duration>(
+                    std::chrono::duration<double>(c.options.load()->readySeconds));
             }
         }
         if (now >= c.deadline) SkipTarget(c, RouteState::Skipped, "player-teleport.state confirmation timeout");
@@ -610,7 +638,9 @@ void CABBIRD_CALL Update(void* raw, double) noexcept {
             c.queue.clear(); ClearResults(c); c.game = {}; c.viewDirty = true; ++c.queueRevision;
             c.collector.ResetScanReport(); c.scanLogPending = true;
         }
-        if (command == Command::None && !Executing(c.game.phase)) { Publish(c); return; }
+        // A pending manual teleport has to get past this idle shortcut, because it is handled below
+        // and does not go through the route state machine.
+        if (command == Command::None && !Executing(c.game.phase) && !c.manualRequested.load()) { Publish(c); return; }
         if (!c.collector.Available()) { Fail(c, Failure::Profile); ScanLog(c); Publish(c); return; }
         CabbirdUnityPlayerSnapshotV1 player{sizeof(player)};
         const auto playerStatus = c.player->snapshot(c.player->user, &player);
@@ -618,7 +648,10 @@ void CABBIRD_CALL Update(void* raw, double) noexcept {
             // The player entity is briefly unavailable around a teleport and while the scene streams.
             // Only a phase that already ran past its own deadline ends the route; otherwise retry.
             const auto now = Clock::now();
-            const bool transient = c.deadline == Clock::time_point{} || now < c.deadline;
+            // A snapshot that fails right at a deadline expiry is a race with the phase that was
+            // about to end, not a broken player service, so keep a short grace period.
+            const bool transient = c.deadline == Clock::time_point{} ||
+                now < c.deadline + std::chrono::seconds(2);
             if (transient) {
                 if (command != Command::None) c.command.store(command, std::memory_order_release);
                 Publish(c);
@@ -626,6 +659,34 @@ void CABBIRD_CALL Update(void* raw, double) noexcept {
             }
             c.collector.CancelScan(c.il2cpp);
             Fail(c, Failure::Player, StatusDetail("player.snapshot", playerStatus)); ScanLog(c); Publish(c); return;
+        }
+        if (c.manualRequested.exchange(false)) {
+            const auto requested = c.manualTarget.exchange(0);
+            // A manual teleport wins over the running route: stop it first so the state machine
+            // cannot pull the player straight back to its own target.
+            if (Executing(c.game.phase)) {
+                c.hold.End();
+                static_cast<void>(c.collector.CancelInteraction(c.il2cpp));
+                c.game.phase = Phase::Stopped;
+                c.deadline = {};
+            }
+            const auto found = std::find_if(c.queue.begin(), c.queue.end(),
+                [&](const Target& item) { return item.mapId == requested; });
+            // Only failures are worth a log line: a successful manual teleport is visible on screen.
+            std::string failure;
+            if (found == c.queue.end()) failure = "not in queue";
+            else if (!c.teleport) failure = "teleport service unavailable";
+            else {
+                CabbirdUnityPlayerWriteRequestV1 request{sizeof(request)};
+                request.entity_id = player.entity_id;
+                std::copy(found->position.begin(), found->position.end(), request.position);
+                const auto status = c.teleport->teleport(c.teleport->user, &request);
+                if (!Succeeded(status)) failure = "failed=" + std::to_string(status.code);
+            }
+            if (!failure.empty() && c.core && c.core->log) {
+                const std::string detail = "manual teleport rejected: " + failure;
+                c.core->log(c.core->user, CABBIRD_CORE_LOG_LEVEL_V1_WARNING, StringView(detail));
+            }
         }
         Work work{&c, player, command};
         if (!Succeeded(c.il2cpp->with_runtime(c.il2cpp->user, RuntimeEntry, &work)) &&
@@ -709,6 +770,11 @@ void CABBIRD_CALL Draw(void* raw, const CabbirdUiServiceV1*) noexcept {
         c.ui->checkbox(c.ui->user, StringView(c.text.Text("settings.chests", "Chests")), &c.settings.chests);
         c.ui->checkbox(c.ui->user, StringView(c.text.Text("settings.collections", "Collectibles")), &c.settings.collections);
         c.ui->slider_float(c.ui->user, StringView(c.text.Text("settings.settle", "Wait after teleport (seconds)")), &c.settings.settleSeconds, .2f, 3);
+        c.ui->slider_float(c.ui->user, StringView(c.text.Text("settings.ready", "Wait until the target is interactable (seconds)")), &c.settings.readySeconds, 4, 30);
+        // Only meaningful while chest scanning is on.
+        if (c.settings.chests != 0)
+            c.ui->checkbox(c.ui->user, StringView(c.text.Text("settings.skip_complete_chests", "Skip chests already marked complete")), &c.settings.skipCompleteChests);
+        c.ui->input_uint32(c.ui->user, StringView(c.text.Text("settings.start_index", "Start at target number")), &c.settings.startIndex, 1, 10);
         if (model && !model->categories.empty()) {
             c.ui->text(c.ui->user, StringView(c.text.Text("settings.categories",
                 "Collectible categories (all selected by default)")));
@@ -743,14 +809,19 @@ void CABBIRD_CALL Draw(void* raw, const CabbirdUiServiceV1*) noexcept {
         if (c.ui->button_enabled(c.ui->user, StringView(c.text.Text("action.stop", "Stop")), 0, 0, busy))
             { c.hold.Cancel(); c.command.store(Command::Stop); }
 
+
         if (model && (model->total || model->phase == Phase::Ready)) {
             if (!model->scanValid) c.ui->text(c.ui->user, StringView(c.text.Text("queue.map_invalid", "The map changed or scanning did not finish. Scan again before continuing.")));
+            const auto visitedCount = model->visited > model->filtered ? model->visited - model->filtered : 0;
             const std::string total = std::to_string(model->total), completed = std::to_string(model->completed),
                 skipped = std::to_string(model->skipped),
-                visited = std::to_string(model->visited > model->filtered ? model->visited - model->filtered : 0),
-                unknown = std::to_string(model->unknownSkipped);
-            const std::string_view args[]{total, visited, completed, skipped, unknown};
-            c.ui->text(c.ui->user, StringView(c.text.Format("queue.progress", "{0} targets; {1} visited; {2} rewards confirmed; {3} skipped ({4} unknown-state timeouts)", args)));
+                visited = std::to_string(visitedCount),
+                unknown = std::to_string(model->unknownSkipped),
+                // 1-based position in the list the user sees, so the run has a visible place.
+                current = std::to_string(std::min<std::uint32_t>(visitedCount + 1, model->total ? model->total : 1));
+            const std::string_view args[]{total, visited, completed, skipped, unknown, current};
+            c.ui->text(c.ui->user, StringView(c.text.Format("queue.progress",
+                "{0} targets; current #{5}; {1} visited; {2} rewards confirmed; {3} skipped ({4} unknown-state timeouts)", args)));
         }
         const auto results = c.results.load();
         if (results && results->total) {
@@ -759,7 +830,7 @@ void CABBIRD_CALL Draw(void* raw, const CabbirdUiServiceV1*) noexcept {
             const std::string pageNumber = std::to_string(page + 1), pageCount = std::to_string(results->pages.size());
             const std::string_view pageArgs[]{pageNumber, pageCount};
             c.ui->text(c.ui->user, StringView(c.text.Format("table.page", "Page {0}/{1}", pageArgs)));
-            if (c.ui->begin_table(c.ui->user, StringView("collectibles-results"), 7, CABBIRD_UI_TABLE_V1_SIZING_STRETCH_PROP, 0, 0)) {
+            if (c.ui->begin_table(c.ui->user, StringView("collectibles-results"), 8, CABBIRD_UI_TABLE_V1_SIZING_STRETCH_PROP, 0, 0)) {
                 const auto cell = [&](std::string_view text) {
                     c.ui->table_next_column(c.ui->user);
                     if (c.ui->text_wrapped) c.ui->text_wrapped(c.ui->user, StringView(text));
@@ -770,6 +841,7 @@ void CABBIRD_CALL Draw(void* raw, const CabbirdUiServiceV1*) noexcept {
                 cell(c.text.Text("table.position", "World coordinates")); cell(c.text.Text("table.completion", "Completion"));
                 cell(c.text.Text("table.result", "Route result"));
                 cell(c.text.Text("table.source", "Source"));
+                cell(c.text.Text("table.action", "Action"));
                 static const ResultPage emptyPage;
                 const auto& rows = results->pages[page] ? *results->pages[page] : emptyPage;
                 for (const auto& target : rows) {
@@ -779,6 +851,15 @@ void CABBIRD_CALL Draw(void* raw, const CabbirdUiServiceV1*) noexcept {
                     cell(CompletionText(c, target.completion)); cell(RouteText(c, target.route));
                     cell(target.official ? c.text.Text("source.catalog", "Catalog") : target.nativePickup != PickupKind::None || target.livePosition
                         ? c.text.Text("source.loaded", "Loaded interaction") : c.text.Text("source.map", "Map"));
+                    c.ui->table_next_column(c.ui->user);
+                    // Each row needs its own widget id, otherwise the repeated label collapses to one id.
+                    const std::string teleportLabel = std::string(c.text.Text("action.teleport", "Teleport")) +
+                        "##teleport" + std::to_string(target.mapId);
+                    if (c.ui->button_enabled(c.ui->user, StringView(teleportLabel), 0, 0, true)) {
+                        c.manualTarget.store(target.mapId);
+                        c.manualRequested.store(true);
+                    }
+
                 }
                 c.ui->end_table(c.ui->user);
             }
