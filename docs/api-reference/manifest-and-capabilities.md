@@ -85,13 +85,17 @@ Schema 是 `additionalProperties: false`——多写一个字段就是 `SchemaVi
 unity-il2cpp   unity-metadata commands       configuration  diagnostics    ipc            game-events
 interop-hook   interop-patch  interop-signature             memory-read    memory-write
 notifications  runtime-info   scheduler      storage        input          ui-font
-ui-texture     ui-window      unity-overlay  unity-entities unity-player-snapshot
+ui-texture     ui-window      ui-overlay     unity-overlay  unity-entities unity-player-snapshot
 unity-player-teleport         unity-player-motion          unity-transform               unity-dump     ui
 json           websocket     web
 ```
 
 写了集合外的值 → `UnknownCapability` 审计，**不会被授予**，而且整个授权会被标记为不可执行。
 `websocket` 对应本机广播，`web` 对应带会话令牌的本机网页应用；它们都是与游戏无关的平台能力。
+`ui-overlay` 让启用插件在设置窗口关闭后仍收到 Render 域的 `on_draw`，用于绘制屏幕状态条等持续叠加层。
+窗口隐藏期间，`begin_window` 返回 0，配对的 `end_window` 不打开或关闭宿主窗口；屏幕叠加层照常绘制。
+关闭窗口不停止叠加层，停用插件才停止绘制。
+该能力不提供额外服务表，也不绕过宿主的隐藏全部界面开关。
 `game-events` 现在也不对应任何服务表：它曾经是 `cabbird.unity.framework` /
 `.process-event` 的 capability，而那两个服务是从上游 UE5 搬来、本仓库从未发布的声明，
 已删除（见 [Unity 服务](unity-services.md)）。`on_update` 回调不经过 capability 检查，

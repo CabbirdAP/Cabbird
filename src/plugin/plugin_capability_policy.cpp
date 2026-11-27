@@ -42,6 +42,7 @@ constexpr auto kKnownCapabilities = std::to_array<std::string_view>({
     "ui-font",
     "ui-texture",
     "ui-window",
+    "ui-overlay",
     "unity-overlay",
     "unity-entities",
     /* Reading the local player's world position.  IT NO LONGER INCLUDES MOVING IT: the write

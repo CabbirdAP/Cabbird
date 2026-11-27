@@ -501,6 +501,9 @@ struct PluginUiProxyContext {
     std::uint64_t generation{};
     bool close_requested{};
     bool reopen_requested{};
+    // on_draw runs for the overlay alone: the plugin's windows are closed, so
+    // begin_window opens nothing and the matching end_window draws nothing.
+    bool overlay_only{};
     UiStackEntryKind window_begin_kind{UiStackEntryKind::Window};
     UiStackEntryKind window_end_kind{UiStackEntryKind::Window};
     cabbird::UiResourceHandle window_resource{};
@@ -638,6 +641,11 @@ int CABBIRD_CALL ProxyBeginWindow(
         context->ui_stack->MarkMismatch();
         return 0;
     }
+    if (context->overlay_only) {
+        // Still tracked, so the end_window a plugin always pairs with it balances.
+        context->ui_stack->PushReserved({context->window_begin_kind, context->window_resource});
+        return 0;
+    }
     if (open != nullptr && context->reopen_requested) {
         *open = 1;
         context->reopen_requested = false;
@@ -660,7 +668,8 @@ void CABBIRD_CALL ProxyEndWindow(void* user) {
     if (context != nullptr && context->scope != nullptr && !callback) return;
     if (context != nullptr && context->service != nullptr &&
         context->service->end_window != nullptr && context->ui_stack != nullptr &&
-        context->ui_stack->Consume(context->window_end_kind, context->window_resource)) {
+        context->ui_stack->Consume(context->window_end_kind, context->window_resource) &&
+        !context->overlay_only) {
         context->service->end_window(context->service->user);
     }
 }
@@ -4214,6 +4223,8 @@ bool RecoverPluginUiStack(
         (stack != nullptr && !stack->entries.empty());
 
     const auto end_window = [&]() noexcept {
+        // An overlay-only draw opened no host window, so there is none to close.
+        if (proxy.overlay_only) return;
         if (proxy.service == nullptr || proxy.service->end_window == nullptr) return;
         try {
             proxy.service->end_window(proxy.service->user);
@@ -6339,7 +6350,10 @@ void PluginManager::Draw(void* imgui_context) {
     const ScopedLogThreadDomain log_domain(cabbird::LogThreadDomain::Render);
     for (const auto& plugin : plugins_) {
         ReconcileWindowVisibility(*plugin);
-        if (!plugin->view.visible || plugin->faulted) continue;
+        const bool overlay_only = !plugin->view.visible;
+        const bool draw_hidden_overlay = overlay_only &&
+            plugin->service_context.capabilities.HasCapability("ui-overlay");
+        if (plugin->faulted || (!plugin->view.visible && !draw_hidden_overlay)) continue;
         auto callback = plugin->scope != nullptr
             ? plugin->scope->AcquireCallback(plugin->view.generation)
             : cabbird::PluginScope::CallbackLease{};
@@ -6353,6 +6367,7 @@ void PluginManager::Draw(void* imgui_context) {
             ui_service_ != nullptr) {
             invoked = true;
             plugin->ui_proxy_context.close_requested = false;
+            plugin->ui_proxy_context.overlay_only = overlay_only;
             try {
                 plugin->descriptor_v1.on_draw(
                     plugin->plugin_context,
@@ -6370,6 +6385,7 @@ void PluginManager::Draw(void* imgui_context) {
             }
             const bool ui_stack_fault = RecoverPluginUiStack(
                 plugin->ui_proxy_context, plugin->service_context);
+            plugin->ui_proxy_context.overlay_only = false;
             if (ui_stack_fault) {
                 fault = true;
                 plugin->faulted = true;
