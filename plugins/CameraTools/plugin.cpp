@@ -963,7 +963,7 @@ void CABBIRD_CALL Update(void* raw, double deltaSeconds) noexcept {
         // Hold player position cleanly via shared host motion controller while Free Camera is active.
         UpdateMotionHold(c, player, c.freeCamera.load(std::memory_order_relaxed));
 
-        if (c.bindings.profileReady && c.il2cpp && c.il2cpp->with_runtime) {
+        if (c.il2cpp && c.il2cpp->with_runtime) {
             TickWork work{&c, deltaSeconds, live, playerPos};
             static_cast<void>(c.il2cpp->with_runtime(c.il2cpp->user, GameTickRuntime, &work));
         }
@@ -1314,11 +1314,6 @@ CabbirdStatusV1 CABBIRD_CALL Load(const CabbirdHostApiV1* host, void** result) n
                         "Camera Tools: saved settings are invalid; defaults retained."));
         }
         SyncAtomicSettings(*c);
-
-        if (!c->bindings.PrepareProfile(host, c->core)) {
-            LogOnceText(*c, 1U << 0, c->text.Text("log.profile",
-                        "Camera Tools: compatibility profile load or entry verification failed; features unavailable."));
-        }
 
         const auto cleanupStatus =
             c->lifecycle->register_stop_cleanup(c->lifecycle->user, Cleanup, c.get(), &c->cleanup);

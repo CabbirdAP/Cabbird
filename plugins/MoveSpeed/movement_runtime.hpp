@@ -193,30 +193,30 @@ void* Detour(Native id) noexcept {
 bool Temporary(CabbirdStatusV1 status) noexcept {
     return status.code==CABBIRD_STATUS_V1_UNAVAILABLE || status.code==CABBIRD_STATUS_V1_NOT_FOUND;
 }
-BindingState ValidateField(Context& c,std::string_view type,std::string_view name,std::string_view field_type,
-                           std::uint32_t expected,std::uint32_t size) {
+BindingState ResolveField(Context& c,std::string_view type,std::string_view name,std::string_view field_type,
+                          std::uint32_t& offset,std::uint32_t size) {
     CabbirdUnityFieldRequestV1 request{};request.struct_size=sizeof(request);request.storage_size=size;
     request.type_name=StringView(type);request.field_name=StringView(name);request.field_type=StringView(field_type);
     CabbirdUnityFieldResultV1 result{};result.struct_size=sizeof(result);
     const auto status=c.metadata->resolve_instance_field(c.metadata->user,&request,&result);
     if(Temporary(status))return BindingState::waiting;
-    return Succeeded(status) && result.storage_size==size && result.offset==expected?BindingState::ready:BindingState::fields;
+    if(!Succeeded(status) || result.storage_size!=size || result.offset>64U*1024U ||
+        result.offset<sizeof(std::uintptr_t)*2 || result.offset%size!=0)return BindingState::fields;
+    offset=result.offset;return BindingState::ready;
 }
 bool ResolveMethod(Context& c,Native id) {
     auto& slot=c.methods[id];
     if(slot.handle.id || slot.state.load()!=BindingState::waiting)return slot.state.load()==BindingState::ready;
     const auto& source=kMethods[id];
-    const auto resolved=cabbird::sdk::ResolveProfileSymbolRva(c.core,c.profile,source.symbol);
-    if(!resolved){slot.state.store(BindingState::entry);return false;}
     const std::string type=std::string(kWorld)+source.type;
     const auto parameter=StringView(source.parameter?source.parameter:"");
     CabbirdUnityMethodRequestV1 request{};request.struct_size=sizeof(request);request.method_kind=CABBIRD_UNITY_METHOD_V1_INSTANCE;
-    request.module_name=StringView(c.profile.module);request.type_name=StringView(type);request.method_name=StringView(source.name);
+    request.module_name=StringView("GameAssembly.dll");request.type_name=StringView(type);request.method_name=StringView(source.name);
     request.return_type=StringView(source.result);request.parameter_types=source.parameter?&parameter:nullptr;request.parameter_count=source.parameter?1:0;
     CabbirdUnityMethodResultV1 result{};result.struct_size=sizeof(result);
     const auto status=c.metadata->resolve_method(c.metadata->user,&request,&result);
     if(Temporary(status))return false;
-    if(!Succeeded(status) || result.address!=resolved.address) {slot.state.store(BindingState::metadata);return false;}
+    if(!Succeeded(status) || !result.address) {slot.state.store(BindingState::metadata);return false;}
     slot.target=result.address;slot.state.store(BindingState::ready);return true;
 }
 bool Install(Context& c,Native id) {
@@ -277,17 +277,17 @@ CabbirdStatusV1 CABBIRD_CALL ResolveStateValues(void* user,const CabbirdIl2CppAp
 }
 void BindMovement(Context& c) {
     if(!c.ownership_ready) {
-        struct Field {const char *type,*name,*storage;std::uint32_t offset,size;};
+        struct Field {const char *type,*name,*storage;std::uint32_t *offset,size;};
         const std::array<Field,6> fields{{
-            {"Common.BaseState","m_entity","EntityHandle",c.state_entity,8},
-            {"MoveSystem.SteeringBehavior","m_entity","EntityHandle",c.steering_entity,8},
-            {"EntityHandle","<entity>k__BackingField","Entity",c.handle_entity,8},
-            {"Entity","data","BaseData",c.entity_data,8},
-            {"Common.BaseState","<stateData>k__BackingField","FsmStateData",c.state_data,8},
-            {"FsmStateData","stateType","EFsmStateType",c.state_type,4}
+            {"Common.BaseState","m_entity","EntityHandle",&c.state_entity,8},
+            {"MoveSystem.SteeringBehavior","m_entity","EntityHandle",&c.steering_entity,8},
+            {"EntityHandle","<entity>k__BackingField","Entity",&c.handle_entity,8},
+            {"Entity","data","BaseData",&c.entity_data,8},
+            {"Common.BaseState","<stateData>k__BackingField","FsmStateData",&c.state_data,8},
+            {"FsmStateData","stateType","EFsmStateType",&c.state_type,4}
         }};
         for(const auto& field:fields) {
-            const auto state=ValidateField(c,std::string(kWorld)+field.type,field.name,std::string(kWorld)+field.storage,field.offset,field.size);
+            const auto state=ResolveField(c,std::string(kWorld)+field.type,field.name,std::string(kWorld)+field.storage,*field.offset,field.size);
             if(state!=BindingState::ready) {
                 for(auto& slot:c.methods)slot.state.store(state);
                 if(state==BindingState::fields)c.bind_issue=c.localizer.Format("log.field","Move Speed: incompatible field {0}.{1}.",std::array<std::string_view,2>{field.type,field.name});
@@ -337,8 +337,7 @@ void BindMovement(Context& c) {
     for(std::size_t i{};i<NativeCount;++i) {
         const auto state=c.methods[i].state.load();
         if(state==BindingState::waiting || state==BindingState::ready)continue;
-        if(state==BindingState::entry)c.bind_issue=c.localizer.Format("log.entry","Move Speed: native entry validation failed for {0}; this path remains unchanged.",std::array<std::string_view,1>{kMethods[i].symbol});
-        else if(state==BindingState::metadata)c.bind_issue=c.localizer.Format("log.metadata","Move Speed: method metadata differs for {0}; this path remains unchanged.",std::array<std::string_view,1>{kMethods[i].symbol});
+        if(state==BindingState::metadata)c.bind_issue=c.localizer.Format("log.metadata","Move Speed: method metadata differs for {0}; this path remains unchanged.",std::array<std::string_view,1>{kMethods[i].symbol});
         else if(state==BindingState::alias)c.bind_issue=c.localizer.Format("log.alias","Move Speed: {0} shares an incompatible native entry; this path remains unchanged.",std::array<std::string_view,1>{kMethods[i].symbol});
         else c.bind_issue=c.localizer.Format("log.hook","Move Speed: the host could not create the hook for {0}; this path remains unchanged.",std::array<std::string_view,1>{kMethods[i].symbol});
         break;

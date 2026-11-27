@@ -37,14 +37,6 @@
       "minVersion": 1
     },
     {
-      "id": "cabbird.profile",
-      "minVersion": 1
-    },
-    {
-      "id": "cabbird.json",
-      "minVersion": 1
-    },
-    {
       "id": "cabbird.unity.il2cpp",
       "minVersion": 1
     },
@@ -93,7 +85,6 @@
     "ui",
     "ui-window",
     "input",
-    "json",
     "memory-read",
     "unity-il2cpp",
     "unity-metadata",

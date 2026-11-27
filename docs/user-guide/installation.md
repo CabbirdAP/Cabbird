@@ -29,7 +29,7 @@ game-package\
       FakeUID\{plugin.dll,manifest.json}
       DamageReplay\{plugin.dll,manifest.json,profile\compatibility.profile.json}
       EntityTeleport\{plugin.dll,manifest.json}
-      MoveSpeed\{plugin.dll,manifest.json,profile\compatibility.profile.json}
+      MoveSpeed\{plugin.dll,manifest.json}
       StoryTools\{plugin.dll,manifest.json,profile\compatibility.profile.json}
 ```
 

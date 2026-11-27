@@ -23,7 +23,6 @@
     "hotkey.error": "无法绑定该快捷键，可能已被占用",
     "section.developer": "开发者工具",
     "action.teleport": "传送到相机位置",
-    "log.profile": "相机工具：兼容资料加载或入口校验失败，部分功能不可用",
     "log.bind": "相机工具：游戏相机运行时绑定尚未就绪",
     "log.bind_detail": "相机工具：运行时绑定诊断（{0}）",
     "log.save": "相机工具：无法排队保存设置",

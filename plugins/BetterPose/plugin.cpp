@@ -1067,7 +1067,6 @@ bool HasActivePoseEdits(const Context& c) noexcept {
 void PublishStatusSnapshot(Context& c, std::string detail) {
     auto snap = std::make_shared<RenderSnapshot>();
     snap->revision = ++c.snapshotRevision;
-    snap->profileReady = c.unity.profileReady;
     snap->bound = c.unity.bound;
     snap->statusDetail = std::move(detail);
     c.published.store(std::move(snap), std::memory_order_release);
@@ -1142,7 +1141,6 @@ void ApplyPoseAndPublishNative(Context& c) {
 
     auto snap = std::make_shared<RenderSnapshot>();
     snap->revision = ++c.snapshotRevision;
-    snap->profileReady = c.unity.profileReady;
     snap->bound = c.unity.bound;
     snap->postLateHookActive = (c.afterLateHook.id != 0 && c.unity.nativeDirectVerified);
     snap->targetAlive = c.frameTargetAlive && !c.bones.empty();
@@ -1263,7 +1261,6 @@ void ApplyPoseAndPublishReflection(Context& c, const Runtime& rt, Object* cam) {
 
     auto snap = std::make_shared<RenderSnapshot>();
     snap->revision = ++c.snapshotRevision;
-    snap->profileReady = c.unity.profileReady;
     snap->bound = c.unity.bound;
     snap->postLateHookActive = false;
     snap->targetAlive = c.frameTargetAlive && !c.bones.empty();
@@ -1553,11 +1550,6 @@ CabbirdStatusV1 CABBIRD_CALL GameUpdateCallback(void* raw, const CabbirdIl2CppAp
 
         c.gameThreadId.store(GetCurrentThreadId(), std::memory_order_relaxed);
         Runtime rt(*api);
-
-        if (!c.unity.profileReady) {
-            PublishStatusSnapshot(c, c.unity.profileError);
-            return Ok();
-        }
 
         if (!c.unity.bound) {
             const auto now = std::chrono::steady_clock::now();
@@ -3112,20 +3104,18 @@ void CABBIRD_CALL Draw(void* raw, const CabbirdUiServiceV1* frameUi) noexcept {
 
         const auto u = ui->user;
 
-        if (!c.renderSnap.profileReady || (!c.renderSnap.bound && !c.renderSnap.statusDetail.empty())) {
+        if (!c.renderSnap.bound && !c.renderSnap.statusDetail.empty()) {
             const std::string detail = c.renderSnap.statusDetail.empty() ? "unavailable" : c.renderSnap.statusDetail;
             const std::string_view args[]{detail};
             UiTextWrapped(ui, c.text.Format("status.unavailable", "Unavailable: {0}", args));
-        } else if (!c.renderSnap.bound) {
-            UiTextWrapped(ui, c.text.Text("status.waiting", "Waiting for Unity runtime and active scene..."));
-        } else if (c.renderSnap.targetAlive) {
+        } else if (c.renderSnap.bound && c.renderSnap.targetAlive) {
             const std::string boneCountStr = std::to_string(c.renderSnap.bones.size());
             const std::string modeStr = c.renderSnap.postLateHookActive
                 ? c.text.Text("status.hook-late", "Post-LateUpdate")
                 : c.text.Text("status.hook-tick", "Game Tick");
             const std::string_view args[]{c.renderSnap.activeTargetName, boneCountStr, modeStr};
             UiTextWrapped(ui, c.text.Format("status.active", "Target: {0} | {1} bones | {2}", args));
-        } else {
+        } else if (c.renderSnap.bound) {
             UiTextWrapped(ui, c.text.Text("status.no-target", "No target skeleton active."));
         }
 
@@ -3270,15 +3260,7 @@ CabbirdStatusV1 CABBIRD_CALL Load(const CabbirdHostApiV1* host, void** result) n
             });
         }
 
-        // Load and entry-verify compatibility.profile.json in Lifecycle domain (never Game/Render).
-        if (!c->unity.PrepareProfile(host, c->core)) {
-            const std::string_view args[]{c->unity.profileError};
-            LogOnceText(*c, 1U << 6U, c->text.Format("log.profile-failed",
-                        "BetterPose: compatibility profile check failed ({0}).", args));
-            PublishStatusSnapshot(*c, c->unity.profileError);
-        } else {
-            PublishStatusSnapshot(*c, {});
-        }
+        PublishStatusSnapshot(*c, {});
 
         const auto cfgStatus = c->config.Bind(host, kSettingsId, SettingsSchema());
         if (!Succeeded(cfgStatus)) return cfgStatus;

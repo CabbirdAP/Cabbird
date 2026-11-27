@@ -2,7 +2,6 @@
 
 #include "cabbird/sdk/cpp.hpp"
 #include "cabbird/sdk/il2cpp.hpp"
-#include "cabbird/sdk/profile.hpp"
 #include "cabbird/sdk/services/core.h"
 #include "cabbird/sdk/services/unity_metadata.h"
 
@@ -15,7 +14,6 @@
 #include <cstring>
 #include <initializer_list>
 #include <string>
-#include <unordered_map>
 #include <vector>
 
 namespace cameratools {
@@ -142,18 +140,6 @@ struct CameraBindings {
     using Method = CabbirdMethodInfoV1;
     using Field = CabbirdFieldInfoV1;
 
-    // Profile snapshot prepared strictly on Lifecycle (Load).
-    cabbird::sdk::Profile profile;
-    bool profileReady{};
-    std::string profileError;
-
-    // Layout values read from compatibility.profile.json (never hardcoded).
-    uint32_t expectedCachedPtrOffset{};
-
-    // Verified entry addresses resolved via ResolveProfileSymbolRva in Lifecycle.
-    std::unordered_map<std::string, std::uintptr_t> profileEntries;
-
-    // Runtime readiness flags (Game domain).
     bool coreReady{};
     bool aoiReady{};
     std::string bindDiagnostics;
@@ -192,7 +178,7 @@ struct CameraBindings {
     bool nativeDirectVerified{};
     bool nativeDirectRejected{};
 
-    // Verified hook target addresses (profile entry-checked + metadata cross-checked).
+    // Hook target addresses resolved and cached from complete method metadata.
     std::uintptr_t addrUrpRender{};
     std::uintptr_t addrInputMovement{};
     std::uintptr_t addrInputJump{};
@@ -208,57 +194,10 @@ struct CameraBindings {
         bindDiagnostics.append(entry);
     }
 
-    // Lifecycle ONLY: load compatibility.profile.json via cabbird.profile + cabbird.json
-    // and verify every pinned symbol's real entry bytes in GameAssembly.dll.
-    bool PrepareProfile(const CabbirdHostApiV1* host, const CabbirdCoreServiceV1* core) {
-        profileReady = false;
-        profileError.clear();
-        profileEntries.clear();
-
-        auto loaded = cabbird::sdk::LoadProfile(
-            cabbird::sdk::Host(host), "compatibility.profile.json",
-            {"ap", "GameAssembly.dll", "il2cpp", "cabbird.camera-tools.v1"});
-        if (!loaded) {
-            profileError = "compatibility.profile.json: " + loaded.error();
-            return false;
-        }
-        try {
-            profile = std::move(loaded).value();
-            expectedCachedPtrOffset = profile.Value("objectCachedPtr", 256, alignof(void*));
-
-            static constexpr const char* kProfileSymbols[]{
-                "urpRender",
-                "cameraMain",
-                "inputMovement",
-                "inputJump",
-                "inputEvade",
-                "inputFlyUp",
-                "inputFlyFall",
-                "inputFlySprint",
-                "inputSwimSprint",
-                "worldGetAoi",
-                "worldUpdateAoi"
-            };
-            for (const char* sym : kProfileSymbols) {
-                const auto resolved = cabbird::sdk::ResolveProfileSymbolRva(core, profile, sym);
-                if (resolved) {
-                    profileEntries.emplace(sym, resolved.address);
-                } else if (profileError.empty()) {
-                    profileError = std::string(sym) + ": " + resolved.error;
-                }
-            }
-            profileReady = !profileEntries.empty();
-            return profileReady;
-        } catch (const std::exception& ex) {
-            profileError = ex.what();
-            return false;
-        }
-    }
-
-    bool VerifyProfileField(const CabbirdUnityMetadataServiceV1* metadata,
+    bool ResolveField(const CabbirdUnityMetadataServiceV1* metadata,
                             const char* typeName, const char* fieldName,
                             const char* fieldType, uint32_t storageSize,
-                            uint32_t expectedOffset, uint32_t* outOffset = nullptr) {
+                            uint32_t* outOffset = nullptr) {
         if (!metadata || !metadata->resolve_instance_field) return false;
         CabbirdUnityFieldRequestV1 req{
             sizeof(req), storageSize,
@@ -270,7 +209,7 @@ struct CameraBindings {
         if (!cabbird::sdk::Succeeded(metadata->resolve_instance_field(metadata->user, &req, &res))) {
             return false;
         }
-        if (res.offset != expectedOffset || res.storage_size != storageSize) {
+        if (res.storage_size != storageSize || res.offset % alignof(void*) != 0) {
             return false;
         }
         if (outOffset) *outOffset = res.offset;
@@ -283,7 +222,6 @@ struct CameraBindings {
                                         const char* methodName, const char* returnType,
                                         std::initializer_list<const char*> params,
                                         bool isStatic,
-                                        const char* profileSymbol = nullptr,
                                         std::uintptr_t* outAddress = nullptr,
                                         std::string* outDiag = nullptr) {
         if (outAddress) *outAddress = 0;
@@ -296,7 +234,7 @@ struct CameraBindings {
 
         CabbirdUnityMethodRequestV1 req{sizeof(req)};
         req.method_kind = isStatic ? CABBIRD_UNITY_METHOD_V1_STATIC : CABBIRD_UNITY_METHOD_V1_INSTANCE;
-        req.module_name = cabbird::sdk::StringView(profile.module.empty() ? "GameAssembly.dll" : profile.module);
+        req.module_name = cabbird::sdk::StringView("GameAssembly.dll");
         req.type_name = cabbird::sdk::StringView(fullType);
         req.method_name = cabbird::sdk::StringView(methodName);
         req.return_type = cabbird::sdk::StringView(returnType);
@@ -317,15 +255,6 @@ struct CameraBindings {
             }
             return nullptr;
         }
-        if (profileSymbol) {
-            const auto it = profileEntries.find(profileSymbol);
-            if (it == profileEntries.end() || it->second != res.address) {
-                if (outDiag) {
-                    *outDiag = fullType + "." + methodName + ": profile-pin-mismatch(" + profileSymbol + ")";
-                }
-                return nullptr;
-            }
-        }
         auto* klass = rt.FindClassAnyImage(ns, clsName);
         if (!klass) {
             if (outDiag) *outDiag = fullType + ": class-not-found";
@@ -344,14 +273,14 @@ struct CameraBindings {
     }
 
     bool Bind(const CabbirdUnityMetadataServiceV1* metadata, const cabbird::sdk::il2cpp::Context& rt) {
-        if (!profileReady || !metadata) return false;
+        if (!metadata) return false;
         bindDiagnostics.clear();
 
-        // UnityEngine.Object.m_CachedPtr (cross-checked with profile + live metadata).
+        // UnityEngine.Object.m_CachedPtr (resolved and checked against live metadata).
         if (!hasCachedPtrOffset) {
             uint32_t offset = 0;
-            if (VerifyProfileField(metadata, "UnityEngine.Object", "m_CachedPtr",
-                                   "System.IntPtr", sizeof(void*), expectedCachedPtrOffset, &offset)) {
+            if (ResolveField(metadata, "UnityEngine.Object", "m_CachedPtr",
+                                   "System.IntPtr", sizeof(void*), &offset)) {
                 cachedPtrOffset = offset;
                 hasCachedPtrOffset = true;
                 if (auto* objCls = rt.FindClassAnyImage("UnityEngine", "Object")) {
@@ -366,22 +295,22 @@ struct CameraBindings {
         camGetMain = ResolveVerifiedMethod(metadata, rt, "UnityEngine", "Camera", "get_main",
                                            "UnityEngine.Camera", {}, true);
         camMgrGetMain = ResolveVerifiedMethod(metadata, rt, "Lens.Framework.Managers", "CameraManager",
-                                              "get_mainCamera", "UnityEngine.Camera", {}, true, "cameraMain");
+                                              "get_mainCamera", "UnityEngine.Camera", {}, true);
         compGetTransform = ResolveVerifiedMethod(metadata, rt, "UnityEngine", "Component", "get_transform",
                                                  "UnityEngine.Transform", {}, false);
         std::uintptr_t getPosAddr = 0;
         tfGetPosition = ResolveVerifiedMethod(metadata, rt, "UnityEngine", "Transform", "get_position",
-                                              "UnityEngine.Vector3", {}, false, nullptr, &getPosAddr);
+                                              "UnityEngine.Vector3", {}, false, &getPosAddr);
         tfSetPosition = ResolveVerifiedMethod(metadata, rt, "UnityEngine", "Transform", "set_position",
                                               "System.Void", {"UnityEngine.Vector3"}, false);
         std::uintptr_t getRotAddr = 0;
         tfGetRotation = ResolveVerifiedMethod(metadata, rt, "UnityEngine", "Transform", "get_rotation",
-                                              "UnityEngine.Quaternion", {}, false, nullptr, &getRotAddr);
+                                              "UnityEngine.Quaternion", {}, false, &getRotAddr);
         camGetFov = ResolveVerifiedMethod(metadata, rt, "UnityEngine", "Camera", "get_fieldOfView",
-                                          "System.Single", {}, false, nullptr, &nativeGetFov.address);
+                                          "System.Single", {}, false, &nativeGetFov.address);
         nativeGetFov.method = camGetFov;
         camSetFov = ResolveVerifiedMethod(metadata, rt, "UnityEngine", "Camera", "set_fieldOfView",
-                                          "System.Void", {"System.Single"}, false, nullptr, &nativeSetFov.address);
+                                          "System.Void", {"System.Single"}, false, &nativeSetFov.address);
         nativeSetFov.method = camSetFov;
         appGetFocused = ResolveVerifiedMethod(metadata, rt, "UnityEngine", "Application", "get_isFocused",
                                               "System.Boolean", {}, true);
@@ -394,7 +323,7 @@ struct CameraBindings {
         nativeGetPosUsesRetBuf = false;
         nativeGetPos.method = ResolveVerifiedMethod(metadata, rt, "UnityEngine", "Transform",
                                                     "get_position_Injected", "System.Void",
-                                                    {"UnityEngine.Vector3&"}, false, nullptr,
+                                                    {"UnityEngine.Vector3&"}, false,
                                                     &nativeGetPos.address, &diag);
         if (!nativeGetPos.address || !nativeGetPos.method) {
             if (tfGetPosition && getPosAddr) {
@@ -410,7 +339,7 @@ struct CameraBindings {
         nativeSetPos = {};
         nativeSetPos.method = ResolveVerifiedMethod(metadata, rt, "UnityEngine", "Transform",
                                                     "set_position_Injected", "System.Void",
-                                                    {"UnityEngine.Vector3&"}, false, nullptr,
+                                                    {"UnityEngine.Vector3&"}, false,
                                                     &nativeSetPos.address, &diag);
         if (!nativeSetPos.address || !nativeSetPos.method) AppendDiag(diag);
 
@@ -419,7 +348,7 @@ struct CameraBindings {
         nativeGetRotUsesRetBuf = false;
         nativeGetRot.method = ResolveVerifiedMethod(metadata, rt, "UnityEngine", "Transform",
                                                     "get_rotation_Injected", "System.Void",
-                                                    {"UnityEngine.Quaternion&"}, false, nullptr,
+                                                    {"UnityEngine.Quaternion&"}, false,
                                                     &nativeGetRot.address, &diag);
         if (!nativeGetRot.address || !nativeGetRot.method) {
             if (tfGetRotation && getRotAddr) {
@@ -438,47 +367,40 @@ struct CameraBindings {
                             nativeGetFov.address && nativeGetFov.method &&
                             nativeSetFov.address && nativeSetFov.method;
 
-        // Pre-render URP hook (profile + metadata cross-checked).
+        // Pre-render URP hook resolved from runtime metadata.
         diag.clear();
         ResolveVerifiedMethod(metadata, rt, "UnityEngine.Rendering.Azur", "UniversalRenderPipeline",
                               "Render", "System.Void",
                               {"UnityEngine.Rendering.ScriptableRenderContext",
                                "System.Collections.Generic.List<UnityEngine.Camera>"},
-                              false, "urpRender", &addrUrpRender, &diag);
+                              false, &addrUrpRender, &diag);
         if (!addrUrpRender && !diag.empty()) AppendDiag(diag);
 
         // Player movement suppression hook targets (each verified independently).
         diag.clear();
         ResolveVerifiedMethod(metadata, rt, "Lens.Framework.Managers", "InputManager",
-                              "OnMainMovement", "System.Void", {"UnityEngine.InputSystem.InputValue"}, false,
-                              "inputMovement", &addrInputMovement, &diag);
+                              "OnMainMovement", "System.Void", {"UnityEngine.InputSystem.InputValue"}, false, &addrInputMovement, &diag);
         if (!addrInputMovement && !diag.empty()) AppendDiag(diag);
         ResolveVerifiedMethod(metadata, rt, "Lens.Framework.Managers", "InputManager",
-                              "OnMainJump", "System.Void", {}, false,
-                              "inputJump", &addrInputJump);
+                              "OnMainJump", "System.Void", {}, false, &addrInputJump);
         ResolveVerifiedMethod(metadata, rt, "Lens.Framework.Managers", "InputManager",
-                              "OnMainEvade", "System.Void", {"UnityEngine.InputSystem.InputValue"}, false,
-                              "inputEvade", &addrInputEvade);
+                              "OnMainEvade", "System.Void", {"UnityEngine.InputSystem.InputValue"}, false, &addrInputEvade);
         ResolveVerifiedMethod(metadata, rt, "Lens.Framework.Managers", "InputManager",
-                              "OnMainFlyUp", "System.Void", {"UnityEngine.InputSystem.InputValue"}, false,
-                              "inputFlyUp", &addrInputFlyUp);
+                              "OnMainFlyUp", "System.Void", {"UnityEngine.InputSystem.InputValue"}, false, &addrInputFlyUp);
         ResolveVerifiedMethod(metadata, rt, "Lens.Framework.Managers", "InputManager",
-                              "OnMainFlyFall", "System.Void", {"UnityEngine.InputSystem.InputValue"}, false,
-                              "inputFlyFall", &addrInputFlyFall);
+                              "OnMainFlyFall", "System.Void", {"UnityEngine.InputSystem.InputValue"}, false, &addrInputFlyFall);
         ResolveVerifiedMethod(metadata, rt, "Lens.Framework.Managers", "InputManager",
-                              "OnMainFlySprint", "System.Void", {"UnityEngine.InputSystem.InputValue"}, false,
-                              "inputFlySprint", &addrInputFlySprint);
+                              "OnMainFlySprint", "System.Void", {"UnityEngine.InputSystem.InputValue"}, false, &addrInputFlySprint);
         ResolveVerifiedMethod(metadata, rt, "Lens.Framework.Managers", "InputManager",
-                              "OnMainSwimSprint", "System.Void", {"UnityEngine.InputSystem.InputValue"}, false,
-                              "inputSwimSprint", &addrInputSwimSprint);
+                              "OnMainSwimSprint", "System.Void", {"UnityEngine.InputSystem.InputValue"}, false, &addrInputSwimSprint);
 
         // Scene streaming (AOI) methods.
         worldGetAoi = ResolveVerifiedMethod(metadata, rt, "Lens.Gameplay.Modules.Azur", "AzurWorld",
                                             "get_AOI", "Lens.Gameplay.Modules.Azur.WorldAOIMgr",
-                                            {}, true, "worldGetAoi");
+                                            {}, true);
         worldUpdateAoi = ResolveVerifiedMethod(metadata, rt, "Lens.Gameplay.Modules.Azur", "WorldAOIMgr",
                                                "UpdateAOI", "System.Void", {"UnityEngine.Vector3"},
-                                               false, "worldUpdateAoi");
+                                               false);
         aoiReady = worldGetAoi != nullptr && worldUpdateAoi != nullptr;
 
         coreReady = (camGetMain || camMgrGetMain) && compGetTransform && tfGetPosition &&

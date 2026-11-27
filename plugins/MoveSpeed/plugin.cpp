@@ -3,7 +3,6 @@
  */
 #include "cabbird/sdk/cpp.hpp"
 #include "cabbird/sdk/localization.hpp"
-#include "cabbird/sdk/profile.hpp"
 #include "cabbird/sdk/services/il2cpp.h"
 #include "cabbird/sdk/config_save_queue.hpp"
 #include <algorithm>
@@ -43,7 +42,7 @@ enum Native : std::size_t { BaseMove, Controllable, MountRun, MountSprint, World
     TargetSpeed, SetTargetSpeed, NativeCount };
 constexpr std::size_t kHookCount = TargetSpeed;
 struct Method final { const char *symbol, *type, *name, *result, *parameter; };
-// Runtime identities stay in code; addresses, bytes and field offsets stay in Profile.
+// Runtime identities are resolved once; callbacks use cached addresses and offsets.
 constexpr std::array<Method,NativeCount> kMethods{{
     {"baseMove","Common.BaseState","Move","System.Void","System.Boolean"},
     {"controllableRun","Controllable.RunState","CalcDesiredVelocity","UnityEngine.Vector3",nullptr},
@@ -72,7 +71,7 @@ constexpr std::array<Method,NativeCount> kMethods{{
     {"targetSpeed","MoveSystem.DoMoveState","get_TargetSpeed","System.Single",nullptr},
     {"setTargetSpeed","MoveSystem.DoMoveState","set_TargetSpeed","System.Void","System.Single"}
 }};
-enum class BindingState { waiting, ready, entry, metadata, fields, dependency, alias, hook };
+enum class BindingState { waiting, ready, metadata, fields, dependency, alias, hook };
 struct HookSlot final {
     std::uintptr_t target{}, original{};
     CabbirdGenerationHandleV1 handle{};
@@ -90,7 +89,6 @@ struct Context final {
     const CabbirdWindowServiceV1* windows{};
     CabbirdGenerationHandleV1 window{};
     cabbird::sdk::Localizer localizer;
-    cabbird::sdk::Profile profile;
     std::array<HookSlot,NativeCount> methods;
     std::uint32_t state_entity{}, steering_entity{}, handle_entity{}, entity_data{};
     std::atomic<DWORD> game_thread{};
@@ -134,8 +132,8 @@ CabbirdStatusV1 CABBIRD_CALL Load(const CabbirdHostApiV1* api, void** output) no
         c->windows = host.Query<CabbirdWindowServiceV1>(CABBIRD_WINDOW_SERVICE_V1_ID).get();
         const auto scheduler = host.Query<CabbirdSchedulerServiceV1>(CABBIRD_SCHEDULER_SERVICE_V1_ID);
         const auto ui = host.Query<CabbirdUiServiceV1>(CABBIRD_UI_SERVICE_V1_ID);
-        if (!c->core || c->core->struct_size < offsetof(CabbirdCoreServiceV1,module_base)+sizeof(c->core->module_base) ||
-            !c->core->read_memory || !c->core->module_base || !c->core->log ||
+        if (!c->core || c->core->struct_size < offsetof(CabbirdCoreServiceV1,read_memory)+sizeof(c->core->read_memory) ||
+            !c->core->read_memory || !c->core->log ||
             !c->hooks || c->hooks->struct_size < sizeof(*c->hooks) || !c->hooks->create || !c->hooks->release || !c->hooks->begin_callback || !c->hooks->end_callback ||
             !c->config || c->config->struct_size < sizeof(*c->config) || !c->config->register_schema || !c->config->read || !c->config->write_atomic ||
             !c->json || c->json->struct_size < sizeof(*c->json) || !c->json->parse || !c->json->release || !c->json->object_find || !c->json->boolean_value || !c->json->number_value ||
@@ -147,22 +145,6 @@ CabbirdStatusV1 CABBIRD_CALL Load(const CabbirdHostApiV1* api, void** output) no
             !ui || ui->struct_size < offsetof(CabbirdUiServiceV1,slider_float)+sizeof(ui->slider_float) || !ui->checkbox || !ui->slider_float) {
             return Unavailable(*c,"load.services","Required host services are unavailable.");
         }
-        auto loaded = cabbird::sdk::LoadProfile(host,"compatibility.profile.json",
-            {"ap","GameAssembly.dll","il2cpp","cabbird.move-speed.v5"});
-        if (!loaded) return Unavailable(*c,"load.profile","The movement compatibility profile is unavailable.");
-        c->profile = std::move(loaded).value();
-        try {
-            constexpr std::uint32_t maximum = 64U*1024U;
-            c->state_entity = c->profile.Value("stateEntity",maximum,alignof(std::uintptr_t));
-            c->steering_entity = c->profile.Value("steeringEntity",maximum,alignof(std::uintptr_t));
-            c->handle_entity = c->profile.Value("handleEntity",maximum,alignof(std::uintptr_t));
-            c->entity_data = c->profile.Value("entityData",maximum,alignof(std::uintptr_t));
-            c->state_data = c->profile.Value("stateData",maximum,alignof(std::uintptr_t));
-            c->state_type = c->profile.Value("stateType",maximum,alignof(std::uint32_t));
-            if (c->state_entity < sizeof(std::uintptr_t)*2 || c->steering_entity < sizeof(std::uintptr_t)*2 ||
-                c->handle_entity < sizeof(std::uintptr_t)*2 || c->entity_data < sizeof(std::uintptr_t)*2)
-                return Unavailable(*c,"load.layout","The movement profile has an unsupported ownership layout.");
-        } catch (...) { return Unavailable(*c,"load.layout","The movement profile has an unsupported ownership layout."); }
         CabbirdGenerationHandleV1 schema{};
         if (!Succeeded(c->config->register_schema(c->config->user,StringView(kSchemaId),kSettingsVersion,
             {reinterpret_cast<const std::uint8_t*>(kSchema.data()),kSchema.size()},&schema)))

@@ -2,7 +2,6 @@
 
 #include "cabbird/sdk/cpp.hpp"
 #include "cabbird/sdk/il2cpp.hpp"
-#include "cabbird/sdk/profile.hpp"
 #include "cabbird/sdk/services/interop.h"
 #include "cabbird/sdk/services/unity.h"
 #include "cabbird/sdk/services/unity_metadata.h"
@@ -21,7 +20,6 @@
 #include <cstdint>
 #include <cstring>
 #include <string>
-#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -96,7 +94,6 @@ struct BoneRenderData {
 
 struct RenderSnapshot {
     uint64_t revision{};
-    bool profileReady{};
     bool bound{};
     bool postLateHookActive{};
     bool targetAlive{};
@@ -235,20 +232,6 @@ struct UnityBindings {
     using Method = CabbirdMethodInfoV1;
     using Field = CabbirdFieldInfoV1;
 
-    // Profile snapshot loaded strictly in Lifecycle (Load) via cabbird.profile + cabbird.json.
-    cabbird::sdk::Profile profile;
-    bool profileReady{};
-    std::string profileError;
-
-    // Validated profile layout values (no hardcoded offsets in C++).
-    uint32_t expectedCachedPtrOffset{};
-    uint32_t expectedBaseDataTransformOffset{};
-    uint32_t expectedBaseDataAnimatorOffset{};
-    uint32_t expectedRelTfRawOffset{};
-
-    // Validated entry-checked profile addresses for game-specific symbols.
-    std::unordered_map<std::string, std::uintptr_t> profileEntries;
-
     bool bound{};
     std::string bindError;
 
@@ -262,7 +245,7 @@ struct UnityBindings {
     CabbirdIl2CppGCHandleV1 animatorTypeHandle{};
     CabbirdIl2CppGCHandleV1 cinemachineBrainTypeHandle{};
 
-    // Verified UnityEngine.Object.m_CachedPtr offset (cross-checked with profile + live metadata).
+    // Verified UnityEngine.Object.m_CachedPtr offset (resolved and checked against live metadata).
     Field* cachedPtrField{};
     uint32_t cachedPtrOffset{};
     bool hasCachedPtrOffset{};
@@ -308,7 +291,7 @@ struct UnityBindings {
     const Method* camGetFov{};
     const Method* camSetFov{};
 
-    // Profile-pinned + metadata-cross-verified game methods.
+    // Runtime-verified game methods.
     const Method* camMgrGetMainCamera{};
     const Method* baseDataGetTransform{};
     const Method* baseDataGetAnimator{};
@@ -345,56 +328,6 @@ struct UnityBindings {
     bool nativeDirectVerified{};
     bool nativeDirectRejected{};
 
-    // Lifecycle ONLY: load compatibility.profile.json via host cabbird.profile + cabbird.json
-    // and verify every pinned symbol's real entry bytes in GameAssembly.dll via ResolveProfileSymbolRva.
-    bool PrepareProfile(const CabbirdHostApiV1* host, const CabbirdCoreServiceV1* core) {
-        profileReady = false;
-        profileError.clear();
-        profileEntries.clear();
-
-        auto loaded = cabbird::sdk::LoadProfile(
-            cabbird::sdk::Host(host), "compatibility.profile.json",
-            {"ap", "GameAssembly.dll", "il2cpp", "cabbird.better-pose.v1"});
-        if (!loaded) {
-            profileError = "compatibility.profile.json: " + loaded.error();
-            return false;
-        }
-        try {
-            profile = std::move(loaded).value();
-            expectedCachedPtrOffset = profile.Value("objectCachedPtr", 256, alignof(void*));
-            expectedBaseDataTransformOffset = profile.Value("baseDataTransform", 4096, alignof(void*));
-            expectedBaseDataAnimatorOffset = profile.Value("baseDataAnimator", 4096, alignof(void*));
-            expectedRelTfRawOffset = profile.Value("relativeTransformRaw", 256, alignof(void*));
-
-            static constexpr const char* kRequiredSymbols[]{
-                "runAfterLateUpdate",
-                "cameraMain",
-                "baseDataTransform",
-                "baseDataAnimator",
-                "baseDataConfigName",
-                "relTfGameObject",
-                "relTfRawTransform",
-                "playableAnimAnimator",
-                "playableAnimGetSpeed",
-                "playableAnimSetSpeed",
-                "playableAnimRebind"
-            };
-            for (const char* sym : kRequiredSymbols) {
-                const auto resolved = cabbird::sdk::ResolveProfileSymbolRva(core, profile, sym);
-                if (!resolved) {
-                    profileError = std::string(sym) + ": " + resolved.error;
-                    return false;
-                }
-                profileEntries.emplace(sym, resolved.address);
-            }
-            profileReady = true;
-            return true;
-        } catch (const std::exception& ex) {
-            profileError = ex.what();
-            return false;
-        }
-    }
-
     bool IsUnityObjectAlive(const cabbird::sdk::il2cpp::Context& rt, Object* obj) const noexcept {
         if (!obj) return false;
         if (cachedPtrField) {
@@ -411,10 +344,10 @@ struct UnityBindings {
         return seh::ReadPtr(reinterpret_cast<std::uintptr_t>(obj) + cachedPtrOffset, nativePtr) && nativePtr != 0;
     }
 
-    bool VerifyProfileField(const CabbirdUnityMetadataServiceV1* metadata,
+    bool ResolveField(const CabbirdUnityMetadataServiceV1* metadata,
                             const char* typeName, const char* fieldName,
                             const char* fieldType, uint32_t storageSize,
-                            uint32_t expectedOffset, uint32_t* outOffset = nullptr) {
+                            uint32_t* outOffset = nullptr) {
         if (!metadata || !metadata->resolve_instance_field) {
             bindError = std::string(typeName) + "." + fieldName + ": metadata service unavailable";
             return false;
@@ -431,23 +364,21 @@ struct UnityBindings {
             bindError = std::string(typeName) + "." + fieldName + ": metadata status " + std::to_string(st.code);
             return false;
         }
-        if (res.offset != expectedOffset || res.storage_size != storageSize) {
-            bindError = std::string(typeName) + "." + fieldName + ": profile offset mismatch";
+        if (res.storage_size != storageSize || res.offset % alignof(void*) != 0) {
+            bindError = std::string(typeName) + "." + fieldName + ": field storage size or alignment mismatch";
             return false;
         }
         if (outOffset) *outOffset = res.offset;
         return true;
     }
 
-    // Resolve a method via cabbird.unity.metadata, cross-check against profile entry address when pinned,
-    // and return the runtime MethodInfo* verified for return type and static/instance flag.
+    // Resolve the unique complete method shape and cache its verified native entry.
     const Method* ResolveVerifiedMethod(const CabbirdUnityMetadataServiceV1* metadata,
                                         const cabbird::sdk::il2cpp::Context& rt,
                                         const char* ns, const char* clsName,
                                         const char* methodName, const char* returnType,
                                         std::initializer_list<const char*> params,
                                         bool isStatic,
-                                        const char* profileSymbol = nullptr,
                                         std::uintptr_t* outAddress = nullptr) {
         if (outAddress) *outAddress = 0;
         if (!metadata || !metadata->resolve_method) return nullptr;
@@ -459,7 +390,7 @@ struct UnityBindings {
 
         CabbirdUnityMethodRequestV1 req{sizeof(req)};
         req.method_kind = isStatic ? CABBIRD_UNITY_METHOD_V1_STATIC : CABBIRD_UNITY_METHOD_V1_INSTANCE;
-        req.module_name = cabbird::sdk::StringView(profile.module.empty() ? "GameAssembly.dll" : profile.module);
+        req.module_name = cabbird::sdk::StringView("GameAssembly.dll");
         req.type_name = cabbird::sdk::StringView(fullType);
         req.method_name = cabbird::sdk::StringView(methodName);
         req.return_type = cabbird::sdk::StringView(returnType);
@@ -471,13 +402,6 @@ struct UnityBindings {
         if (!cabbird::sdk::Succeeded(st) || !res.address) {
             bindError = fullType + "." + methodName + ": metadata status " + std::to_string(st.code);
             return nullptr;
-        }
-        if (profileSymbol) {
-            const auto it = profileEntries.find(profileSymbol);
-            if (it == profileEntries.end() || it->second != res.address) {
-                bindError = fullType + "." + methodName + ": profile entry mismatch (" + profileSymbol + ")";
-                return nullptr;
-            }
         }
         auto* klass = rt.FindClassAnyImage(ns, clsName);
         if (!klass) {
@@ -528,11 +452,6 @@ struct UnityBindings {
     bool Bind(const cabbird::sdk::il2cpp::Context& rt, const CabbirdUnityMetadataServiceV1* metadata) {
         if (bound) return true;
         bindError.clear();
-        if (!profileReady) {
-            bindError = profileError.empty() ? "compatibility profile not loaded" : profileError;
-            return false;
-        }
-
         unityObjectClass = rt.FindClassAnyImage("UnityEngine", "Object");
         baseDataClass = rt.FindClassAnyImage("Lens.Gameplay.Modules.BigWorld", "BaseData");
         skinnedMeshClass = rt.FindClassAnyImage("UnityEngine", "SkinnedMeshRenderer");
@@ -543,23 +462,23 @@ struct UnityBindings {
             return false;
         }
 
-        // Cross-check profile field layout against live metadata (no hardcoded offsets).
+        // Resolve and validate field layouts once in the Game domain.
         cachedPtrField = rt.FindField(unityObjectClass, "m_CachedPtr");
-        if (!VerifyProfileField(metadata, "UnityEngine.Object", "m_CachedPtr", "System.IntPtr",
-                                sizeof(void*), expectedCachedPtrOffset, &cachedPtrOffset)) {
+        if (!ResolveField(metadata, "UnityEngine.Object", "m_CachedPtr", "System.IntPtr",
+                                sizeof(void*), &cachedPtrOffset)) {
             return false;
         }
         hasCachedPtrOffset = true;
-        if (!VerifyProfileField(metadata, "Lens.Gameplay.Modules.BigWorld.BaseData",
+        if (!ResolveField(metadata, "Lens.Gameplay.Modules.BigWorld.BaseData",
                                 "<transform>k__BackingField", "Lens.Gameplay.Modules.BigWorld.RelativeTransform",
-                                sizeof(void*), expectedBaseDataTransformOffset) ||
-            !VerifyProfileField(metadata, "Lens.Gameplay.Modules.BigWorld.BaseData",
+                                sizeof(void*)) ||
+            !ResolveField(metadata, "Lens.Gameplay.Modules.BigWorld.BaseData",
                                 "<animator>k__BackingField",
                                 "Lens.Gameplay.Modules.BigWorld.PlayableAnimator.PlayableAnimator",
-                                sizeof(void*), expectedBaseDataAnimatorOffset) ||
-            !VerifyProfileField(metadata, "Lens.Gameplay.Modules.BigWorld.RelativeTransform",
+                                sizeof(void*)) ||
+            !ResolveField(metadata, "Lens.Gameplay.Modules.BigWorld.RelativeTransform",
                                 "m_transform", "UnityEngine.Transform",
-                                sizeof(void*), expectedRelTfRawOffset)) {
+                                sizeof(void*))) {
             return false;
         }
 
@@ -619,42 +538,42 @@ struct UnityBindings {
         goGetComponent1 = ResolveVerifiedMethod(metadata, rt, "UnityEngine", "GameObject", "GetComponent", "UnityEngine.Component", {"System.Type"}, false);
         bindError = savedErr;
 
-        // Profile-pinned game methods: cross-verified against compatibility.profile.json entry addresses.
+        // Game methods resolved by their complete runtime signatures.
         camMgrGetMainCamera = ResolveVerifiedMethod(
             metadata, rt, "Lens.Framework.Managers", "CameraManager", "get_mainCamera",
-            "UnityEngine.Camera", {}, true, "cameraMain");
+            "UnityEngine.Camera", {}, true);
         baseDataGetTransform = ResolveVerifiedMethod(
             metadata, rt, "Lens.Gameplay.Modules.BigWorld", "BaseData", "get_transform",
-            "Lens.Gameplay.Modules.BigWorld.RelativeTransform", {}, false, "baseDataTransform");
+            "Lens.Gameplay.Modules.BigWorld.RelativeTransform", {}, false);
         baseDataGetAnimator = ResolveVerifiedMethod(
             metadata, rt, "Lens.Gameplay.Modules.BigWorld", "BaseData", "get_animator",
-            "Lens.Gameplay.Modules.BigWorld.PlayableAnimator.PlayableAnimator", {}, false, "baseDataAnimator");
+            "Lens.Gameplay.Modules.BigWorld.PlayableAnimator.PlayableAnimator", {}, false);
         baseDataGetConfigName = ResolveVerifiedMethod(
             metadata, rt, "Lens.Gameplay.Modules.BigWorld", "BaseData", "get_configName",
-            "System.String", {}, false, "baseDataConfigName");
+            "System.String", {}, false);
         relTfGetGameObject = ResolveVerifiedMethod(
             metadata, rt, "Lens.Gameplay.Modules.BigWorld", "RelativeTransform", "get_gameObject",
-            "UnityEngine.GameObject", {}, false, "relTfGameObject");
+            "UnityEngine.GameObject", {}, false);
         relTfGetRawTransform = ResolveVerifiedMethod(
             metadata, rt, "Lens.Gameplay.Modules.BigWorld", "RelativeTransform", "GetRawTransform",
-            "UnityEngine.Transform", {}, false, "relTfRawTransform");
+            "UnityEngine.Transform", {}, false);
         playableAnimGetAnimator = ResolveVerifiedMethod(
             metadata, rt, "Lens.Gameplay.Modules.BigWorld.PlayableAnimator", "PlayableAnimator", "get_animator",
-            "UnityEngine.Animator", {}, false, "playableAnimAnimator");
+            "UnityEngine.Animator", {}, false);
         playableAnimGetSpeed = ResolveVerifiedMethod(
             metadata, rt, "Lens.Gameplay.Modules.BigWorld.PlayableAnimator", "PlayableAnimator", "get_speed",
-            "System.Single", {}, false, "playableAnimGetSpeed");
+            "System.Single", {}, false);
         playableAnimSetSpeed = ResolveVerifiedMethod(
             metadata, rt, "Lens.Gameplay.Modules.BigWorld.PlayableAnimator", "PlayableAnimator", "set_speed",
-            "System.Void", {"System.Single"}, false, "playableAnimSetSpeed");
+            "System.Void", {"System.Single"}, false);
         playableAnimRebind = ResolveVerifiedMethod(
             metadata, rt, "Lens.Gameplay.Modules.BigWorld.PlayableAnimator", "PlayableAnimator", "Rebind",
-            "System.Void", {}, false, "playableAnimRebind");
+            "System.Void", {}, false);
 
         std::uintptr_t afterLateAddr = 0;
         const Method* afterLateMethod = ResolveVerifiedMethod(
             metadata, rt, "Lens.Framework", "UpdateSource", "RunAfterLateUpdate",
-            "System.Void", {}, true, "runAfterLateUpdate", &afterLateAddr);
+            "System.Void", {}, true, &afterLateAddr);
 
         if (!camMgrGetMainCamera || !baseDataGetTransform || !baseDataGetAnimator || !baseDataGetConfigName ||
             !relTfGetGameObject || !relTfGetRawTransform || !playableAnimGetAnimator ||
@@ -677,7 +596,7 @@ struct UnityBindings {
                                  DirectEntry& out) -> bool {
             out = {};
             std::uintptr_t addr = 0;
-            const Method* m = ResolveVerifiedMethod(metadata, rt, ns, cls, name, ret, params, false, nullptr, &addr);
+            const Method* m = ResolveVerifiedMethod(metadata, rt, ns, cls, name, ret, params, false, &addr);
             if (!m || !addr) return false;
             out.address = addr;
             out.method = m;

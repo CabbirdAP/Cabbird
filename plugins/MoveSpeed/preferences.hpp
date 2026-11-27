@@ -1,7 +1,6 @@
 #pragma once
 
-// Read only this plugin's named settings via the host JSON ABI. Profile loading
-// and schema validation use the common host/SDK implementation.
+// Read only this plugin's named settings via the host JSON ABI.
 bool ReadBoolean(Context& context, CabbirdGenerationHandleV1 root, std::string_view key, bool& value) noexcept {
     CabbirdGenerationHandleV1 child{};
     if (!Succeeded(context.json->object_find(context.json->user, root, StringView(key), &child))) return false;
