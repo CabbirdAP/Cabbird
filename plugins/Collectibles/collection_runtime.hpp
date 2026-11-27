@@ -230,6 +230,9 @@ public:
     std::string_view LastInteractionDetails() const noexcept { return interactionDetails_; }
     // True when the last interaction was a hit-collection node, which needs one hit per damage step.
     bool LastHitCollection() const noexcept { return lastHitCollection_; }
+    // Interaction registry size and how many entries matched the last target.
+    std::uint32_t LastRegistered() const noexcept { return lastRegistered_; }
+    std::uint32_t LastTargetMatches() const noexcept { return lastTargetMatches_; }
     bool CancelInteraction(const CabbirdIl2CppServiceV1* service) const {
         receipt_.Cancel(); puzzlePreparedMap_ = 0; puzzlePreparedDetails_.clear();
         std::vector<CabbirdIl2CppGCHandleV1> handles;
@@ -675,6 +678,8 @@ public:
             auto* storage = reinterpret_cast<Object*>(runtime.Functions().il2cpp_object_unbox(enumeration.get()));
             if (!storage || !Value(runtime, next, storage, nullptr, more)) return finish(InteractionState::Unavailable, "registry.MoveNext failed");
             if (!more) {
+                lastRegistered_ = registered;
+                lastTargetMatches_ = targetMatches;
                 details << " registered=" << registered << " entityHosts=" << entityHosts << " targetMatches=" << targetMatches;
                 // A puzzle owner may only expose a discovery-voice action. The
                 // configured graph finish, rather than that voice event, owns
@@ -1195,6 +1200,8 @@ private:
     mutable std::string failure_;
     mutable std::string interactionDetails_;
     mutable bool lastHitCollection_{};
+    mutable std::uint32_t lastRegistered_{};
+    mutable std::uint32_t lastTargetMatches_{};
     bool skipCompleteChests_{true};
     mutable CabbirdIl2CppGCHandleV1 puzzleGraphs_{}, puzzleNodes_{}, puzzleSelected_{}, puzzleSelectedGraph_{}, puzzleOwner_{};
     mutable std::vector<CabbirdIl2CppGCHandleV1> puzzleChildren_;

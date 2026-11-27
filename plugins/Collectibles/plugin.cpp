@@ -22,7 +22,7 @@ using namespace collectibles;
 using Json = nlohmann::json;
 using Clock = std::chrono::steady_clock;
 constexpr auto kConfig = "settings";
-constexpr auto kSchema = R"({"type":"object","required":["chests","collections","settleSeconds"],"additionalProperties":false,"properties":{"chests":{"type":"integer","minimum":0,"maximum":1},"collections":{"type":"integer","minimum":0,"maximum":1},"settleSeconds":{"type":"number","minimum":0.2,"maximum":3},"page":{"type":"integer","minimum":0,"maximum":1000000},"categories":{"type":"array","items":{"type":"integer","minimum":0},"maxItems":64},"readySeconds":{"type":"number","minimum":4,"maximum":30},"skipCompleteChests":{"type":"integer","minimum":0,"maximum":1},"startIndex":{"type":"integer","minimum":1,"maximum":1000000}}})";
+constexpr auto kSchema = R"({"type":"object","required":["chests","collections","settleSeconds"],"additionalProperties":false,"properties":{"chests":{"type":"integer","minimum":0,"maximum":1},"collections":{"type":"integer","minimum":0,"maximum":1},"settleSeconds":{"type":"number","minimum":0.2,"maximum":3},"page":{"type":"integer","minimum":0,"maximum":1000000},"categories":{"type":"array","items":{"type":"integer","minimum":0},"maxItems":64},"readySeconds":{"type":"number","minimum":4,"maximum":30},"skipCompleteChests":{"type":"integer","minimum":0,"maximum":1},"startIndex":{"type":"integer","minimum":1,"maximum":1000000},"earlySkipEmpty":{"type":"integer","minimum":0,"maximum":1}}})";
 struct Settings {
     int chests{1}, collections{1};
     float settleSeconds{.8f};
@@ -32,16 +32,19 @@ struct Settings {
     int skipCompleteChests{1};
     // 1-based queue position the next start begins at.
     std::uint32_t startIndex{1};
+    // Skip a target early once the interaction registry stops changing without ever holding it.
+    int earlySkipEmpty{1};
     std::uint32_t page{};
     // Enabled collection categories (TDWorldCollectingType ids). Empty means "every category".
     std::vector<std::int32_t> categories;
 
     bool operator==(const Settings&) const = default;
 };
-void to_json(Json& j, const Settings& s) { j = {{"chests",s.chests},{"collections",s.collections},{"settleSeconds",s.settleSeconds},{"readySeconds",s.readySeconds},{"skipCompleteChests",s.skipCompleteChests},{"startIndex",s.startIndex},{"page",s.page},{"categories",s.categories}}; }
+void to_json(Json& j, const Settings& s) { j = {{"chests",s.chests},{"collections",s.collections},{"settleSeconds",s.settleSeconds},{"readySeconds",s.readySeconds},{"skipCompleteChests",s.skipCompleteChests},{"startIndex",s.startIndex},{"earlySkipEmpty",s.earlySkipEmpty},{"page",s.page},{"categories",s.categories}}; }
 void from_json(const Json& j, Settings& s) { j.at("chests").get_to(s.chests); j.at("collections").get_to(s.collections); j.at("settleSeconds").get_to(s.settleSeconds); s.readySeconds = j.value("readySeconds", 10.f);
     s.skipCompleteChests = j.value("skipCompleteChests", 1);
-    s.startIndex = j.value("startIndex", 1u); s.page = j.value("page", 0u);
+    s.startIndex = j.value("startIndex", 1u);
+    s.earlySkipEmpty = j.value("earlySkipEmpty", 1); s.page = j.value("page", 0u);
     s.categories.clear();
     if (const auto found = j.find("categories"); found != j.end() && found->is_array())
         for (const auto& id : *found) if (id.is_number_integer()) s.categories.push_back(id.get<std::int32_t>()); }
@@ -51,6 +54,7 @@ bool Valid(const Settings& s) {
         std::isfinite(s.settleSeconds) && s.settleSeconds >= .2f && s.settleSeconds <= 3 &&
         std::isfinite(s.readySeconds) && s.readySeconds >= 4 && s.readySeconds <= 30 &&
         (s.skipCompleteChests == 0 || s.skipCompleteChests == 1) && s.startIndex >= 1 && s.startIndex <= 1000000 &&
+        (s.earlySkipEmpty == 0 || s.earlySkipEmpty == 1) &&
         s.page <= 1000000;
 }
 bool CategoryEnabled(const Settings& settings, const Target& target) {
@@ -74,6 +78,8 @@ struct Model {
     bool scanValid{};
     // Targets walked past because their category is switched off; the progress line subtracts them.
     std::uint32_t filtered{};
+    // Skip breakdown: already complete, never appeared, unsupported action, timed out.
+    std::uint32_t skippedComplete{}, skippedAbsent{}, skippedUnsupported{}, skippedTimeout{};
     // List position (0-based) the run started at, so the visible number matches the list.
     std::size_t listStart{};
     std::vector<CategoryRow> categories;
@@ -137,6 +143,9 @@ struct Context {
     std::uint32_t attempts{};
     std::uint32_t consecutiveFailures{};
     std::uint32_t hitsIssued{};
+    // Registry census while waiting for a target to appear: an unchanged size means loading finished.
+    std::uint32_t registryCount{};
+    Clock::time_point registryStable{};
     Clock::time_point nextHit{};
     Clock::time_point retryAt{};
 };
@@ -311,13 +320,23 @@ void Advance(Context& c, bool completed, bool unknown = false, RouteState result
     c.queue[c.game.visited].route = completed ? RouteState::Complete : unknown ? RouteState::UnknownTimeout : result;
     Changed(c, c.game.visited);
     if (completed) ++c.game.completed;
-    else ++c.game.skipped;
+    else {
+        ++c.game.skipped;
+        switch (result) {
+            case RouteState::AlreadyComplete: ++c.game.skippedComplete; break;
+            case RouteState::NotSpawned: ++c.game.skippedAbsent; break;
+            case RouteState::Unsupported: ++c.game.skippedUnsupported; break;
+            case RouteState::InteractionTimeout: case RouteState::UnknownTimeout: ++c.game.skippedTimeout; break;
+            default: break;
+        }
+    }
     if (unknown) ++c.game.unknownSkipped;
     ++c.game.visited;
     c.attempts = 0;
     c.retryAt = {};
     if (completed) c.consecutiveFailures = 0;
     c.hitsIssued = 0; c.nextHit = {};
+    c.registryCount = 0; c.registryStable = {};
     c.game.phase = c.game.visited == c.queue.size() ? Phase::Complete : Phase::Moving;
     c.deadline = {};
 }
@@ -413,11 +432,12 @@ CabbirdStatusV1 Execute(Work& work, const CabbirdIl2CppApiV1& api) {
             c.game.completed = c.game.skipped = c.game.unknownSkipped = 0;
             c.runCategories = c.settings.categories;
         }
-        // The selection only decides what the route runs; the scan and the queue stay complete.
-        // "filtered" counts skipped targets so that visited - filtered is the position in the list;
-        // starting at a later list position means the disabled targets before it already count.
-        c.game.filtered = c.game.visited > c.game.listStart
-            ? static_cast<std::uint32_t>(c.game.visited - c.game.listStart) : 0;
+        // Only a fresh run re-bases the visible position. A resume keeps the counter it stopped at;
+        // recomputing it here made the list number restart at 1 after every pause.
+        if (fresh) {
+            c.game.filtered = c.game.visited > c.game.listStart
+                ? static_cast<std::uint32_t>(c.game.visited - c.game.listStart) : 0;
+        }
         c.game.phase = c.game.visited < c.queue.size() ? Phase::Moving : Phase::Complete;
         c.game.failure = Failure::None;
         c.lastFailure.clear();
@@ -575,7 +595,22 @@ CabbirdStatusV1 Execute(Work& work, const CabbirdIl2CppApiV1& api) {
         } else if (action == InteractionState::Unsupported) {
             LogInteractionSkip(c, "unsupported native action");
             Advance(c, false, false, RouteState::Unsupported);
+        } else if (c.settings.earlySkipEmpty != 0 && c.collector.LastTargetMatches() == 0) {
+            // No entry for this target yet. Loading grows the registry, so a registry that keeps the
+            // same size for a moment means the scene is settled and the object simply is not there.
+            if (c.collector.LastRegistered() != c.registryCount) {
+                c.registryCount = c.collector.LastRegistered();
+                c.registryStable = now;
+            } else if (c.registryStable != Clock::time_point{} &&
+                       now - c.registryStable >= std::chrono::milliseconds(2000)) {
+                LogInteractionSkip(c, "target never appeared in the interaction registry");
+                Advance(c, false, false, RouteState::NotSpawned);
+                return Ok();
+            }
+            c.settled = now + std::chrono::milliseconds(200);
         } else {
+            c.registryCount = 0;
+            c.registryStable = {};
             c.settled = action == InteractionState::Discovering ? now : now + std::chrono::milliseconds(200);
         }
         return Ok();
@@ -774,6 +809,7 @@ void CABBIRD_CALL Draw(void* raw, const CabbirdUiServiceV1*) noexcept {
         // Only meaningful while chest scanning is on.
         if (c.settings.chests != 0)
             c.ui->checkbox(c.ui->user, StringView(c.text.Text("settings.skip_complete_chests", "Skip chests already marked complete")), &c.settings.skipCompleteChests);
+        c.ui->checkbox(c.ui->user, StringView(c.text.Text("settings.early_skip_empty", "Skip points that never appear (may skip on slow loads)")), &c.settings.earlySkipEmpty);
         c.ui->input_uint32(c.ui->user, StringView(c.text.Text("settings.start_index", "Start at target number")), &c.settings.startIndex, 1, 10);
         if (model && !model->categories.empty()) {
             c.ui->text(c.ui->user, StringView(c.text.Text("settings.categories",
@@ -818,10 +854,16 @@ void CABBIRD_CALL Draw(void* raw, const CabbirdUiServiceV1*) noexcept {
                 visited = std::to_string(visitedCount),
                 unknown = std::to_string(model->unknownSkipped),
                 // 1-based position in the list the user sees, so the run has a visible place.
-                current = std::to_string(std::min<std::uint32_t>(visitedCount + 1, model->total ? model->total : 1));
+                current = std::to_string(std::min<std::uint32_t>(visitedCount + 1, model->total ? model->total : 1)),
+                done = std::to_string(model->skippedComplete), absent = std::to_string(model->skippedAbsent),
+                unsupported = std::to_string(model->skippedUnsupported), timedOut = std::to_string(model->skippedTimeout);
             const std::string_view args[]{total, visited, completed, skipped, unknown, current};
             c.ui->text(c.ui->user, StringView(c.text.Format("queue.progress",
                 "{0} targets; current #{5}; {1} visited; {2} rewards confirmed; {3} skipped ({4} unknown-state timeouts)", args)));
+            // Its own argument list: the placeholder contract only allows {0}..{7}.
+            const std::string_view skipArgs[]{done, absent, unsupported, timedOut};
+            c.ui->text(c.ui->user, StringView(c.text.Format("queue.skip_breakdown",
+                "skipped: {0} already complete, {1} never appeared, {2} unsupported, {3} timed out", skipArgs)));
         }
         const auto results = c.results.load();
         if (results && results->total) {
@@ -879,6 +921,11 @@ CabbirdStatusV1 CABBIRD_CALL Cleanup(void* raw) noexcept {
     auto& c = *static_cast<Context*>(raw);
     c.hold.Cancel();
     return c.hold.End() ? Ok() : Status(CABBIRD_STATUS_V1_FAILED);
+}
+void LogStopFailure(Context& c, const char* reason) noexcept {
+    if (!c.core || !c.core->log) return;
+    const std::string detail = std::string("Collectibles stop: ") + reason;
+    c.core->log(c.core->user, CABBIRD_CORE_LOG_LEVEL_V1_WARNING, StringView(detail));
 }
 void LogLoadFailure(const CabbirdHostApiV1* host, const char* stage, const char* reason) noexcept {
     const auto core = Query<CabbirdCoreServiceV1>(host, CABBIRD_CORE_SERVICE_V1_ID);
@@ -970,21 +1017,29 @@ CabbirdStatusV1 CABBIRD_CALL Stop(void* raw, std::uint32_t) noexcept {
     try {
         auto& c = *static_cast<Context*>(raw);
         c.active.store(false); c.command.store(Command::None);
-        if (!c.hold.Release()) return Status(CABBIRD_STATUS_V1_FAILED);
-        if (!c.collector.StopReceipt() || !c.collector.CancelScan(c.il2cpp)) return Status(CABBIRD_STATUS_V1_FAILED);
+        // The motion hold belongs to the player service and is dropped with the generation anyway,
+        // so a refused release must not quarantine this plugin on reload.
+        if (!c.hold.Release()) LogStopFailure(c, "player motion hold release refused");
+        if (!c.collector.StopReceipt()) { LogStopFailure(c, "reward hook release failed"); return Status(CABBIRD_STATUS_V1_FAILED); }
+        if (!c.collector.CancelScan(c.il2cpp)) { LogStopFailure(c, "il2cpp handle release failed"); return Status(CABBIRD_STATUS_V1_FAILED); }
         c.queue.clear(); c.game.phase = Phase::Stopped;
-        const bool saved = c.saves.Flush();
+        // A reload tears services down around this call, so a refused settings flush or window
+        // release is a teardown race, not a leak: report it and let the stop succeed. Only the
+        // reward hook and the il2cpp handles can outlive the generation, and those already returned.
+        if (!c.saves.Flush()) LogStopFailure(c, "settings flush refused");
         if (c.window.id) {
             const auto status = c.windows->release_window(c.windows->user, c.window);
-            if (!Succeeded(status) && status.code != CABBIRD_STATUS_V1_NOT_FOUND) return status;
+            if (!Succeeded(status) && status.code != CABBIRD_STATUS_V1_NOT_FOUND && status.code != CABBIRD_STATUS_V1_UNAVAILABLE)
+                LogStopFailure(c, "window release refused");
             c.window = {};
         }
         if (c.cleanup.id) {
             const auto cleanup = c.lifecycle->unregister_stop_cleanup(c.lifecycle->user, c.cleanup);
-            if (!Succeeded(cleanup) && cleanup.code != CABBIRD_STATUS_V1_NOT_FOUND) return cleanup;
+            if (!Succeeded(cleanup) && cleanup.code != CABBIRD_STATUS_V1_NOT_FOUND && cleanup.code != CABBIRD_STATUS_V1_UNAVAILABLE)
+                LogStopFailure(c, "stop cleanup unregister refused");
             c.cleanup = {};
         }
-        return saved ? Ok() : Status(CABBIRD_STATUS_V1_FAILED);
+        return Ok();
     } catch (...) { return Status(CABBIRD_STATUS_V1_FAILED); }
 }
 void CABBIRD_CALL Unload(void* raw) noexcept { try { delete static_cast<Context*>(raw); } catch (...) {} }
