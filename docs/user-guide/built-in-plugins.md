@@ -1,6 +1,6 @@
 # 内建插件
 
-运行包提供十四个独立插件包，发行版本统一为 `1.0.0`，默认全部停用。先在插件管理器中加载插件；窗口内另有“启用”开关的功能，还需打开该开关。
+运行包提供十五个独立插件包，发行版本统一为 `1.0.0`，默认全部停用。先在插件管理器中加载插件；窗口内另有“启用”开关的功能，还需打开该开关。
 关闭窗口不会停用插件，停止或卸载请使用插件管理器。
 
 | 插件 | 插件 ID | 功能 |
@@ -8,6 +8,7 @@
 | Entity Overlay | `cabbird.entity-overlay` | 实体框、标签、分类与距离筛选 |
 | IL2CPP Dump | `cabbird.unity-dump` | 按需导出 IL2CPP 类型资料与明文 metadata |
 | Player Coordinates | `cabbird.player-coords` | 读取玩家坐标、持续或手动刷新 |
+| 状态条（Status Bar） | `cabbird.status-bar` | 玻璃状态条、帧率与 1% Low、时间及 CPU/GPU/内存指标 |
 | Player Teleport | `cabbird.player-teleport` | 移动当前受控玩家或列表中的其他角色 |
 | FakeUID | `cabbird.fake-uid` | 替换本地 UID 水印文本 |
 | Damage Multiplier（倍攻） | `cabbird.damage-replay` | 重放当前受控玩家发起的伤害 |
@@ -30,6 +31,7 @@
 | Entity Overlay | `config-entity-overlay-settings.json` |
 | IL2CPP Dump | `config-unity-dump-settings.json` |
 | Player Coordinates | `config-player-coordinates-settings.json` |
+| 状态条（Status Bar） | `config-status-bar-settings.json` |
 | Player Teleport | `config-player-teleport-settings.json` |
 | FakeUID | `config-fake-uid-settings-v1.json` |
 | Damage Multiplier（倍攻） | `config-damage-replay-settings.json` |
@@ -76,6 +78,16 @@ Player Coordinates、Story Tools、FakeUID、IL2CPP Dump、Move Speed、Free Fli
 
 插件配置仅保存持续刷新开关。窗口的尺寸、位置和开合由宿主持久化；
 点击窗口右上角的关闭按钮可隐藏窗口，在插件管理页可重新打开。
+
+## Status Bar
+
+显示玻璃状态条，可选择屏幕上方或下方的左侧、居中、右侧六个位置，调整项目间距，并独立开关帧率、
+1% Low、时间、内存占用、CPU 占用/频率/功耗、GPU 占用/频率/温度/功耗及 Cabbird 徽标。
+帧率每半秒刷新，1% Low 在累计至少 100 帧后显示；硬件指标每秒后台采样，系统或驱动不支持的读数显示 `--`。
+GPU 频率、温度和功耗沿用 NVIDIA NVML，其他显卡的这些项目显示 `--`。
+
+保存项：六个屏幕位置、间距和各显示项开关。关闭设置窗口后状态条继续显示，从插件管理器重新打开设置；停用插件会停止状态条与硬件采样。
+设置保留 Anomaly 的 `key=value` 编解码，通过宿主配置服务保存为 JSON 字符串，编辑后由 Worker 落盘，停止时补存。
 
 ## Player Teleport
 

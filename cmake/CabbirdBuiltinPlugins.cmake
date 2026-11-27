@@ -23,6 +23,12 @@ cabbird_add_plugin(PlayerCoords
     PACKAGE_NAME PlayerCoords)
 target_link_libraries(PlayerCoords PRIVATE nlohmann_json::nlohmann_json)
 
+cabbird_add_plugin(StatusBar
+    SOURCES plugins/StatusBar/plugin.cpp
+    MANIFEST plugins/StatusBar/manifest.json
+    PACKAGE_NAME StatusBar)
+target_link_libraries(StatusBar PRIVATE nlohmann_json::nlohmann_json pdh)
+
 cabbird_add_plugin(FakeUID
     SOURCES plugins/FakeUID/plugin.cpp plugins/FakeUID/uid_runtime.cpp
     MANIFEST plugins/FakeUID/manifest.json

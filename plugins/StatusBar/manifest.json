@@ -1,0 +1,26 @@
+{
+  "schemaVersion": 2,
+  "id": "cabbird.status-bar",
+  "name": "Status Bar",
+  "description": "A glass status bar with frame rate, 1% low, clock, memory load, CPU load, frequency and power, and GPU load, frequency, temperature and power.",
+  "author": "b1ank / Cabbird",
+  "license": "AGPL-3.0-only",
+  "version": "1.0.0",
+  "entry": "plugin.dll",
+  "api": { "major": 1, "minMinor": 0, "maxMinor": 0 },
+  "games": ["ap"],
+  "builds": ["ap-*"],
+  "loadPhase": "game-ready",
+  "services": [
+    { "id": "cabbird.ui", "minVersion": 1 },
+    { "id": "cabbird.font", "minVersion": 1, "optional": true },
+    { "id": "cabbird.texture", "minVersion": 1, "optional": true },
+    { "id": "cabbird.localization", "minVersion": 1 },
+    { "id": "cabbird.config", "minVersion": 1 },
+    { "id": "cabbird.scheduler", "minVersion": 1 },
+    { "id": "cabbird.core", "minVersion": 1, "optional": true }
+  ],
+  "capabilities": [
+    "ui", "ui-font", "ui-texture", "ui-overlay", "configuration", "scheduler"
+  ]
+}

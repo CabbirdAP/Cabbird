@@ -49,3 +49,7 @@ everything under third_party/ is a notice, not code.
 Windows, Direct3D, DXGI, Segoe UI, Unity, IL2CPP and Azur Promilia are names or
 products of their respective owners. They are not redistributed as third-party
 source components by this repository.
+
+The bundled StatusBar plugin is ported from Anomaly's StatusBar by b1ank under
+AGPL-3.0-only. Its Material Symbols Rounded font subset is redistributed under
+Apache-2.0, with the full license in the plugin's assets/MaterialSymbols-LICENSE.txt.
