@@ -3067,9 +3067,19 @@ CabbirdStatusV1 CABBIRD_CALL BeginHookCallbackV1(
 
 CabbirdStatusV1 CABBIRD_CALL EndHookCallbackV1(
     void* user, CabbirdGenerationHandleV1 callback_lease) {
-    return InvokeScopedPlatform(user, [&](PluginServiceContext& context) {
-        return context.platform->EndHookCallback(ScopedPlatformOwner(context), callback_lease);
-    });
+    auto* context = static_cast<PluginServiceContext*>(user);
+    if (!ValidServiceContext(context) || context->platform == nullptr) {
+        return StatusV1(CABBIRD_STATUS_V1_INVALID_ARGUMENT, "plugin service context is invalid");
+    }
+    // The existing hook lease keeps this generation alive. Returning it must
+    // remain possible after FreezeCallbackSources closes new service admission;
+    // acquiring another callback here would strand the lease during hot reload.
+    // EndHookCallback still validates the owner, generation and live lease token.
+    try {
+        return context->platform->EndHookCallback(ScopedPlatformOwner(*context), callback_lease);
+    } catch (...) {
+        return StatusV1(CABBIRD_STATUS_V1_FAILED, "hook callback lease release failed");
+    }
 }
 
 CabbirdStatusV1 CABBIRD_CALL ApplyPatchV1(
