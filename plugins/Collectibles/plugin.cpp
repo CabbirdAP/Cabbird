@@ -121,6 +121,8 @@ struct Context {
     // run of consecutive failures stops the route so it cannot spin through a broken world.
     std::uint32_t attempts{};
     std::uint32_t consecutiveFailures{};
+    std::uint32_t hitsIssued{};
+    Clock::time_point nextHit{};
     Clock::time_point retryAt{};
 };
 CabbirdStatusV1 Status(std::uint32_t code) noexcept { return {code, 0, {}}; }
@@ -268,6 +270,8 @@ void LogTargetResult(Context& c, const Target& target, std::string_view result) 
 // One target failing must not end the run: log it, skip it, and keep going until several fail in
 // a row (that indicates the world or the services are broken rather than one bad object).
 constexpr std::uint32_t kTargetAttempts = 2;
+// Hits a hit-collection node may need before its damage steps are exhausted.
+constexpr std::uint32_t kHitAttempts = 24;
 constexpr std::uint32_t kConsecutiveFailureLimit = 5;
 void Advance(Context& c, bool completed, bool unknown, RouteState result);
 void SkipTarget(Context& c, RouteState result, std::string_view reason) {
@@ -298,6 +302,7 @@ void Advance(Context& c, bool completed, bool unknown = false, RouteState result
     c.attempts = 0;
     c.retryAt = {};
     if (completed) c.consecutiveFailures = 0;
+    c.hitsIssued = 0; c.nextHit = {};
     c.game.phase = c.game.visited == c.queue.size() ? Phase::Complete : Phase::Moving;
     c.deadline = {};
 }
@@ -464,8 +469,11 @@ CabbirdStatusV1 Execute(Work& work, const CabbirdIl2CppApiV1& api) {
         if (Succeeded(status) && (c.sequenceObserved || !c.haveBaseline || result.request_sequence != c.baseline)) {
             const bool ours = (!c.sequenceObserved || result.request_sequence == c.observedSequence) && result.entity_id == c.playerId &&
                 std::equal(c.requested.begin(), c.requested.end(), result.applied_position);
-            if (!ours || (result.result_code != CABBIRD_UNITY_PLAYER_WRITE_V1_RESULT_OK &&
-                          result.result_code != CABBIRD_UNITY_PLAYER_WRITE_V1_RESULT_PENDING)) {
+            const bool accepted = result.result_code == CABBIRD_UNITY_PLAYER_WRITE_V1_RESULT_OK ||
+                result.result_code == CABBIRD_UNITY_PLAYER_WRITE_V1_RESULT_PENDING;
+            const bool refusedButApplied = result.result_code == CABBIRD_UNITY_PLAYER_WRITE_V1_RESULT_REFUSED &&
+                ours && result.position_error <= 1.0f;
+            if (!ours || (!accepted && !refusedButApplied)) {
                 const auto coordinates = [](const auto& values) {
                     return '(' + std::to_string(values[0]) + ',' + std::to_string(values[1]) + ',' + std::to_string(values[2]) + ')';
                 };
@@ -483,12 +491,16 @@ CabbirdStatusV1 Execute(Work& work, const CabbirdIl2CppApiV1& api) {
                 if (status.message.data && status.message.size) detail.append(" nativeReason=").append(status.message.data, status.message.size);
                 detail += " " + c.hold.Diagnostics();
                 c.hold.End();
-                SkipTarget(c, RouteState::Failed, detail);
+                // A refused or reverted teleport is a target-level skip; only a genuine identity or
+                // position mismatch is worth showing as a failure.
+                const bool refused = result.result_code == CABBIRD_UNITY_PLAYER_WRITE_V1_RESULT_REFUSED ||
+                    result.result_code == CABBIRD_UNITY_PLAYER_WRITE_V1_RESULT_REVERTED;
+                SkipTarget(c, refused ? RouteState::Skipped : RouteState::Failed, detail);
                 return Ok();
             }
             c.observedSequence = result.request_sequence;
             c.sequenceObserved = true;
-            if (result.result_code == CABBIRD_UNITY_PLAYER_WRITE_V1_RESULT_OK) {
+            if (result.result_code == CABBIRD_UNITY_PLAYER_WRITE_V1_RESULT_OK || refusedButApplied) {
                 if (!c.collector.RefreshArrival(runtime, target))
                     LogInteractionSkip(c, "arrival AOI refresh failed; settling anyway");
                 c.game.phase = Phase::Settling;
@@ -498,7 +510,7 @@ CabbirdStatusV1 Execute(Work& work, const CabbirdIl2CppApiV1& api) {
                 c.deadline = now + std::chrono::seconds(10);
             }
         }
-        if (now >= c.deadline) SkipTarget(c, RouteState::Failed, "player-teleport.state confirmation timeout");
+        if (now >= c.deadline) SkipTarget(c, RouteState::Skipped, "player-teleport.state confirmation timeout");
         return Ok();
     }
     if (c.game.phase == Phase::Settling) {
@@ -526,6 +538,8 @@ CabbirdStatusV1 Execute(Work& work, const CabbirdIl2CppApiV1& api) {
             c.game.phase = Phase::Interacting;
             target.route = RouteState::Interacting; Changed(c, c.game.visited);
             c.deadline = now + std::chrono::seconds(10);
+            c.hitsIssued = c.collector.LastHitCollection() ? 1 : 0;
+            c.nextHit = now + std::chrono::milliseconds(500);
         } else if (action == InteractionState::Unavailable) {
             // A failed registry query is not fatal: keep trying until this target's deadline.
             if (now >= c.deadline) SkipTarget(c, RouteState::Failed, c.collector.LastInteractionDetails());
@@ -550,6 +564,13 @@ CabbirdStatusV1 Execute(Work& work, const CabbirdIl2CppApiV1& api) {
             Advance(c, true);
         }
         else if (transient && now < c.deadline) return Ok();
+        else if (c.collector.LastHitCollection() && c.hitsIssued > 0 && c.hitsIssued < kHitAttempts && now >= c.nextHit) {
+            // Chopping and mining nodes lose one damage step per hit, so keep hitting while the
+            // server has not reported the collection yet.
+            ++c.hitsIssued;
+            c.nextHit = now + std::chrono::milliseconds(500);
+            static_cast<void>(c.collector.Interact(runtime, target));
+        }
         else if (state == CompletionState::Unavailable) SkipTarget(c, RouteState::Failed, "server completion state unavailable while waiting for the reward response");
         else if (now >= c.deadline) { LogInteractionSkip(c, "native action dispatched but no matching completed reward response was confirmed"); Advance(c, false, state == CompletionState::Unknown, RouteState::InteractionTimeout); }
     }
