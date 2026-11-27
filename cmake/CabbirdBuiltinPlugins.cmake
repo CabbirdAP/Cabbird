@@ -74,6 +74,13 @@ cabbird_add_plugin(Collectibles
     PACKAGE_NAME Collectibles)
 target_link_libraries(Collectibles PRIVATE nlohmann_json::nlohmann_json)
 
+cabbird_add_plugin(BetterPose
+    SOURCES plugins/BetterPose/plugin.cpp
+    MANIFEST plugins/BetterPose/manifest.json
+    PACKAGE_NAME BetterPose)
+target_link_libraries(BetterPose PRIVATE nlohmann_json::nlohmann_json)
+target_compile_options(BetterPose PRIVATE /utf-8)
+
 endif()
 
 # Each preview build refreshes the same package inventory as the release.

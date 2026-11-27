@@ -1,0 +1,106 @@
+{
+  "schemaVersion": 2,
+  "id": "cabbird.better-pose",
+  "name": "BetterPose",
+  "description": "Visual 3D skeleton pose editor for Unity characters: on-screen joint gizmos, direct bone dragging with optional 2-bone IK and anatomical limits, orbit camera, symmetry mirroring, undo/redo, and JSON pose import/export.",
+  "author": "Cabbird",
+  "license": "AGPL-3.0-only",
+  "version": "1.0.0",
+  "entry": "plugin.dll",
+  "api": {
+    "major": 1,
+    "minMinor": 0,
+    "maxMinor": 0
+  },
+  "games": [
+    "ap"
+  ],
+  "builds": [
+    "ap-*"
+  ],
+  "loadPhase": "game-ready",
+  "services": [
+    {
+      "id": "cabbird.core",
+      "minVersion": 1
+    },
+    {
+      "id": "cabbird.ui",
+      "minVersion": 1
+    },
+    {
+      "id": "cabbird.window",
+      "minVersion": 1
+    },
+    {
+      "id": "cabbird.input",
+      "minVersion": 1
+    },
+    {
+      "id": "cabbird.profile",
+      "minVersion": 1
+    },
+    {
+      "id": "cabbird.json",
+      "minVersion": 1
+    },
+    {
+      "id": "cabbird.unity.il2cpp",
+      "minVersion": 1
+    },
+    {
+      "id": "cabbird.unity.metadata",
+      "minVersion": 1
+    },
+    {
+      "id": "cabbird.unity.player",
+      "minVersion": 1,
+      "optional": true
+    },
+    {
+      "id": "cabbird.unity.entities",
+      "minVersion": 1,
+      "optional": true
+    },
+    {
+      "id": "cabbird.game-lifecycle",
+      "minVersion": 1
+    },
+    {
+      "id": "cabbird.interop.hook",
+      "minVersion": 1,
+      "optional": true
+    },
+    {
+      "id": "cabbird.config",
+      "minVersion": 1
+    },
+    {
+      "id": "cabbird.plugin-state",
+      "minVersion": 1,
+      "optional": true
+    },
+    {
+      "id": "cabbird.scheduler",
+      "minVersion": 1
+    },
+    {
+      "id": "cabbird.localization",
+      "minVersion": 1
+    }
+  ],
+  "capabilities": [
+    "ui",
+    "ui-window",
+    "input",
+    "json",
+    "memory-read",
+    "unity-il2cpp",
+    "unity-metadata",
+    "unity-player-snapshot",
+    "unity-entities",
+    "interop-hook",
+    "configuration",
+    "scheduler"
+  ]
+}
