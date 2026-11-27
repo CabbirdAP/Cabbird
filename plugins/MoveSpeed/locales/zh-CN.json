@@ -1,0 +1,23 @@
+{
+  "schemaVersion": 1,
+  "locale": "zh-CN",
+  "messages": {
+    "window.title": "移动速度",
+    "plugin.description": "调整已验证的移动与飞行坐骑输入，保留普通跳跃曲线和全局时间。",
+    "load.services": "所需的宿主服务不可用。",
+    "load.profile": "移动兼容资料不可用。",
+    "load.layout": "移动兼容资料的实体归属布局不受支持。",
+    "load.schema": "无法注册移速设置。",
+    "enabled": "启用",
+    "player-only": "仅调整受控实体",
+    "factor": "移动速度倍率",
+    "log.settings-invalid": "移动速度：已保存设置无效，保留默认值。",
+    "log.field": "移动速度：字段 {0}.{1} 不兼容。",
+    "log.states": "移动速度：移动状态元数据不兼容，保留游戏原有移动。",
+    "log.entry": "移动速度：{0} 的原生入口校验失败，此路径保持原样。",
+    "log.metadata": "移动速度：{0} 的方法元数据不匹配，此路径保持原样。",
+    "log.alias": "移动速度：{0} 共用了不兼容的原生入口，此路径保持原样。",
+    "log.hook": "移动速度：宿主无法创建 {0} 钩子，此路径保持原样。",
+    "log.save-queue": "移动速度：设置无法加入保存队列，将在停止时重试尚未保存的更改。"
+  }
+}

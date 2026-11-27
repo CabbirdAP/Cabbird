@@ -7,7 +7,9 @@
 #include "cabbird/plugin_dependency_resolver.hpp"
 #include "cabbird/plugin_native_dependency.hpp"
 #include "cabbird/plugin_package.hpp"
+#include "cabbird/plugin_profile.hpp"
 #include "cabbird/scoped_platform_services.hpp"
+#include "cabbird/web_server.hpp"
 #include "cabbird/structured_logger.hpp"
 #include "cabbird/thread_local_value.hpp"
 #include "cabbird/ui_resource_decoder.hpp"
@@ -293,19 +295,22 @@ std::string Utf8(const std::filesystem::path& path) {
 constexpr std::uintmax_t kMaximumUiWindowStateFileBytes = 2U * 1024U * 1024U;
 constexpr std::size_t kMaximumUiPersistentWindows = 10000U;
 constexpr std::size_t kMaximumPersistentPluginWindows = 10000U;
+constexpr std::size_t kMaximumPersistentPluginFavorites = 10000U;
 constexpr std::size_t kMaximumPluginIdBytes = 255U;
 constexpr auto kUiWindowStateSaveInterval = std::chrono::milliseconds(500);
 
 struct PersistentUiState final {
     std::vector<cabbird::UiWindowPersistentState> windows;
     std::unordered_map<std::string, bool> plugin_windows;
+    std::unordered_set<std::string> favorites;
 };
 
 std::string SerializeUiWindowState(
     const std::vector<cabbird::UiWindowPersistentState>& windows,
-    const std::unordered_map<std::string, bool>& plugin_windows) {
+    const std::unordered_map<std::string, bool>& plugin_windows,
+    const std::unordered_set<std::string>& favorites) {
     nlohmann::json document{{"schemaVersion", 1}, {"windows", nlohmann::json::array()},
-        {"pluginWindows", nlohmann::json::array()}};
+        {"pluginWindows", nlohmann::json::array()}, {"favorites", nlohmann::json::array()}};
     for (const cabbird::UiWindowPersistentState& window : windows) {
         document["windows"].push_back({
             {"stableId", window.stable_id},
@@ -325,6 +330,11 @@ std::string SerializeUiWindowState(
         document["pluginWindows"].push_back({
             {"pluginId", plugin_id},
             {"visible", visible}});
+    }
+    std::vector<std::string> sorted_favorites(favorites.begin(), favorites.end());
+    std::ranges::sort(sorted_favorites);
+    for (const std::string& plugin_id : sorted_favorites) {
+        document["favorites"].push_back(plugin_id);
     }
     return document.dump(2) + '\n';
 }
@@ -358,6 +368,21 @@ PersistentUiState ParseUiWindowState(
         result.windows.push_back(std::move(state));
     }
 
+    if (document.contains("favorites")) {
+        const nlohmann::json& favorites = document["favorites"];
+        if (!favorites.is_array() || favorites.size() > kMaximumPersistentPluginFavorites) {
+            throw std::runtime_error("plugin favorites collection is invalid");
+        }
+        result.favorites.reserve(favorites.size());
+        for (const nlohmann::json& item : favorites) {
+            if (!item.is_string()) throw std::runtime_error("plugin favorite record is invalid");
+            std::string plugin_id = item.get<std::string>();
+            if (plugin_id.empty() || plugin_id.size() > kMaximumPluginIdBytes ||
+                !result.favorites.insert(std::move(plugin_id)).second) {
+                throw std::runtime_error("plugin favorite value is invalid");
+            }
+        }
+    }
     if (!document.contains("pluginWindows")) return result;
     const nlohmann::json& plugin_windows = document["pluginWindows"];
     if (!plugin_windows.is_array() ||
@@ -1163,6 +1188,212 @@ int CABBIRD_CALL ProxyTextLink(
         : 0;
 }
 
+void CABBIRD_CALL ProxyTextWrapped(void* user, CabbirdStringViewV1 text) {
+    const auto* context = UiProxyContext(user);
+    auto callback = AcquireUiCallback(context);
+    if (context != nullptr && context->scope != nullptr && !callback) return;
+    if (context != nullptr &&
+        HasUiField<decltype(CabbirdUiServiceV1::text_wrapped)>(
+            context->service, offsetof(CabbirdUiServiceV1, text_wrapped)) &&
+        context->service->text_wrapped != nullptr) {
+        context->service->text_wrapped(context->service->user, text);
+    }
+}
+
+int CABBIRD_CALL ProxyBeginChildAutoFitY(
+    void* user, CabbirdStringViewV1 id, float width, float max_height) {
+    auto* context = UiProxyContext(user);
+    auto callback = AcquireUiCallback(context);
+    if (context != nullptr && context->scope != nullptr && !callback) return 0;
+    if (context == nullptr ||
+        !HasUiField<decltype(CabbirdUiServiceV1::begin_child_auto_fit_y)>(
+            context->service, offsetof(CabbirdUiServiceV1, begin_child_auto_fit_y)) ||
+        !HasUiField<decltype(CabbirdUiServiceV1::end_child)>(
+            context->service, offsetof(CabbirdUiServiceV1, end_child)) ||
+        context->service->begin_child_auto_fit_y == nullptr || context->service->end_child == nullptr ||
+        !ReserveUiStackEntry(context)) {
+        return 0;
+    }
+    const int result = context->service->begin_child_auto_fit_y(
+        context->service->user, id, width, max_height);
+    // ImGui child regions require EndChild even when BeginChild returns false.
+    context->ui_stack->PushReserved({UiStackEntryKind::Child});
+    return result;
+}
+
+int CABBIRD_CALL ProxySliderFloatEnabled(
+    void* user, CabbirdStringViewV1 label, float* value, float minimum, float maximum, int enabled) {
+    const auto* context = UiProxyContext(user);
+    auto callback = AcquireUiCallback(context);
+    if (context != nullptr && context->scope != nullptr && !callback) return 0;
+    return context != nullptr &&
+            HasUiField<decltype(CabbirdUiServiceV1::slider_float_enabled)>(
+                context->service, offsetof(CabbirdUiServiceV1, slider_float_enabled)) &&
+            context->service->slider_float_enabled != nullptr
+        ? context->service->slider_float_enabled(context->service->user, label, value, minimum, maximum, enabled)
+        : 0;
+}
+
+int CABBIRD_CALL ProxyCheckboxSquare(void* user, CabbirdStringViewV1 label, int* value) {
+    const auto* context = UiProxyContext(user);
+    auto callback = AcquireUiCallback(context);
+    if (context != nullptr && context->scope != nullptr && !callback) return 0;
+    return context != nullptr &&
+            HasUiField<decltype(CabbirdUiServiceV1::checkbox_square)>(
+                context->service, offsetof(CabbirdUiServiceV1, checkbox_square)) &&
+            context->service->checkbox_square != nullptr
+        ? context->service->checkbox_square(context->service->user, label, value) : 0;
+}
+
+int CABBIRD_CALL ProxyButtonSelected(
+    void* user, CabbirdStringViewV1 label, float width, float height,
+    int selected, int enabled) {
+    const auto* context = UiProxyContext(user);
+    auto callback = AcquireUiCallback(context);
+    if (context != nullptr && context->scope != nullptr && !callback) return 0;
+    return context != nullptr &&
+            HasUiField<decltype(CabbirdUiServiceV1::button_selected)>(
+                context->service, offsetof(CabbirdUiServiceV1, button_selected)) &&
+            context->service->button_selected != nullptr
+        ? context->service->button_selected(
+              context->service->user, label, width, height, selected, enabled)
+        : 0;
+}
+
+void CABBIRD_CALL ProxySetNextItemWidth(void* user, const float width) {
+    const auto* context = UiProxyContext(user);
+    auto callback = AcquireUiCallback(context);
+    if (context != nullptr && context->scope != nullptr && !callback) return;
+    if (context != nullptr &&
+        HasUiField<decltype(CabbirdUiServiceV1::set_next_item_width)>(
+            context->service, offsetof(CabbirdUiServiceV1, set_next_item_width)) &&
+        context->service->set_next_item_width != nullptr) {
+        context->service->set_next_item_width(context->service->user, width);
+    }
+}
+
+const CabbirdUiServiceV1* OverlayService(const PluginUiProxyContext* context) noexcept {
+    const CabbirdUiServiceV1* const service =
+        context != nullptr ? context->service : nullptr;
+    return HasUiField<decltype(CabbirdUiServiceV1::overlay_text)>(
+               service, offsetof(CabbirdUiServiceV1, overlay_text)) &&
+            service->overlay_viewport_size != nullptr && service->overlay_glass != nullptr &&
+            service->overlay_rect_filled != nullptr && service->overlay_line != nullptr &&
+            service->overlay_circle != nullptr && service->overlay_ring_sector != nullptr &&
+            service->overlay_measure_text != nullptr && service->overlay_text != nullptr
+        ? service
+        : nullptr;
+}
+
+void CABBIRD_CALL ProxyOverlayViewportSize(void* user, float* width, float* height) {
+    const auto* context = UiProxyContext(user);
+    if (width != nullptr) *width = 0.0F;
+    if (height != nullptr) *height = 0.0F;
+    auto callback = AcquireUiCallback(context);
+    const auto* service = OverlayService(context);
+    if ((context == nullptr || (context->scope != nullptr && !callback)) || service == nullptr || service->overlay_viewport_size == nullptr) return;
+    service->overlay_viewport_size(service->user, width, height);
+}
+
+int CABBIRD_CALL ProxyOverlayGlass(void* user, float x, float y, float width, float height,
+    const CabbirdUiGlassStyleV1* style) {
+    const auto* context = UiProxyContext(user);
+    auto callback = AcquireUiCallback(context);
+    const auto* service = OverlayService(context);
+    if ((context == nullptr || (context->scope != nullptr && !callback)) || service == nullptr || service->overlay_glass == nullptr) return 0;
+    return service->overlay_glass(service->user, x, y, width, height, style);
+}
+
+void CABBIRD_CALL ProxyOverlayRectFilled(void* user, float x, float y, float width,
+    float height, std::uint32_t color, float rounding) {
+    const auto* context = UiProxyContext(user);
+    auto callback = AcquireUiCallback(context);
+    const auto* service = OverlayService(context);
+    if ((context == nullptr || (context->scope != nullptr && !callback)) || service == nullptr || service->overlay_rect_filled == nullptr) return;
+    service->overlay_rect_filled(service->user, x, y, width, height, color, rounding);
+}
+
+void CABBIRD_CALL ProxyOverlayLine(void* user, float x0, float y0, float x1, float y1,
+    std::uint32_t color, float thickness) {
+    const auto* context = UiProxyContext(user);
+    auto callback = AcquireUiCallback(context);
+    const auto* service = OverlayService(context);
+    if ((context == nullptr || (context->scope != nullptr && !callback)) || service == nullptr || service->overlay_line == nullptr) return;
+    service->overlay_line(service->user, x0, y0, x1, y1, color, thickness);
+}
+
+void CABBIRD_CALL ProxyOverlayCircle(void* user, float center_x, float center_y,
+    float radius, std::uint32_t color, float thickness) {
+    const auto* context = UiProxyContext(user);
+    auto callback = AcquireUiCallback(context);
+    const auto* service = OverlayService(context);
+    if ((context == nullptr || (context->scope != nullptr && !callback)) || service == nullptr || service->overlay_circle == nullptr) return;
+    service->overlay_circle(service->user, center_x, center_y, radius, color, thickness);
+}
+
+void CABBIRD_CALL ProxyOverlayRingSector(void* user, float center_x, float center_y,
+    float inner_radius, float outer_radius, float angle_start, float angle_end,
+    std::uint32_t color) {
+    const auto* context = UiProxyContext(user);
+    auto callback = AcquireUiCallback(context);
+    const auto* service = OverlayService(context);
+    if ((context == nullptr || (context->scope != nullptr && !callback)) || service == nullptr || service->overlay_ring_sector == nullptr) return;
+    service->overlay_ring_sector(service->user, center_x, center_y, inner_radius,
+        outer_radius, angle_start, angle_end, color);
+}
+
+void CABBIRD_CALL ProxyOverlayMeasureText(
+    void* user, CabbirdStringViewV1 text, float font_size, float* width, float* height) {
+    const auto* context = UiProxyContext(user);
+    if (width != nullptr) *width = 0.0F;
+    if (height != nullptr) *height = 0.0F;
+    auto callback = AcquireUiCallback(context);
+    const auto* service = OverlayService(context);
+    if ((context == nullptr || (context->scope != nullptr && !callback)) || service == nullptr || service->overlay_measure_text == nullptr) return;
+    service->overlay_measure_text(service->user, text, font_size, width, height);
+}
+
+void CABBIRD_CALL ProxyOverlayText(void* user, float x, float y, CabbirdStringViewV1 text,
+    std::uint32_t color, float font_size) {
+    const auto* context = UiProxyContext(user);
+    auto callback = AcquireUiCallback(context);
+    const auto* service = OverlayService(context);
+    if ((context == nullptr || (context->scope != nullptr && !callback)) || service == nullptr || service->overlay_text == nullptr) return;
+    service->overlay_text(service->user, x, y, text, color, font_size);
+}
+
+int CABBIRD_CALL ProxyOverlayGlassRingSector(void* user, float center_x, float center_y,
+    float inner_radius, float outer_radius, float angle_start, float angle_end,
+    const CabbirdUiGlassStyleV1* style) {
+    const auto* context = UiProxyContext(user);
+    auto callback = AcquireUiCallback(context);
+    const auto* service = OverlayService(context);
+    if ((context == nullptr || (context->scope != nullptr && !callback)) || service == nullptr ||
+        !HasUiField<decltype(CabbirdUiServiceV1::overlay_glass_ring_sector)>(
+            service, offsetof(CabbirdUiServiceV1, overlay_glass_ring_sector)) ||
+        service->overlay_glass_ring_sector == nullptr) {
+        return 0;
+    }
+    return service->overlay_glass_ring_sector(service->user, center_x, center_y,
+        inner_radius, outer_radius, angle_start, angle_end, style);
+}
+
+int CABBIRD_CALL ProxyDrawScreenPrimitives(
+    void* user, const CabbirdUiScreenPrimitiveV1* primitives,
+    const std::size_t count) {
+    const auto* context = UiProxyContext(user);
+    auto callback = AcquireUiCallback(context);
+    if (context != nullptr && context->scope != nullptr && !callback) return 0;
+    return context != nullptr && context->service != nullptr &&
+            HasUiField<decltype(CabbirdUiServiceV1::draw_screen_primitives)>(
+                context->service,
+                offsetof(CabbirdUiServiceV1, draw_screen_primitives)) &&
+            context->service->draw_screen_primitives != nullptr
+        ? context->service->draw_screen_primitives(
+              context->service->user, primitives, count)
+        : 0;
+}
+
 CabbirdUiServiceV1 MakeUiProxy(PluginUiProxyContext* context) noexcept {
     CabbirdUiServiceV1 proxy{
         sizeof(CabbirdUiServiceV1), CABBIRD_UI_SERVICE_V1_VERSION,
@@ -1178,6 +1409,23 @@ CabbirdUiServiceV1 MakeUiProxy(PluginUiProxyContext* context) noexcept {
         ProxyDeveloperModeEnabled, ProxyInputText, ProxyButtonEnabled,
         ProxySameLine, ProxySetCursorPosX, ProxyTextLink,
         ProxyBeginTabBar, ProxyBeginTabItem, ProxyEndTabItem, ProxyEndTabBar};
+    proxy.text_wrapped = ProxyTextWrapped;
+    proxy.begin_child_auto_fit_y = ProxyBeginChildAutoFitY;
+    proxy.slider_float_enabled = ProxySliderFloatEnabled;
+    proxy.set_next_item_width = ProxySetNextItemWidth;
+    proxy.overlay_viewport_size = ProxyOverlayViewportSize;
+    proxy.overlay_glass = ProxyOverlayGlass;
+    proxy.overlay_rect_filled = ProxyOverlayRectFilled;
+    proxy.overlay_line = ProxyOverlayLine;
+    proxy.overlay_circle = ProxyOverlayCircle;
+    proxy.overlay_ring_sector = ProxyOverlayRingSector;
+    proxy.overlay_measure_text = ProxyOverlayMeasureText;
+    proxy.overlay_text = ProxyOverlayText;
+    proxy.overlay_glass_ring_sector = ProxyOverlayGlassRingSector;
+    proxy.draw_screen_primitives = ProxyDrawScreenPrimitives;
+    proxy.checkbox_square = ProxyCheckboxSquare;
+    proxy.button_selected = ProxyButtonSelected;
+
     if (context == nullptr || context->service == nullptr) {
         proxy.struct_size = offsetof(CabbirdUiServiceV1, user) + sizeof(proxy.user);
         return proxy;
@@ -1226,6 +1474,86 @@ CabbirdUiServiceV1 MakeUiProxy(PluginUiProxyContext* context) noexcept {
         context->service->end_tab_bar == nullptr) {
         advertised_size = (std::min)(
             advertised_size, offsetof(CabbirdUiServiceV1, end_tab_bar));
+    }
+    if (!HasUiField<decltype(CabbirdUiServiceV1::text_wrapped)>(
+            context->service, offsetof(CabbirdUiServiceV1, text_wrapped)) ||
+        context->service->text_wrapped == nullptr) {
+        advertised_size = (std::min)(advertised_size, offsetof(CabbirdUiServiceV1, text_wrapped));
+    }
+    if (!HasUiField<decltype(CabbirdUiServiceV1::begin_child_auto_fit_y)>(
+            context->service, offsetof(CabbirdUiServiceV1, begin_child_auto_fit_y)) ||
+        context->service->begin_child_auto_fit_y == nullptr) {
+        advertised_size = (std::min)(advertised_size, offsetof(CabbirdUiServiceV1, begin_child_auto_fit_y));
+    }
+    if (!HasUiField<decltype(CabbirdUiServiceV1::slider_float_enabled)>(
+            context->service, offsetof(CabbirdUiServiceV1, slider_float_enabled)) ||
+        context->service->slider_float_enabled == nullptr) {
+        advertised_size = (std::min)(advertised_size, offsetof(CabbirdUiServiceV1, slider_float_enabled));
+    }
+    if (!HasUiField<decltype(CabbirdUiServiceV1::set_next_item_width)>(
+            context->service, offsetof(CabbirdUiServiceV1, set_next_item_width)) ||
+        context->service->set_next_item_width == nullptr) {
+        advertised_size = (std::min)(advertised_size, offsetof(CabbirdUiServiceV1, set_next_item_width));
+    }
+    if (!HasUiField<decltype(CabbirdUiServiceV1::overlay_viewport_size)>(
+            context->service, offsetof(CabbirdUiServiceV1, overlay_viewport_size)) ||
+        context->service->overlay_viewport_size == nullptr) {
+        advertised_size = (std::min)(advertised_size, offsetof(CabbirdUiServiceV1, overlay_viewport_size));
+    }
+    if (!HasUiField<decltype(CabbirdUiServiceV1::overlay_glass)>(
+            context->service, offsetof(CabbirdUiServiceV1, overlay_glass)) ||
+        context->service->overlay_glass == nullptr) {
+        advertised_size = (std::min)(advertised_size, offsetof(CabbirdUiServiceV1, overlay_glass));
+    }
+    if (!HasUiField<decltype(CabbirdUiServiceV1::overlay_rect_filled)>(
+            context->service, offsetof(CabbirdUiServiceV1, overlay_rect_filled)) ||
+        context->service->overlay_rect_filled == nullptr) {
+        advertised_size = (std::min)(advertised_size, offsetof(CabbirdUiServiceV1, overlay_rect_filled));
+    }
+    if (!HasUiField<decltype(CabbirdUiServiceV1::overlay_line)>(
+            context->service, offsetof(CabbirdUiServiceV1, overlay_line)) ||
+        context->service->overlay_line == nullptr) {
+        advertised_size = (std::min)(advertised_size, offsetof(CabbirdUiServiceV1, overlay_line));
+    }
+    if (!HasUiField<decltype(CabbirdUiServiceV1::overlay_circle)>(
+            context->service, offsetof(CabbirdUiServiceV1, overlay_circle)) ||
+        context->service->overlay_circle == nullptr) {
+        advertised_size = (std::min)(advertised_size, offsetof(CabbirdUiServiceV1, overlay_circle));
+    }
+    if (!HasUiField<decltype(CabbirdUiServiceV1::overlay_ring_sector)>(
+            context->service, offsetof(CabbirdUiServiceV1, overlay_ring_sector)) ||
+        context->service->overlay_ring_sector == nullptr) {
+        advertised_size = (std::min)(advertised_size, offsetof(CabbirdUiServiceV1, overlay_ring_sector));
+    }
+    if (!HasUiField<decltype(CabbirdUiServiceV1::overlay_measure_text)>(
+            context->service, offsetof(CabbirdUiServiceV1, overlay_measure_text)) ||
+        context->service->overlay_measure_text == nullptr) {
+        advertised_size = (std::min)(advertised_size, offsetof(CabbirdUiServiceV1, overlay_measure_text));
+    }
+    if (!HasUiField<decltype(CabbirdUiServiceV1::overlay_text)>(
+            context->service, offsetof(CabbirdUiServiceV1, overlay_text)) ||
+        context->service->overlay_text == nullptr) {
+        advertised_size = (std::min)(advertised_size, offsetof(CabbirdUiServiceV1, overlay_text));
+    }
+    if (!HasUiField<decltype(CabbirdUiServiceV1::overlay_glass_ring_sector)>(
+            context->service, offsetof(CabbirdUiServiceV1, overlay_glass_ring_sector)) ||
+        context->service->overlay_glass_ring_sector == nullptr) {
+        advertised_size = (std::min)(advertised_size, offsetof(CabbirdUiServiceV1, overlay_glass_ring_sector));
+    }
+    if (!HasUiField<decltype(CabbirdUiServiceV1::draw_screen_primitives)>(
+            context->service, offsetof(CabbirdUiServiceV1, draw_screen_primitives)) ||
+        context->service->draw_screen_primitives == nullptr) {
+        advertised_size = (std::min)(advertised_size, offsetof(CabbirdUiServiceV1, draw_screen_primitives));
+    }
+    if (!HasUiField<decltype(CabbirdUiServiceV1::checkbox_square)>(
+            context->service, offsetof(CabbirdUiServiceV1, checkbox_square)) ||
+        context->service->checkbox_square == nullptr) {
+        advertised_size = (std::min)(advertised_size, offsetof(CabbirdUiServiceV1, checkbox_square));
+    }
+    if (!HasUiField<decltype(CabbirdUiServiceV1::button_selected)>(
+            context->service, offsetof(CabbirdUiServiceV1, button_selected)) ||
+        context->service->button_selected == nullptr) {
+        advertised_size = (std::min)(advertised_size, offsetof(CabbirdUiServiceV1, button_selected));
     }
     proxy.struct_size = static_cast<std::uint32_t>(advertised_size);
     return proxy;
@@ -1331,13 +1659,32 @@ struct JsonNode final {
     nlohmann::json* value{};
 };
 
+struct WebCallbackBinding final {
+    std::shared_ptr<cabbird::PluginScope> scope;
+    std::uint64_t generation{};
+    CabbirdWebCallbackV1 callback{};
+    void* callback_user{};
+};
+
 struct PluginServiceContext {
+    struct MotionRequest {
+        const CabbirdUnityPlayerMotionServiceV1* adapter{};
+        CabbirdGenerationHandleV1 native_handle{};
+        std::atomic_bool revoked{};
+        ~MotionRequest() {
+            if (adapter && native_handle.id && !revoked.exchange(true)) {
+                try { static_cast<void>(adapter->release(adapter->user, native_handle)); }
+                catch (...) {}
+            }
+        }
+    };
     PluginManager* manager{};
     PluginUiProxyContext* ui_proxy_context{};
     UiStackTracker* ui_stack{};
     std::string plugin_id;
     std::uint64_t generation{};
     std::filesystem::path package_directory;
+    std::filesystem::path profile_package_directory;
     std::filesystem::path state_directory;
     std::filesystem::path configuration_directory;
     std::shared_ptr<cabbird::PluginScope> scope;
@@ -1353,14 +1700,20 @@ struct PluginServiceContext {
     CabbirdConfigServiceV1 config{};
     CabbirdStorageServiceV1 storage{};
     CabbirdJsonServiceV1 json{};
+    CabbirdProfileServiceV1 profile{};
     CabbirdRuntimeInfoServiceV1 runtime_info{};
     CabbirdLocalizationServiceV1 localization{};
     CabbirdDiagnosticsServiceV1 diagnostics{};
     CabbirdSchedulerServiceV1 scheduler{};
+    CabbirdGameLifecycleServiceV1 game_lifecycle{};
     CabbirdIpcServiceV1 ipc_service{};
+    CabbirdWebSocketServiceV1 websocket{};
+    CabbirdWebServiceV1 web{};
     CabbirdCommandsServiceV1 commands{};
     CabbirdNotificationsServiceV1 notifications{};
     CabbirdSignatureServiceV1 signature{};
+    CabbirdSignatureServiceV2 signature_v2{};
+    CabbirdSignatureServiceV3 signature_v3{};
     CabbirdHookServiceV1 hook{};
     CabbirdPatchServiceV1 patch{};
     const CabbirdUiServiceV1* ui{};
@@ -1393,6 +1746,10 @@ struct PluginServiceContext {
      * `unity-player-snapshot` already gated the query itself. */
     const CabbirdUnityPlayerServiceV1* adapter_player{};
     CabbirdUnityPlayerServiceV1 player_service{};
+    const CabbirdUnityPlayerMotionServiceV1* adapter_motion{};
+    CabbirdUnityPlayerMotionServiceV1 motion_service{};
+    std::mutex motion_mutex;
+    std::unordered_map<std::uint64_t, std::shared_ptr<MotionRequest>> motion_requests;
     std::mutex json_mutex;
     std::unordered_map<std::uint64_t, JsonNode> json_nodes;
     std::vector<cabbird::UiResourceHandle> open_windows;
@@ -1619,6 +1976,17 @@ bool IsActiveDrawResourceCallback(const PluginServiceContext& context) noexcept 
 bool IsSynchronousStateIoForbidden() noexcept {
     return g_log_thread_domain.Get() == cabbird::LogThreadDomain::Game ||
         g_log_thread_domain.Get() == cabbird::LogThreadDomain::Render;
+}
+
+bool IsLifecycleOrWorkerCallback(const PluginServiceContext& context) noexcept {
+    const auto domain = g_log_thread_domain.Get();
+    if (domain == cabbird::LogThreadDomain::Lifecycle ||
+        domain == cabbird::LogThreadDomain::Worker) return true;
+    return domain == cabbird::LogThreadDomain::Unknown &&
+        ((g_lifecycle_callback.Get() && g_callback_scope.Get() == context.scope.get() &&
+          g_callback_generation.Get() == context.generation) ||
+         (context.platform != nullptr && context.platform->IsWorkerThread()) ||
+         (context.ipc != nullptr && context.ipc->IsWorkerThread()));
 }
 
 cabbird::ScopedPluginServiceOwner ScopedPlatformOwner(
@@ -2046,6 +2414,89 @@ CabbirdStatusV1 CABBIRD_CALL PlayerWriteStateV1(
     return player->write_state(player->user, result);
 }
 
+void RevokePlayerMotion(PluginServiceContext* context, std::uint64_t token) noexcept {
+    std::shared_ptr<PluginServiceContext::MotionRequest> request;
+    {
+        std::scoped_lock lock(context->motion_mutex);
+        const auto found = context->motion_requests.find(token);
+        if (found == context->motion_requests.end()) return;
+        request = std::move(found->second);
+        context->motion_requests.erase(found);
+    }
+    if (!request->revoked.exchange(true)) {
+        try { static_cast<void>(request->adapter->release(request->adapter->user, request->native_handle)); }
+        catch (...) {}
+    }
+}
+CabbirdStatusV1 CABBIRD_CALL PlayerMotionAcquireV1(void* user,
+    const CabbirdUnityPlayerMotionRequestV1* request, CabbirdGenerationHandleV1* handle) noexcept {
+    auto* context = static_cast<PluginServiceContext*>(user);
+    if (handle) *handle = {};
+    if (!ValidServiceContext(context) || !handle || !context->adapter_motion)
+        return StatusV1(CABBIRD_STATUS_V1_INVALID_ARGUMENT, "invalid player motion context or output");
+    auto lease = AcquireServiceCallback(context);
+    if (!lease) return StatusV1(CABBIRD_STATUS_V1_UNAVAILABLE, "plugin scope is stopping");
+    try {
+        auto registration = std::make_shared<PluginServiceContext::MotionRequest>();
+        registration->adapter = context->adapter_motion;
+        auto token = std::make_shared<std::uint64_t>();
+        const auto status = registration->adapter->acquire(registration->adapter->user, request, &registration->native_handle);
+        if (status.code != CABBIRD_STATUS_V1_OK) return status;
+        struct Adoption {
+            std::shared_ptr<cabbird::PluginScope> scope;
+            std::uint64_t token{};
+            bool complete{};
+            ~Adoption() { if (token && !complete) static_cast<void>(scope->Release(token)); }
+        } adoption{context->scope};
+        const auto resource = context->scope->Register(cabbird::PluginResourceKind::PlayerMotion,
+            "cabbird.unity.player-motion.request", [context, token] { RevokePlayerMotion(context, *token); });
+        if (!resource) {
+            return StatusV1(CABBIRD_STATUS_V1_UNAVAILABLE, "plugin scope is stopping");
+        }
+        *token = resource;
+        adoption.token = resource;
+        {
+            std::scoped_lock lock(context->motion_mutex);
+            context->motion_requests.emplace(resource, registration);
+        }
+        adoption.complete = true;
+        *handle = {resource, context->generation};
+        return StatusV1(CABBIRD_STATUS_V1_OK);
+    } catch (...) { return StatusV1(CABBIRD_STATUS_V1_FAILED, "player motion acquisition failed"); }
+}
+CabbirdStatusV1 CABBIRD_CALL PlayerMotionUpdateV1(void* user, CabbirdGenerationHandleV1 handle,
+    const CabbirdUnityPlayerMotionRequestV1* request) noexcept {
+    auto* context = static_cast<PluginServiceContext*>(user);
+    if (!ValidServiceContext(context)) return StatusV1(CABBIRD_STATUS_V1_INVALID_ARGUMENT);
+    auto lease = AcquireServiceCallback(context);
+    if (!lease) return StatusV1(CABBIRD_STATUS_V1_UNAVAILABLE, "plugin scope is stopping");
+    try {
+        std::shared_ptr<PluginServiceContext::MotionRequest> registration;
+        {
+            std::scoped_lock lock(context->motion_mutex);
+            const auto found = context->motion_requests.find(handle.id);
+            if (handle.generation != context->generation || found == context->motion_requests.end())
+                return StatusV1(CABBIRD_STATUS_V1_NOT_FOUND);
+            registration = found->second;
+        }
+        if (registration->revoked.load()) return StatusV1(CABBIRD_STATUS_V1_NOT_FOUND);
+        return registration->adapter->update(registration->adapter->user, registration->native_handle, request);
+    } catch (...) { return StatusV1(CABBIRD_STATUS_V1_FAILED, "player motion update failed"); }
+}
+CabbirdStatusV1 CABBIRD_CALL PlayerMotionReleaseV1(void* user, CabbirdGenerationHandleV1 handle) noexcept {
+    auto* context = static_cast<PluginServiceContext*>(user);
+    if (!ValidServiceContext(context)) return StatusV1(CABBIRD_STATUS_V1_INVALID_ARGUMENT);
+    auto lease = AcquireServiceCallback(context);
+    if (!lease) return StatusV1(CABBIRD_STATUS_V1_UNAVAILABLE, "plugin scope is stopping");
+    if (handle.generation != context->generation) return StatusV1(CABBIRD_STATUS_V1_NOT_FOUND);
+    // Scope token authorization prevents one plugin from releasing another's request.
+    {
+        std::scoped_lock lock(context->motion_mutex);
+        if (!context->motion_requests.contains(handle.id)) return StatusV1(CABBIRD_STATUS_V1_NOT_FOUND);
+    }
+    return StatusV1(context->scope->Release(handle.id) ? CABBIRD_STATUS_V1_OK : CABBIRD_STATUS_V1_NOT_FOUND);
+}
+
 CabbirdStatusV1 CABBIRD_CALL ReadV1(
     void* user, std::uintptr_t address, CabbirdMutableByteSpanV1 destination) {
     const auto* context = static_cast<const PluginServiceContext*>(user);
@@ -2120,8 +2571,9 @@ uintptr_t CABBIRD_CALL ModuleBaseV1(void* user, CabbirdStringViewV1 module_name)
     // the view is materialised first.
     const std::wstring wide = WideUtf8(std::string(module_name.data, module_name.size).c_str());
     if (wide.empty()) return 0;
-    const auto module = cabbird::mem::FindModule(wide);
-    return module ? module->base : 0;
+    // RVA consumers need only the requested image's base, not an inventory of
+    // every loaded module and path on the Game thread.
+    return reinterpret_cast<std::uintptr_t>(GetModuleHandleW(wide.c_str()));
 }
 CabbirdStatusV1 CABBIRD_CALL PluginDirectoryV1(
     void* user, char* destination, std::size_t* inout_size) {
@@ -2314,6 +2766,22 @@ CabbirdStatusV1 CABBIRD_CALL CancelTaskV1(
     });
 }
 
+CabbirdStatusV1 CABBIRD_CALL RegisterGameStopCleanupV1(
+    void* user, CabbirdGameStopCleanupV1 callback, void* callback_user,
+    CabbirdGenerationHandleV1* handle) {
+    return InvokeScopedPlatform(user, [&](PluginServiceContext& context) {
+        return context.platform->RegisterGameStopCleanup(
+            ScopedPlatformOwner(context), callback, callback_user, handle);
+    });
+}
+
+CabbirdStatusV1 CABBIRD_CALL UnregisterGameStopCleanupV1(
+    void* user, CabbirdGenerationHandleV1 handle) {
+    return InvokeScopedPlatform(user, [&](PluginServiceContext& context) {
+        return context.platform->UnregisterGameStopCleanup(ScopedPlatformOwner(context), handle);
+    });
+}
+
 template <typename Callback>
 CabbirdStatusV1 InvokeScopedIpc(void* user, Callback&& callback) noexcept {
     auto* context = static_cast<PluginServiceContext*>(user);
@@ -2394,6 +2862,109 @@ CabbirdStatusV1 CABBIRD_CALL PublishIpcV1(
     });
 }
 
+const CabbirdWebSocketServiceV1* QueryWebSocketProvider() noexcept {
+    const auto* provider = static_cast<const CabbirdWebSocketServiceV1*>(
+        cabbird::ProcessAdapterServices().Query(
+            CABBIRD_WEBSOCKET_SERVICE_V1_ID, CABBIRD_WEBSOCKET_SERVICE_V1_VERSION));
+    constexpr std::size_t required = offsetof(CabbirdWebSocketServiceV1, server_info) +
+        sizeof(CabbirdWebSocketServiceV1::server_info);
+    return provider != nullptr && provider->struct_size >= required &&
+        provider->service_version >= CABBIRD_WEBSOCKET_SERVICE_V1_VERSION &&
+        provider->publish_text != nullptr && provider->server_info != nullptr
+        ? provider : nullptr;
+}
+
+CabbirdStatusV1 CABBIRD_CALL PublishWebSocketTextV1(
+    void* user, CabbirdStringViewV1 message) {
+    return InvokeScopedPlatform(user, [&](PluginServiceContext&) {
+        const auto* provider = QueryWebSocketProvider();
+        return provider == nullptr ? StatusV1(CABBIRD_STATUS_V1_UNAVAILABLE)
+            : provider->publish_text(provider->user, message);
+    });
+}
+
+CabbirdStatusV1 CABBIRD_CALL WebSocketInfoV1(
+    void* user, CabbirdWebSocketServerInfoV1* info) {
+    return InvokeScopedPlatform(user, [&](PluginServiceContext&) {
+        const auto* provider = QueryWebSocketProvider();
+        return provider == nullptr ? StatusV1(CABBIRD_STATUS_V1_UNAVAILABLE)
+            : provider->server_info(provider->user, info);
+    });
+}
+
+CabbirdStatusV1 CABBIRD_CALL SetWebSocketPortV1(void* user, std::uint16_t port) {
+    return InvokeScopedPlatform(user, [&](PluginServiceContext&) {
+        const auto* provider = QueryWebSocketProvider();
+        constexpr std::size_t required = offsetof(CabbirdWebSocketServiceV1, set_port) +
+            sizeof(CabbirdWebSocketServiceV1::set_port);
+        return provider == nullptr || provider->struct_size < required || provider->set_port == nullptr
+            ? StatusV1(CABBIRD_STATUS_V1_UNAVAILABLE)
+            : provider->set_port(provider->user, port);
+    });
+}
+
+cabbird::WebServer* QueryWebProvider() noexcept {
+    const auto* provider = static_cast<const cabbird::WebProviderV1*>(
+        cabbird::ProcessAdapterServices().Query(cabbird::kWebProviderId, 1));
+    return provider != nullptr && provider->struct_size >= sizeof(*provider) &&
+        provider->service_version == 1 ? provider->user : nullptr;
+}
+
+CabbirdStatusV1 CABBIRD_CALL InvokeWebRequestV1(
+    void* user, const CabbirdWebRequestV1* request, CabbirdWebResponseV1* response) noexcept {
+    auto* binding = static_cast<WebCallbackBinding*>(user);
+    if (binding == nullptr || binding->callback == nullptr)
+        return StatusV1(CABBIRD_STATUS_V1_UNAVAILABLE);
+    // WebServer owns the callback lease and keeps this binding alive through it.
+    const ScopedLogThreadDomain domain(cabbird::LogThreadDomain::Worker);
+    ScopedPluginCallback callback_scope(binding->scope, binding->generation, false);
+    try {
+        return binding->callback(binding->callback_user, request, response);
+    } catch (...) {
+        return StatusV1(CABBIRD_STATUS_V1_FAILED, "loopback web callback failed");
+    }
+}
+
+CabbirdStatusV1 CABBIRD_CALL RegisterWebV1(
+    void* user, CabbirdStringViewV1 assets, CabbirdWebCallbackV1 callback,
+    void* callback_user, CabbirdGenerationHandleV1* application) {
+    if (application == nullptr) return StatusV1(CABBIRD_STATUS_V1_INVALID_ARGUMENT);
+    *application = {};
+    return InvokeStateIoService(user, [&](PluginServiceContext& context) {
+        if (!IsLifecycleOrWorkerCallback(context))
+            return StatusV1(CABBIRD_STATUS_V1_UNAVAILABLE, "web registration requires Lifecycle or Worker");
+        auto* provider = QueryWebProvider();
+        if (provider == nullptr) return StatusV1(CABBIRD_STATUS_V1_UNAVAILABLE);
+        if (callback == nullptr) return StatusV1(CABBIRD_STATUS_V1_INVALID_ARGUMENT);
+        auto binding = std::make_shared<WebCallbackBinding>();
+        binding->scope = context.scope;
+        binding->generation = context.generation;
+        binding->callback = callback;
+        binding->callback_user = callback_user;
+        return provider->Register(context.scope, context.profile_package_directory,
+            ServiceString(assets), InvokeWebRequestV1, binding.get(), application, binding);
+    });
+}
+
+CabbirdStatusV1 CABBIRD_CALL UnregisterWebV1(void* user, CabbirdGenerationHandleV1 application) {
+    return InvokeStateIoService(user, [&](PluginServiceContext& context) {
+        if (!IsLifecycleOrWorkerCallback(context))
+            return StatusV1(CABBIRD_STATUS_V1_UNAVAILABLE, "web removal requires Lifecycle or Worker");
+        auto* provider = QueryWebProvider();
+        return provider == nullptr ? StatusV1(CABBIRD_STATUS_V1_UNAVAILABLE)
+            : provider->Unregister(context.scope, application);
+    });
+}
+
+CabbirdStatusV1 CABBIRD_CALL WebUrlV1(
+    void* user, CabbirdGenerationHandleV1 application, char* destination, std::size_t* inout_size) {
+    return InvokeScopedPlatform(user, [&](PluginServiceContext& context) {
+        auto* provider = QueryWebProvider();
+        return provider == nullptr ? StatusV1(CABBIRD_STATUS_V1_UNAVAILABLE)
+            : provider->Url(context.scope, application, destination, inout_size);
+    });
+}
+
 CabbirdStatusV1 CABBIRD_CALL RegisterCommandV1(
     void* user, CabbirdStringViewV1 name, CabbirdStringViewV1 description,
     CabbirdCommandCallbackV1 callback, void* callback_user, CabbirdGenerationHandleV1* handle) {
@@ -2445,7 +3016,29 @@ CabbirdStatusV1 CABBIRD_CALL ResolveSignatureV1(
     return InvokeScopedPlatform(user, [&](PluginServiceContext& context) {
         return context.platform->ResolveSignature(
             ScopedPlatformOwner(context), ServiceString(module_name), ServiceString(section_name),
-            ServiceString(pattern), address);
+            ServiceString(pattern), address, !IsSynchronousStateIoForbidden());
+    });
+}
+
+CabbirdStatusV1 CABBIRD_CALL ResolveSignatureLayoutV2(
+    void* user, const CabbirdSignatureLayoutRequestV2* request,
+    std::uintptr_t* addresses, const std::uint32_t address_count,
+    std::uint32_t* offsets, const std::uint32_t offset_count) {
+    return InvokeScopedPlatform(user, [&](PluginServiceContext& context) {
+        return context.platform->ResolveSignatureLayout(
+            ScopedPlatformOwner(context), request, addresses, address_count, offsets, offset_count,
+            !IsSynchronousStateIoForbidden());
+    });
+}
+
+CabbirdStatusV1 CABBIRD_CALL ResolveSignaturesV3(
+    void* user, CabbirdStringViewV1 module_name, CabbirdStringViewV1 section_name,
+    const CabbirdStringViewV1* patterns, std::uint32_t count,
+    std::uint32_t* status_codes, std::uintptr_t* addresses) {
+    return InvokeScopedPlatform(user, [&](PluginServiceContext& context) {
+        return context.platform->ResolveSignatures(
+            ScopedPlatformOwner(context), ServiceString(module_name), ServiceString(section_name),
+            patterns, count, status_codes, addresses, !IsSynchronousStateIoForbidden());
     });
 }
 
@@ -2932,6 +3525,39 @@ CabbirdStatusV1 CABBIRD_CALL DrawTextureV1(
     });
 }
 
+CabbirdStatusV1 CABBIRD_CALL DrawTextureOverlayV1(
+    void* user, const CabbirdGenerationHandleV1 handle, const float x, const float y,
+    const float width, const float height, const std::uint32_t tint_rgba) {
+    if (!std::isfinite(x) || !std::isfinite(y)) {
+        return StatusV1(CABBIRD_STATUS_V1_INVALID_ARGUMENT, "texture position is invalid");
+    }
+    return InvokeUiResourceService(user, [&](PluginServiceContext& context) {
+        if (!IsActiveDrawResourceCallback(context)) {
+            return StatusV1(CABBIRD_STATUS_V1_UNAVAILABLE, "texture rendering is not active");
+        }
+        if (!ValidGenerationHandle(context, handle)) {
+            return StatusV1(CABBIRD_STATUS_V1_NOT_FOUND, "texture handle is not live");
+        }
+        const auto texture = context.ui_resources->ResourceState(context.scope, UiHandle(handle));
+        if (!texture) return StatusV1(CABBIRD_STATUS_V1_NOT_FOUND, "texture handle is not live");
+        if (texture->state == cabbird::UiResourceState::Failed) {
+            return StatusV1(CABBIRD_STATUS_V1_UNAVAILABLE, "texture decode or upload failed");
+        }
+        cabbird::UiTextureDrawRequest request;
+        request.x = x;
+        request.y = y;
+        request.width = width;
+        request.height = height;
+        request.tint_rgba = tint_rgba;
+        request.on_top = true;
+        request.viewport_relative = true;
+        if (!context.manager->DrawUiTextureEx(context.scope, UiHandle(handle), request)) {
+            return StatusV1(CABBIRD_STATUS_V1_UNAVAILABLE, "texture render backend is not ready");
+        }
+        return StatusV1(CABBIRD_STATUS_V1_OK);
+    });
+}
+
 CabbirdStatusV1 CABBIRD_CALL InputSnapshotV1(void* user, CabbirdInputSnapshotV1* snapshot) {
     if (snapshot == nullptr || snapshot->struct_size < sizeof(*snapshot)) {
         return StatusV1(CABBIRD_STATUS_V1_INVALID_ARGUMENT, "input snapshot is invalid");
@@ -3137,7 +3763,8 @@ CabbirdStatusV1 CABBIRD_CALL JsonParseV1(
         }
         auto root = std::make_shared<nlohmann::json>(
             nlohmann::json::parse(document.data, document.data + document.size));
-        return RegisterJsonNode(context, std::move(root), root.get(), handle);
+        auto* value = root.get();
+        return RegisterJsonNode(context, std::move(root), value, handle);
     });
 }
 
@@ -3150,6 +3777,30 @@ CabbirdStatusV1 CABBIRD_CALL JsonReleaseV1(
         return context.scope->Release(handle.id)
             ? StatusV1(CABBIRD_STATUS_V1_OK)
             : StatusV1(CABBIRD_STATUS_V1_NOT_FOUND, "JSON handle is not live");
+    });
+}
+
+CabbirdStatusV1 CABBIRD_CALL LoadProfileV1(
+    void* user, const CabbirdStringViewV1 relative_path,
+    CabbirdGenerationHandleV1* document) {
+    if (document == nullptr)
+        return StatusV1(CABBIRD_STATUS_V1_INVALID_ARGUMENT, "profile arguments are invalid");
+    *document = {};
+    if (relative_path.data == nullptr)
+        return StatusV1(CABBIRD_STATUS_V1_INVALID_ARGUMENT, "profile arguments are invalid");
+    return InvokeJsonService(user, [&](PluginServiceContext& context) {
+        if (!IsLifecycleOrWorkerCallback(context))
+            return StatusV1(CABBIRD_STATUS_V1_UNAVAILABLE,
+                "profile loading requires Lifecycle or Worker");
+        auto result = cabbird::LoadPluginProfile(
+            context.profile_package_directory, ServiceString(relative_path));
+        if (!result) {
+            LogV1(user, CABBIRD_CORE_LOG_LEVEL_V1_WARNING,
+                {result.error.data(), result.error.size()});
+            return StatusV1(result.code, "profile could not be read or failed schema validation");
+        }
+        auto* root = result.document.get();
+        return RegisterJsonNode(context, std::move(result.document), root, document);
     });
 }
 
@@ -3382,6 +4033,11 @@ CabbirdStatusV1 CABBIRD_CALL QueryServiceV1(
         *service = &context->json;
         return StatusV1(CABBIRD_STATUS_V1_OK);
     }
+    if (id == CABBIRD_PROFILE_SERVICE_V1_ID &&
+        minimum_version <= context->profile.service_version) {
+        *service = &context->profile;
+        return StatusV1(CABBIRD_STATUS_V1_OK);
+    }
     if (id == CABBIRD_RUNTIME_INFO_SERVICE_V1_ID &&
         minimum_version <= context->runtime_info.service_version) {
         *service = &context->runtime_info;
@@ -3402,9 +4058,26 @@ CabbirdStatusV1 CABBIRD_CALL QueryServiceV1(
         *service = &context->scheduler;
         return StatusV1(CABBIRD_STATUS_V1_OK);
     }
+    if (id == CABBIRD_GAME_LIFECYCLE_SERVICE_V1_ID &&
+        minimum_version <= context->game_lifecycle.service_version) {
+        *service = &context->game_lifecycle;
+        return StatusV1(CABBIRD_STATUS_V1_OK);
+    }
     if (id == CABBIRD_IPC_SERVICE_V1_ID &&
         minimum_version <= context->ipc_service.service_version) {
         *service = &context->ipc_service;
+        return StatusV1(CABBIRD_STATUS_V1_OK);
+    }
+    if (id == CABBIRD_WEBSOCKET_SERVICE_V1_ID) {
+        if (minimum_version <= context->websocket.service_version && QueryWebSocketProvider() != nullptr) {
+            *service = &context->websocket;
+            return StatusV1(CABBIRD_STATUS_V1_OK);
+        }
+        return StatusV1(CABBIRD_STATUS_V1_UNAVAILABLE, "websocket service is not ready");
+    }
+    if (id == CABBIRD_WEB_SERVICE_V1_ID &&
+        minimum_version <= context->web.service_version && QueryWebProvider() != nullptr) {
+        *service = &context->web;
         return StatusV1(CABBIRD_STATUS_V1_OK);
     }
     if (id == CABBIRD_COMMANDS_SERVICE_V1_ID &&
@@ -3415,6 +4088,14 @@ CabbirdStatusV1 CABBIRD_CALL QueryServiceV1(
     if (id == CABBIRD_NOTIFICATIONS_SERVICE_V1_ID &&
         minimum_version <= context->notifications.service_version) {
         *service = &context->notifications;
+        return StatusV1(CABBIRD_STATUS_V1_OK);
+    }
+    if (id == CABBIRD_SIGNATURE_SERVICE_V3_ID && minimum_version == CABBIRD_SIGNATURE_SERVICE_V3_VERSION) {
+        *service = &context->signature_v3;
+        return StatusV1(CABBIRD_STATUS_V1_OK);
+    }
+    if (id == CABBIRD_SIGNATURE_SERVICE_V2_ID && minimum_version == CABBIRD_SIGNATURE_SERVICE_V2_VERSION) {
+        *service = &context->signature_v2;
         return StatusV1(CABBIRD_STATUS_V1_OK);
     }
     if (id == CABBIRD_SIGNATURE_SERVICE_V1_ID &&
@@ -3496,6 +4177,17 @@ CabbirdStatusV1 CABBIRD_CALL QueryServiceV1(
             &PlayerWritePositionV1,
             &PlayerWriteStateV1};
         *service = &context->player_service;
+        return StatusV1(CABBIRD_STATUS_V1_OK);
+    }
+    if (id == CABBIRD_UNITY_PLAYER_MOTION_SERVICE_V1_ID) {
+        const auto* adapter = static_cast<const CabbirdUnityPlayerMotionServiceV1*>(
+            cabbird::ProcessAdapterServices().Query(id, minimum_version));
+        if (!adapter || adapter->struct_size < sizeof(*adapter) || !adapter->acquire || !adapter->update || !adapter->release)
+            return StatusV1(CABBIRD_STATUS_V1_UNAVAILABLE, "player motion service is not ready");
+        context->adapter_motion = adapter;
+        context->motion_service = {sizeof(context->motion_service), adapter->service_version, context,
+            &PlayerMotionAcquireV1, &PlayerMotionUpdateV1, &PlayerMotionReleaseV1};
+        *service = &context->motion_service;
         return StatusV1(CABBIRD_STATUS_V1_OK);
     }
     if (const void* adapter = cabbird::ProcessAdapterServices().Query(id, minimum_version)) {
@@ -3640,8 +4332,10 @@ struct PluginManager::LoadedPlugin {
     CabbirdPluginDescriptorV1 descriptor_v1{};
     void* plugin_context{};
     bool waiting_for_service{};
+    bool loaded{};
     bool started{};
     bool faulted{};
+    bool activation_rollback_failed{};
     bool capability_audit_logged{};
     bool localization_catalog_loaded{};
     PluginView view;
@@ -3846,7 +4540,6 @@ PluginManager::~PluginManager() {
         static_cast<void>(platform_services_.release());
     }
     std::error_code error;
-    std::filesystem::remove_all(cache_directory_, error);
     // A quarantined plugin may still own a thread executing inside its DLL. Keep
     // both its service context and module mapping alive until process teardown.
     const bool process_quarantined = !quarantined_plugins_.empty();
@@ -3977,6 +4670,16 @@ void PluginManager::SetQueuedCallbackCanceller(
     queued_callback_canceller_ = std::move(canceller);
 }
 
+void PluginManager::SetGameStopInvoker(
+    std::function<std::uint32_t(std::function<void()>, std::chrono::milliseconds)> invoker) {
+    game_stop_invoker_ = std::move(invoker);
+}
+
+void PluginManager::SetGenerationInitializer(
+    std::function<bool(std::string_view, std::uint64_t)> initializer) {
+    generation_initializer_ = std::move(initializer);
+}
+
 void PluginManager::SetCallbackEvidenceObserver(
     std::function<void(const PluginCallbackEvidence&)> observer) {
     callback_evidence_observer_ = std::move(observer);
@@ -4007,16 +4710,19 @@ void PluginManager::PublishSuspended(const cabbird::PluginCatalogEntry& entry) {
     disabled_plugins_[view.id] = std::move(view);
 }
 
-bool PluginManager::LoadCatalogEntry(const cabbird::PluginCatalogEntry& entry) {
+bool PluginManager::LoadCatalogEntry(const cabbird::PluginCatalogEntry& entry, std::string* failure) {
+    if (failure != nullptr) failure->clear();
     if (!LoadAllowed(entry)) {
         PublishSuspended(entry);
+        if (failure != nullptr) *failure = "suspended by Runtime recovery policy";
         return false;
     }
     cabbird::PluginShadowResult staged;
     RunPluginLoadStep([&] { staged = shadow_store_.Stage(entry); });
     if (!staged.Ok()) {
-        Log(CABBIRD_CORE_LOG_LEVEL_V1_ERROR,
-            "package shadow failed for " + std::string(entry.Id()) + ": " + staged.error);
+        const std::string message = "package shadow failed for " + std::string(entry.Id()) + ": " + staged.error;
+        if (failure != nullptr) *failure = message;
+        Log(CABBIRD_CORE_LOG_LEVEL_V1_ERROR, message);
         return false;
     }
     const std::filesystem::path source = entry.entry_file;
@@ -4035,7 +4741,7 @@ bool PluginManager::LoadCatalogEntry(const cabbird::PluginCatalogEntry& entry) {
     publish_activation(true);
     try {
         const bool loaded = LoadBinary(
-            source, binary, package, std::move(*staged.shadow));
+            source, binary, package, std::move(*staged.shadow), failure);
         publish_activation(false);
         return loaded;
     } catch (...) {
@@ -4045,7 +4751,38 @@ bool PluginManager::LoadCatalogEntry(const cabbird::PluginCatalogEntry& entry) {
 }
 
 bool PluginManager::Activate(LoadedPlugin& plugin) {
-    if (plugin.scope == nullptr) return false;
+    const ScopedLogThreadDomain log_domain(cabbird::LogThreadDomain::Lifecycle);
+    if (plugin.scope == nullptr || plugin.activation_rollback_failed) return false;
+    if (generation_initializer_) {
+        bool initialized{};
+        try {
+            initialized = generation_initializer_(plugin.view.id, plugin.view.generation);
+        } catch (...) {}
+        if (!initialized) {
+            // No plugin callback has entered this attempt; the scope is either
+            // new or was already drained by the previous activation rollback.
+            static_cast<void>(plugin.scope->BeginStop(std::chrono::milliseconds::zero()));
+            static_cast<void>(plugin.scope->RevokeAll());
+            plugin.waiting_for_service = false;
+            plugin.faulted = true;
+            plugin.view.status_reason = "plugin generation dispatcher is unavailable";
+            Log(CABBIRD_CORE_LOG_LEVEL_V1_ERROR,
+                "ABI v1 plugin activation dispatch unavailable: " + plugin.view.id);
+            return false;
+        }
+    }
+    // A deferred attempt owns a fresh barrier. Old scoped callbacks stay frozen,
+    // even though the DLL itself remains mapped while waiting for an adapter.
+    if (plugin.scope->SourcesFrozen()) {
+        plugin.scope = std::make_shared<cabbird::PluginScope>(
+            lifecycle_ledger_, plugin.view.id, plugin.view.generation);
+        static_cast<void>(plugin.scope->Register(
+            cabbird::PluginResourceKind::Task, "plugin.update"));
+        if (plugin.view.visibility_control) {
+            static_cast<void>(plugin.scope->Register(
+                cabbird::PluginResourceKind::Ui, "plugin.draw"));
+        }
+    }
     plugin.plugin_context = nullptr;
     plugin.ui_stack.Reset();
     plugin.service_context.manager = this;
@@ -4054,6 +4791,7 @@ bool PluginManager::Activate(LoadedPlugin& plugin) {
     plugin.service_context.plugin_id = plugin.view.id;
     plugin.service_context.generation = plugin.view.generation;
     plugin.service_context.package_directory = plugin.view.package_directory;
+    plugin.service_context.profile_package_directory = plugin.shadow_generation.package_root;
     plugin.service_context.state_directory = ValidPluginStateId(plugin.view.id)
         ? (root_ / L"state" / L"plugins" /
               WideUtf8(plugin.view.id.c_str())).lexically_normal()
@@ -4110,21 +4848,7 @@ bool PluginManager::Activate(LoadedPlugin& plugin) {
         }
         plugin.capability_audit_logged = true;
     }
-    /* Designated initializers, deliberately, and naming all nine fields.
-     *
-     * CabbirdCoreServiceV1 has nine fields (abi/cabbird-sdk-v1-windows-x64.json records size 72
-     * with offsets), while the caller copied from Anomaly names seven.  With positional
-     * initialization the seventh argument -- PluginDirectoryV1, signature (void*, char*, size_t*)
-     * -- landed on patch_memory, signature (void*, uintptr_t, CabbirdByteSpanV1), producing
-     * C2679 "no operator= accepts an initializer list".  Naming every field means a future
-     * addition to the struct cannot silently shift an argument again.
-     *
-     * last_status stays null on purpose.  core.h describes it as "the last status returned on
-     * this thread", but nothing in Cabbird records such a value: StatusV1 (defined above) builds
-     * and returns a status without writing it anywhere, so there is no thread-local store to read
-     * back.  A plugin calling last_status receives null and must treat that as "not supported".
-     * Implementing it means adding thread-local state to every host call path -- not something to
-     * introduce without a decision, so it is left visibly unimplemented rather than approximated. */
+    // Shared Core operations keep the upstream order; Unity memory extensions follow.
     plugin.service_context.core = {
         .struct_size = sizeof(CabbirdCoreServiceV1),
         .service_version = CABBIRD_CORE_SERVICE_V1_VERSION,
@@ -4132,8 +4856,8 @@ bool PluginManager::Activate(LoadedPlugin& plugin) {
         .log = LogV1,
         .read_memory = ReadV1,
         .write_memory = WriteV1,
-        .patch_memory = PatchMemoryV1,
         .plugin_directory = PluginDirectoryV1,
+        .patch_memory = PatchMemoryV1,
         .module_base = ModuleBaseV1,
         .last_status = nullptr};
     plugin.service_context.plugin_state = {
@@ -4153,6 +4877,9 @@ bool PluginManager::Activate(LoadedPlugin& plugin) {
         JsonParseV1, JsonReleaseV1, JsonKindV1, JsonBooleanV1, JsonNumberV1,
         JsonStringV1, JsonArraySizeV1, JsonArrayItemV1, JsonObjectSizeV1,
         JsonObjectKeyAtV1, JsonObjectFindV1, JsonSerializeV1};
+    plugin.service_context.profile = {
+        sizeof(CabbirdProfileServiceV1), CABBIRD_PROFILE_SERVICE_V1_VERSION,
+        &plugin.service_context, LoadProfileV1};
     plugin.service_context.runtime_info = {
         sizeof(CabbirdRuntimeInfoServiceV1), CABBIRD_RUNTIME_INFO_SERVICE_V1_VERSION,
         &plugin.service_context, RuntimeInfoV1, RuntimeVersionV1};
@@ -4166,11 +4893,20 @@ bool PluginManager::Activate(LoadedPlugin& plugin) {
     plugin.service_context.scheduler = {
         sizeof(CabbirdSchedulerServiceV1), CABBIRD_SCHEDULER_SERVICE_V1_VERSION,
         &plugin.service_context, ScheduleV1, CancelTaskV1};
+    plugin.service_context.game_lifecycle = {
+        sizeof(CabbirdGameLifecycleServiceV1), CABBIRD_GAME_LIFECYCLE_SERVICE_V1_VERSION,
+        &plugin.service_context, RegisterGameStopCleanupV1, UnregisterGameStopCleanupV1};
     plugin.service_context.ipc_service = {
         sizeof(CabbirdIpcServiceV1), CABBIRD_IPC_SERVICE_V1_VERSION,
         &plugin.service_context, RegisterIpcEndpointV1, UnregisterIpcEndpointV1,
         InvokeIpcV1, InvokeIpcAsyncV1, CancelIpcV1, SubscribeIpcV1,
         UnsubscribeIpcV1, PublishIpcV1};
+    plugin.service_context.websocket = {
+        sizeof(CabbirdWebSocketServiceV1), CABBIRD_WEBSOCKET_SERVICE_V1_VERSION,
+        &plugin.service_context, PublishWebSocketTextV1, WebSocketInfoV1, SetWebSocketPortV1};
+    plugin.service_context.web = {
+        sizeof(CabbirdWebServiceV1), CABBIRD_WEB_SERVICE_V1_VERSION,
+        &plugin.service_context, RegisterWebV1, UnregisterWebV1, WebUrlV1};
     plugin.service_context.commands = {
         sizeof(CabbirdCommandsServiceV1), CABBIRD_COMMANDS_SERVICE_V1_VERSION,
         &plugin.service_context, RegisterCommandV1, UnregisterCommandV1, InvokeCommandV1};
@@ -4180,6 +4916,12 @@ bool PluginManager::Activate(LoadedPlugin& plugin) {
     plugin.service_context.signature = {
         sizeof(CabbirdSignatureServiceV1), CABBIRD_SIGNATURE_SERVICE_V1_VERSION,
         &plugin.service_context, ResolveSignatureV1};
+    plugin.service_context.signature_v2 = {
+        sizeof(CabbirdSignatureServiceV2), CABBIRD_SIGNATURE_SERVICE_V2_VERSION,
+        &plugin.service_context, ResolveSignatureV1, ResolveSignatureLayoutV2};
+    plugin.service_context.signature_v3 = {
+        sizeof(CabbirdSignatureServiceV3), CABBIRD_SIGNATURE_SERVICE_V3_VERSION,
+        &plugin.service_context, ResolveSignatureV1, ResolveSignatureLayoutV2, ResolveSignaturesV3};
     plugin.service_context.hook = {
         sizeof(CabbirdHookServiceV1), CABBIRD_HOOK_SERVICE_V1_VERSION,
         &plugin.service_context,
@@ -4198,7 +4940,7 @@ bool PluginManager::Activate(LoadedPlugin& plugin) {
     plugin.service_context.texture = {
         sizeof(CabbirdTextureServiceV1), CABBIRD_TEXTURE_SERVICE_V1_VERSION,
         &plugin.service_context,
-        RequestTextureV1, ReleaseTextureV1, TextureStateV1, DrawTextureV1};
+        RequestTextureV1, ReleaseTextureV1, TextureStateV1, DrawTextureV1, DrawTextureOverlayV1};
     plugin.service_context.input_service = {
         sizeof(CabbirdInputServiceV1), CABBIRD_INPUT_SERVICE_V1_VERSION,
         &plugin.service_context,
@@ -4244,43 +4986,41 @@ bool PluginManager::Activate(LoadedPlugin& plugin) {
     }
     g_loading_plugin_id.Get().clear();
     g_loading_package_directory.Get().clear();
-    if (load_status.code == CABBIRD_STATUS_V1_UNAVAILABLE) {
-        plugin.plugin_context = nullptr;
-        plugin.waiting_for_service = true;
-        plugin.started = false;
-        Log(CABBIRD_CORE_LOG_LEVEL_V1_INFO, "ABI v1 plugin waiting for service: " + plugin.view.id);
-        return true;
-    }
     if (load_status.code != CABBIRD_STATUS_V1_OK) {
-        plugin.plugin_context = nullptr;
-        plugin.waiting_for_service = false;
+        const std::string failure_message = StatusMessage("on_load", load_status);
+        plugin.view.status_reason = failure_message;
+        if (!RollbackActivation(plugin)) return false;
+        plugin.waiting_for_service = load_status.code == CABBIRD_STATUS_V1_UNAVAILABLE;
+        if (plugin.waiting_for_service) {
+            Log(CABBIRD_CORE_LOG_LEVEL_V1_INFO,
+                "ABI v1 plugin waiting for service: " + plugin.view.id);
+            return true;
+        }
         Log(CABBIRD_CORE_LOG_LEVEL_V1_ERROR,
             "ABI v1 plugin rejected activation: plugin=" + plugin.view.id +
-                " " + StatusMessage("on_load", load_status));
+                " " + failure_message);
         return false;
     }
+    plugin.loaded = true;
     if (plugin.descriptor_v1.on_start != nullptr) {
         CabbirdStatusV1 start_status = StatusV1(CABBIRD_STATUS_V1_FAILED);
-        auto callback = plugin.scope->AcquireCallback(plugin.view.generation);
-        if (callback) {
-            ScopedPluginCallback callback_scope(plugin.scope, plugin.view.generation, false);
-            RunPluginLoadStep([&] {
-                try { start_status = plugin.descriptor_v1.on_start(plugin.plugin_context); }
-                catch (...) {
-                    Log(CABBIRD_CORE_LOG_LEVEL_V1_ERROR,
-                        "exception while starting ABI v1 plugin " + plugin.view.id);
-                }
-            });
-        }
-        if (start_status.code != CABBIRD_STATUS_V1_OK) {
-            auto unload_callback = plugin.scope->AcquireCallback(plugin.view.generation);
-            if (unload_callback) {
+        {
+            auto callback = plugin.scope->AcquireCallback(plugin.view.generation);
+            if (callback) {
                 ScopedPluginCallback callback_scope(plugin.scope, plugin.view.generation, false);
                 RunPluginLoadStep([&] {
-                    try { plugin.descriptor_v1.on_unload(plugin.plugin_context); } catch (...) {}
+                    try { start_status = plugin.descriptor_v1.on_start(plugin.plugin_context); }
+                    catch (...) {
+                        Log(CABBIRD_CORE_LOG_LEVEL_V1_ERROR,
+                            "exception while starting ABI v1 plugin " + plugin.view.id);
+                    }
                 });
             }
-            plugin.plugin_context = nullptr;
+        }
+        if (start_status.code != CABBIRD_STATUS_V1_OK) {
+            const std::string failure_message = StatusMessage("on_start", start_status);
+            plugin.view.status_reason = failure_message;
+            if (!RollbackActivation(plugin)) return false;
             if (start_status.code == CABBIRD_STATUS_V1_UNAVAILABLE) {
                 plugin.waiting_for_service = true;
                 plugin.started = false;
@@ -4291,23 +5031,118 @@ bool PluginManager::Activate(LoadedPlugin& plugin) {
             plugin.waiting_for_service = false;
             Log(CABBIRD_CORE_LOG_LEVEL_V1_ERROR,
                 "ABI v1 plugin rejected activation: plugin=" + plugin.view.id +
-                    " " + StatusMessage("on_start", start_status));
+                    " " + failure_message);
             return false;
         }
     }
     plugin.waiting_for_service = false;
     plugin.started = true;
+    plugin.view.status_reason.clear();
     ReconcileWindowVisibility(plugin);
     Log(CABBIRD_CORE_LOG_LEVEL_V1_INFO, "ABI v1 plugin started: " + plugin.view.id);
     return true;
+}
+
+bool PluginManager::RollbackActivation(LoadedPlugin& plugin) {
+    const auto deadline = StopDeadlineAfter(std::chrono::milliseconds(5000));
+    const auto& scope = plugin.scope;
+    scope->FreezeCallbackSources();
+    if (queued_callback_canceller_) {
+        try { queued_callback_canceller_(plugin.view.id, plugin.view.generation); } catch (...) {}
+    }
+    const auto quarantine = [&](const char* reason) {
+        plugin.activation_rollback_failed = true;
+        plugin.waiting_for_service = false;
+        plugin.faulted = true;
+        plugin.view.status_reason = reason;
+        Log(CABBIRD_CORE_LOG_LEVEL_V1_ERROR,
+            "plugin activation rollback failed: " + plugin.view.id + " " + reason);
+        return false;
+    };
+    if (platform_services_ && !platform_services_->RevokeScope(
+            ScopedPlatformOwner(plugin.service_context), deadline,
+            cabbird::ScopedPlatformRevokePhase::PreStop)) {
+        return quarantine("platform hook revocation failed during activation rollback");
+    }
+    if (!scope->BeginStop(StopRemaining(deadline))) {
+        return quarantine("callback barrier timed out during activation rollback");
+    }
+    const auto cleanup = RunGameStopCleanups(plugin, deadline);
+    if (cleanup.code != CABBIRD_STATUS_V1_OK) {
+        return quarantine("game cleanup failed during activation rollback");
+    }
+    if (platform_services_ && !platform_services_->RevokeScope(
+            ScopedPlatformOwner(plugin.service_context), deadline)) {
+        return quarantine("platform revocation failed during activation rollback");
+    }
+    static_cast<void>(scope->RevokeAll());
+    if (plugin.loaded) {
+        auto lease = scope->AcquireLifecycleLease(plugin.view.generation);
+        if (!lease) return quarantine("lifecycle lease unavailable during activation rollback");
+        ScopedPluginCallback callback_scope(scope, plugin.view.generation, true);
+        RunPluginLoadStep([&] {
+            try { plugin.descriptor_v1.on_unload(plugin.plugin_context); } catch (...) {
+                Log(CABBIRD_CORE_LOG_LEVEL_V1_ERROR,
+                    "exception while rolling back ABI v1 plugin " + plugin.view.id);
+            }
+        });
+    }
+    plugin.loaded = false;
+    plugin.started = false;
+    plugin.plugin_context = nullptr;
+    return true;
+}
+
+CabbirdStatusV1 PluginManager::RunGameStopCleanups(
+    LoadedPlugin& plugin, const std::chrono::steady_clock::time_point deadline) {
+    if (!platform_services_) return StatusV1(CABBIRD_STATUS_V1_OK);
+    auto cleanups = platform_services_->GameStopCleanups(ScopedPlatformOwner(plugin.service_context));
+    if (cleanups.empty()) return StatusV1(CABBIRD_STATUS_V1_OK);
+    if (!game_stop_invoker_) return StatusV1(CABBIRD_STATUS_V1_UNAVAILABLE, "game cleanup dispatcher is unavailable");
+    auto result = std::make_shared<CabbirdStatusV1>(StatusV1(CABBIRD_STATUS_V1_FAILED));
+    auto operation = [cleanups = std::move(cleanups), result, deadline] {
+        ScopedLogThreadDomain game_domain(cabbird::LogThreadDomain::Game);
+        for (const auto& cleanup : cleanups) {
+            if (StopRemaining(deadline) == std::chrono::milliseconds::zero()) {
+                *result = StatusV1(CABBIRD_STATUS_V1_TIMEOUT, "game cleanup deadline exceeded");
+                return;
+            }
+            auto lease = cleanup.scope->AcquireLifecycleLease(cleanup.scope->Generation());
+            if (!lease) {
+                *result = StatusV1(CABBIRD_STATUS_V1_UNAVAILABLE, "game cleanup lifecycle lease is unavailable");
+                return;
+            }
+            ScopedPluginCallback callback_scope(cleanup.scope, cleanup.scope->Generation(), true);
+            try { *result = cleanup.callback(cleanup.callback_user); }
+            catch (...) { *result = StatusV1(CABBIRD_STATUS_V1_FAILED, "game cleanup raised an exception"); }
+            if (result->code != CABBIRD_STATUS_V1_OK) return;
+        }
+    };
+    std::uint32_t invoked{ERROR_UNHANDLED_EXCEPTION};
+    // Game ingress borrows the same execution gate; release it for the bounded
+    // invocation while lifecycle admission remains closed to competing mutation.
+    RunPluginLoadStep([&] {
+        invoked = game_stop_invoker_(std::move(operation), StopRemaining(deadline));
+    });
+    if (invoked == ERROR_TIMEOUT) return StatusV1(CABBIRD_STATUS_V1_TIMEOUT, "game cleanup timed out");
+    if (invoked != ERROR_SUCCESS) return StatusV1(CABBIRD_STATUS_V1_UNAVAILABLE, "game cleanup dispatcher refused invocation");
+    return *result;
 }
 
 bool PluginManager::LoadBinary(
     const std::filesystem::path& source,
     const std::filesystem::path& binary,
     const std::filesystem::path& package_directory,
-    cabbird::PluginShadowGeneration shadow_generation) {
+    cabbird::PluginShadowGeneration shadow_generation, std::string* failure) {
     const auto discard_shadow = [&] { shadow_store_.Retire(shadow_generation); };
+    if (failure != nullptr) failure->clear();
+    const auto reject = [&](std::string message) {
+        if (failure != nullptr) {
+            if (!failure->empty()) failure->append("; ");
+            failure->append(message);
+        }
+        Log(CABBIRD_CORE_LOG_LEVEL_V1_ERROR, std::move(message));
+    };
 
     const cabbird::PluginCapabilityGrant grant =
         cabbird::ResolvePluginCapabilityGrant(&shadow_generation.manifest);
@@ -4320,9 +5155,7 @@ bool PluginManager::LoadBinary(
                         cabbird::PluginCapabilityAuditCode::RequiredServiceMissingCapability
                     ? "required-service-capability-missing"
                     : "required-service-mapping-missing";
-            Log(
-                CABBIRD_CORE_LOG_LEVEL_V1_ERROR,
-                "plugin manifest capability denied: plugin=" +
+            reject("plugin manifest capability denied: plugin=" +
                     shadow_generation.plugin_id + " code=" + code +
                     " service=" + audit.service +
                     " capability=" + audit.capability);
@@ -4349,7 +5182,7 @@ bool PluginManager::LoadBinary(
             if (!diagnostic.loaded_path.empty()) {
                 message += " loaded=" + Utf8(diagnostic.loaded_path);
             }
-            Log(CABBIRD_CORE_LOG_LEVEL_V1_ERROR, std::move(message));
+            reject(std::move(message));
         }
         discard_shadow();
         return false;
@@ -4366,8 +5199,7 @@ bool PluginManager::LoadBinary(
         if (search_cookie != nullptr) RemoveDllDirectory(search_cookie);
     });
     if (module == nullptr) {
-        Log(CABBIRD_CORE_LOG_LEVEL_V1_ERROR,
-            "load failed for " + source.string() + ": " + std::to_string(load_error));
+        reject("load failed for " + source.string() + ": " + std::to_string(load_error));
         discard_shadow();
         return false;
     }
@@ -4419,8 +5251,7 @@ bool PluginManager::LoadBinary(
             descriptor.version.data != nullptr && descriptor.version.size != 0 &&
             descriptor.on_load != nullptr && descriptor.on_unload != nullptr;
         if (!valid) {
-            Log(CABBIRD_CORE_LOG_LEVEL_V1_ERROR,
-                "invalid ABI v1 plugin metadata: " + source.string() +
+            reject("invalid ABI v1 plugin metadata: " + source.string() +
                     " entry_code=" + std::to_string(entry_status.code) +
                     " struct_size=" + std::to_string(descriptor.struct_size) +
                     " api=" + std::to_string(descriptor.api_major) + "." +
@@ -4444,8 +5275,7 @@ bool PluginManager::LoadBinary(
         plugin->view.visibility_control = descriptor.on_draw != nullptr;
         plugin->view.generation = shadow_generation.generation;
         if (plugin->view.id != shadow_generation.plugin_id) {
-            Log(CABBIRD_CORE_LOG_LEVEL_V1_ERROR,
-                "plugin identity mismatch: manifest=" + shadow_generation.plugin_id +
+            reject("plugin identity mismatch: manifest=" + shadow_generation.plugin_id +
                     " descriptor=" + plugin->view.id);
             unload_module();
             discard_shadow();
@@ -4471,17 +5301,22 @@ bool PluginManager::LoadBinary(
                 return loaded->view.id == plugin->view.id;
         }) || std::any_of(quarantined_plugins_.begin(), quarantined_plugins_.end(),
                 [&](const auto& loaded) { return loaded->view.id == plugin->view.id; })) {
-            Log(CABBIRD_CORE_LOG_LEVEL_V1_ERROR, "duplicate plugin id: " + plugin->view.id);
+            reject("duplicate plugin id: " + plugin->view.id);
             static_cast<void>(plugin->scope->RevokeAll());
             unload_module();
-            discard_shadow();
+            shadow_store_.Retire(plugin->shadow_generation);
             return false;
         }
         if (!Activate(*plugin)) {
-            Log(CABBIRD_CORE_LOG_LEVEL_V1_ERROR, "ABI v1 plugin rejected activation: " + plugin->view.id);
-            static_cast<void>(plugin->scope->RevokeAll());
+            reject("ABI v1 plugin rejected activation: " + plugin->view.id +
+                (plugin->view.status_reason.empty() ? std::string{} : " " + plugin->view.status_reason));
+            if (plugin->activation_rollback_failed) {
+                plugin->view.state = "quarantined";
+                quarantined_plugins_.push_back(std::move(plugin));
+                return false;
+            }
             unload_module();
-            discard_shadow();
+            shadow_store_.Retire(plugin->shadow_generation);
             return false;
         }
         Log(CABBIRD_CORE_LOG_LEVEL_V1_INFO,
@@ -4489,7 +5324,7 @@ bool PluginManager::LoadBinary(
         plugins_.push_back(std::move(plugin));
         return true;
     }
-    Log(CABBIRD_CORE_LOG_LEVEL_V1_ERROR, "plugin does not export the current ABI entry: " + source.string());
+    reject("plugin does not export the current ABI entry: " + source.string());
     unload_module();
     discard_shadow();
     return false;
@@ -4810,8 +5645,10 @@ bool PluginManager::ReconcileEnablement(
             continue;
         }
 
-        if (!LoadCatalogEntry(*entry) || !active(id)) {
-            publish_view(*entry, "faulted", "plugin activation failed");
+        std::string activation_failure;
+        if (!LoadCatalogEntry(*entry, &activation_failure) || !active(id)) {
+            publish_view(*entry, "faulted", activation_failure.empty()
+                ? "plugin activation failed" : std::move(activation_failure));
             loaded = false;
         } else {
             disabled_plugins_.erase(id);
@@ -4923,6 +5760,15 @@ bool PluginManager::UnloadIndicesWithDeadline(
         }
 
         if (!quarantine && scope != nullptr) {
+            const auto cleanup = RunGameStopCleanups(plugin, deadline);
+            if (cleanup.code != CABBIRD_STATUS_V1_OK) {
+                quarantine = true;
+                timed_out = cleanup.code == CABBIRD_STATUS_V1_TIMEOUT;
+                quarantine_reason = timed_out ? "game stop cleanup timed out" : "game stop cleanup failed";
+            }
+        }
+
+        if (!quarantine && scope != nullptr) {
             static_cast<void>(scope->RevokeAllExcept(cabbird::PluginResourceKind::Config));
         }
 
@@ -5012,7 +5858,7 @@ bool PluginManager::UnloadIndicesWithDeadline(
         auto unload_lease = scope == nullptr
             ? cabbird::PluginScope::CallbackLease{}
             : scope->AcquireLifecycleLease(generation);
-        if (plugin.started) {
+        if (plugin.loaded) {
             ScopedPluginCallback callback_scope(scope, generation, true);
             if (unload_lease || scope == nullptr) {
                 try { plugin.descriptor_v1.on_unload(plugin.plugin_context); } catch (...) {
@@ -5020,6 +5866,7 @@ bool PluginManager::UnloadIndicesWithDeadline(
                 }
             }
         }
+        plugin.loaded = false;
         plugin.started = false;
         plugin.plugin_context = nullptr;
         {
@@ -5055,10 +5902,14 @@ void PluginManager::LoadPersistentUiWindowState() {
             throw std::runtime_error("UI window state values are invalid");
         }
         ui_window_state_last_document_ = SerializeUiWindowState(
-            state.windows, state.plugin_windows);
+            state.windows, state.plugin_windows, state.favorites);
         {
             std::scoped_lock lock(plugin_window_visibility_mutex_);
             plugin_window_visibility_ = std::move(state.plugin_windows);
+        }
+        {
+            std::scoped_lock lock(favorite_plugins_mutex_);
+            favorite_plugins_ = std::move(state.favorites);
         }
     } catch (const std::exception& exception) {
         Log(CABBIRD_CORE_LOG_LEVEL_V1_WARNING, "UI window state load failed: " + std::string(exception.what()));
@@ -5080,8 +5931,13 @@ void PluginManager::SavePersistentUiWindowState(const bool force) noexcept {
             std::scoped_lock visibility_lock(plugin_window_visibility_mutex_);
             plugin_windows = plugin_window_visibility_;
         }
+        std::unordered_set<std::string> favorites;
+        {
+            std::scoped_lock favorites_lock(favorite_plugins_mutex_);
+            favorites = favorite_plugins_;
+        }
         const std::string document = SerializeUiWindowState(
-            ui_resources_->ExportPersistentWindowState(), plugin_windows);
+            ui_resources_->ExportPersistentWindowState(), plugin_windows, favorites);
         if (document == ui_window_state_last_document_) {
             ui_window_state_last_save_ = now;
             return;
@@ -5165,6 +6021,7 @@ void PluginManager::RetryWaitingPlugins() {
     for (const auto& plugin : plugins_) {
         if (!plugin->waiting_for_service || Activate(*plugin)) continue;
         plugin->waiting_for_service = false;
+        plugin->faulted = true;
         Log(CABBIRD_CORE_LOG_LEVEL_V1_ERROR,
             "ABI v1 deferred activation failed: " + plugin->view.id);
     }
@@ -5173,6 +6030,25 @@ void PluginManager::RetryWaitingPlugins() {
 void PluginManager::PersistUiWindowState() {
     const ScopedLogThreadDomain log_domain(cabbird::LogThreadDomain::Worker);
     SavePersistentUiWindowState();
+}
+
+void PluginManager::SetPluginFavorite(
+    const std::string_view plugin_id, const bool favorite) noexcept {
+    try {
+        if (plugin_id.empty() || plugin_id.size() > kMaximumPluginIdBytes) return;
+        std::scoped_lock lock(favorite_plugins_mutex_);
+        if (favorite) {
+            favorite_plugins_.insert(std::string(plugin_id));
+        } else {
+            favorite_plugins_.erase(std::string(plugin_id));
+        }
+    } catch (...) {
+    }
+}
+
+std::unordered_set<std::string> PluginManager::FavoritePlugins() const {
+    std::scoped_lock lock(favorite_plugins_mutex_);
+    return favorite_plugins_;
 }
 
 void PluginManager::ReconcileWindowVisibility(LoadedPlugin& plugin) noexcept {
@@ -5295,6 +6171,17 @@ bool PluginManager::ReloadPackages(const std::vector<std::string>& package_names
         }
     }
 
+    const auto reject_quarantined_reload = [&] {
+        if (!std::any_of(quarantined_plugins_.begin(), quarantined_plugins_.end(),
+                [&](const auto& plugin) { return affected.contains(plugin->view.id); })) return false;
+        Log(CABBIRD_CORE_LOG_LEVEL_V1_ERROR,
+            "plugin package reload stopped by quarantined generation: " + summary);
+        return true;
+    };
+    // An already quarantined member cannot reload. Reject before stopping any
+    // other generation in this dependency closure.
+    if (reject_quarantined_reload()) return false;
+
     struct RollbackCandidate {
         std::string id;
         std::filesystem::path source;
@@ -5313,13 +6200,7 @@ bool PluginManager::ReloadPackages(const std::vector<std::string>& package_names
         unload_indices.push_back(index);
     }
     UnloadIndices(unload_indices, false);
-    if (std::any_of(
-            quarantined_plugins_.begin(), quarantined_plugins_.end(),
-            [&](const auto& plugin) { return affected.contains(plugin->view.id); })) {
-        Log(CABBIRD_CORE_LOG_LEVEL_V1_ERROR,
-            "plugin package reload stopped by quarantined generation: " + summary);
-        return false;
-    }
+    if (reject_quarantined_reload()) return false;
 
     const auto decisions = enablement_store_.Resolve(catalog);
     const auto publish_disabled = [&](const cabbird::PluginCatalogEntry& entry,
@@ -5952,6 +6833,23 @@ bool PluginManager::DrawUiTexture(
     }
 }
 
+bool PluginManager::DrawUiTextureEx(
+    const std::shared_ptr<cabbird::PluginScope>& scope,
+    const cabbird::UiResourceHandle handle,
+    const cabbird::UiTextureDrawRequest& request) noexcept {
+    try {
+        std::shared_ptr<cabbird::UiResourceRenderBackend> backend;
+        {
+            std::scoped_lock lock(ui_resource_backend_mutex_);
+            backend = ui_resource_render_backend_;
+        }
+        return backend != nullptr &&
+            backend->DrawTextureEx(*ui_resources_, scope, handle, request);
+    } catch (...) {
+        return false;
+    }
+}
+
 PluginRuntimeDiagnosticsSnapshot PluginManager::DiagnosticsSnapshot() const {
     struct ServiceCandidate final {
         std::string_view id;
@@ -6008,6 +6906,8 @@ PluginRuntimeDiagnosticsSnapshot PluginManager::DiagnosticsSnapshot() const {
                     plugin.service_context.storage.service_version, true},
                 ServiceCandidate{CABBIRD_JSON_SERVICE_V1_ID,
                     plugin.service_context.json.service_version, true},
+                ServiceCandidate{CABBIRD_PROFILE_SERVICE_V1_ID,
+                    plugin.service_context.profile.service_version, true},
                 ServiceCandidate{CABBIRD_RUNTIME_INFO_SERVICE_V1_ID,
                     plugin.service_context.runtime_info.service_version, true},
                 ServiceCandidate{CABBIRD_LOCALIZATION_SERVICE_V1_ID,
@@ -6016,14 +6916,20 @@ PluginRuntimeDiagnosticsSnapshot PluginManager::DiagnosticsSnapshot() const {
                     plugin.service_context.diagnostics.service_version, true},
                 ServiceCandidate{CABBIRD_SCHEDULER_SERVICE_V1_ID,
                     plugin.service_context.scheduler.service_version, true},
+                ServiceCandidate{CABBIRD_GAME_LIFECYCLE_SERVICE_V1_ID,
+                    plugin.service_context.game_lifecycle.service_version, true},
                 ServiceCandidate{CABBIRD_IPC_SERVICE_V1_ID,
                     plugin.service_context.ipc_service.service_version, true},
+                ServiceCandidate{CABBIRD_WEBSOCKET_SERVICE_V1_ID,
+                    plugin.service_context.websocket.service_version, QueryWebSocketProvider() != nullptr},
+                ServiceCandidate{CABBIRD_WEB_SERVICE_V1_ID,
+                    plugin.service_context.web.service_version, QueryWebProvider() != nullptr},
                 ServiceCandidate{CABBIRD_COMMANDS_SERVICE_V1_ID,
                     plugin.service_context.commands.service_version, true},
                 ServiceCandidate{CABBIRD_NOTIFICATIONS_SERVICE_V1_ID,
                     plugin.service_context.notifications.service_version, true},
                 ServiceCandidate{CABBIRD_SIGNATURE_SERVICE_V1_ID,
-                    plugin.service_context.signature.service_version, true},
+                    plugin.service_context.signature_v3.service_version, true},
                 ServiceCandidate{CABBIRD_HOOK_SERVICE_V1_ID,
                     plugin.service_context.hook.service_version, true},
                 ServiceCandidate{CABBIRD_PATCH_SERVICE_V1_ID,
@@ -6117,7 +7023,7 @@ PluginRuntimeDiagnosticsSnapshot PluginManager::DiagnosticsSnapshot() const {
         if (quarantined) {
             view.visible = false;
         } else if (plugin.waiting_for_service) {
-            view.status_reason = "required service is not ready";
+            if (view.status_reason.empty()) view.status_reason = "required service is not ready";
         } else if (!plugin.faulted) {
             view.status_reason.clear();
         }

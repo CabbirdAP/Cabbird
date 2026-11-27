@@ -22,6 +22,7 @@
 #include <mutex>
 #include <span>
 #include <unordered_map>
+#include <unordered_set>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -184,6 +185,14 @@ public:
     bool StopForRuntime(std::chrono::milliseconds timeout = std::chrono::milliseconds(1000));
     void SetQueuedCallbackCanceller(
         std::function<void(std::string_view, std::uint64_t)> canceller);
+    // Invokes a bounded host-owned restoration callback on the validated Game
+    // dispatcher. A timeout may leave it running; quarantine retains its owner.
+    void SetGameStopInvoker(
+        std::function<std::uint32_t(std::function<void()>, std::chrono::milliseconds)> invoker);
+    // Reopens dispatcher admission before an activation attempt. Required when
+    // cancellation closes an owner/generation that may later be retried.
+    void SetGenerationInitializer(
+        std::function<bool(std::string_view, std::uint64_t)> initializer);
     void SetCallbackEvidenceObserver(
         std::function<void(const PluginCallbackEvidence&)> observer);
     [[nodiscard]] cabbird::PluginScope::CallbackLease AcquireCallback(
@@ -201,6 +210,10 @@ public:
     // synchronization, but callers must not hold a renderer/plugin gate: it
     // can perform filesystem I/O.
     void PersistUiWindowState();
+    // Favorites share the existing UI-state persistence channel. Updating the
+    // shell preference only changes memory; the Worker publishes it to disk.
+    void SetPluginFavorite(std::string_view plugin_id, bool favorite) noexcept;
+    [[nodiscard]] std::unordered_set<std::string> FavoritePlugins() const;
     // Must be called only from the validated game-thread anchor.
     void GameUpdate(double delta_seconds);
     void Draw(void* imgui_context);
@@ -234,6 +247,10 @@ public:
         const std::shared_ptr<cabbird::PluginScope>& scope,
         cabbird::UiResourceHandle handle, float width, float height,
         std::uint32_t tint_rgba) noexcept;
+    [[nodiscard]] bool DrawUiTextureEx(
+        const std::shared_ptr<cabbird::PluginScope>& scope,
+        cabbird::UiResourceHandle handle,
+        const cabbird::UiTextureDrawRequest& request) noexcept;
     [[nodiscard]] bool QueueUiFontLoad(
         const std::shared_ptr<cabbird::PluginScope>& scope,
         cabbird::UiResourceHandle handle) noexcept;
@@ -273,7 +290,7 @@ private:
     struct LoadedPlugin;
     [[nodiscard]] bool LoadAllowed(const cabbird::PluginCatalogEntry& entry) const;
     void PublishSuspended(const cabbird::PluginCatalogEntry& entry);
-    bool LoadCatalogEntry(const cabbird::PluginCatalogEntry& entry);
+    bool LoadCatalogEntry(const cabbird::PluginCatalogEntry& entry, std::string* failure = nullptr);
     void LogImpl(
         CabbirdCoreLogLevelV1 level,
         std::string message,
@@ -283,9 +300,12 @@ private:
         const std::filesystem::path& source,
         const std::filesystem::path& binary,
         const std::filesystem::path& package_directory,
-        cabbird::PluginShadowGeneration shadow_generation);
+        cabbird::PluginShadowGeneration shadow_generation, std::string* failure = nullptr);
     void RunPluginLoadStep(std::function<void()> operation);
     bool Activate(LoadedPlugin& plugin);
+    bool RollbackActivation(LoadedPlugin& plugin);
+    CabbirdStatusV1 RunGameStopCleanups(
+        LoadedPlugin& plugin, std::chrono::steady_clock::time_point deadline);
     void RetryWaitingForAdapterServices();
     void RetryWaitingPlugins();
     bool ReconcileEnablement(const cabbird::PluginCatalogSnapshot& catalog);
@@ -341,6 +361,8 @@ private:
     std::chrono::steady_clock::time_point ui_window_state_last_save_{};
     mutable std::mutex plugin_window_visibility_mutex_;
     std::unordered_map<std::string, bool> plugin_window_visibility_;
+    mutable std::mutex favorite_plugins_mutex_;
+    std::unordered_set<std::string> favorite_plugins_;
     std::shared_ptr<cabbird::UiResourceRegistry> ui_resources_ =
         std::make_shared<cabbird::UiResourceRegistry>();
     cabbird::InputService input_service_;
@@ -349,9 +371,11 @@ private:
     mutable std::mutex ui_resource_backend_mutex_;
     std::shared_ptr<cabbird::UiResourceRenderBackend> ui_resource_render_backend_;
     std::function<void(std::string_view, std::uint64_t)> queued_callback_canceller_;
+    std::function<std::uint32_t(std::function<void()>, std::chrono::milliseconds)> game_stop_invoker_;
     std::function<void(const PluginCallbackEvidence&)> callback_evidence_observer_;
     PluginLoadPredicate load_predicate_;
     PluginActivationObserver activation_observer_;
+    std::function<bool(std::string_view, std::uint64_t)> generation_initializer_;
     mutable std::mutex stop_diagnostics_mutex_;
     std::vector<PluginStopDiagnostic> stop_diagnostics_;
 };

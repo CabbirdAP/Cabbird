@@ -9,6 +9,7 @@
 #include <filesystem>
 #include <string>
 #include <string_view>
+#include <stop_token>
 #include <vector>
 
 namespace cabbird::launcher {
@@ -62,7 +63,7 @@ struct ManualMapOptions final {
      *
      * Neither field below reaches the image any more.  Upstream's CabbirdStartInfo has no
      * ini_path and no level, and the mapped runtime reads its own configuration from
-     * <runtime_root>\cabbird.ini (src/runtime/core_main.cpp, BuildStartContext).  Both used to
+     * <runtime_root>\cabbird.ini (src/app/core_main.cpp, BuildStartContext).  Both used to
      * be written into ABI fields that NO consumer read -- there is no start_info->ini_path and
      * no start_info->level anywhere in the runtime -- so nothing regresses, but a caller that
      * sets them is setting a value that goes nowhere.  `ini_path` in particular was never set
@@ -132,7 +133,9 @@ struct ManualMapLaunchResult final {
 [[nodiscard]] std::vector<AttachableProcess> EnumerateAttachableProcesses(
     std::wstring_view executable_name = L"AzurPromilia.exe") noexcept;
 [[nodiscard]] ManualMapResult ManualMapRuntimeCore(const ManualMapOptions& options) noexcept;
+// Closing the caller cancels discovery and loader waits before mapping starts.
+// Once remote mapping begins, its result must finish before resources are freed.
 [[nodiscard]] ManualMapLaunchResult LaunchAndManualMapRuntimeCore(
-    const ManualMapLaunchOptions& options) noexcept;
+    const ManualMapLaunchOptions& options, std::stop_token stop = {}) noexcept;
 
 }  // namespace cabbird::launcher

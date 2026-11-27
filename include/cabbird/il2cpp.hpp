@@ -244,7 +244,7 @@ bool Initialize(std::wstring_view assembly_name = L"GameAssembly.dll");
 [[nodiscard]] const std::wstring& AssemblyPath();
 
 // Human-readable reason for the last Initialize() failure.
-[[nodiscard]] const std::string& LastError();
+[[nodiscard]] std::string LastError();
 
 // ---------------------------------------------------------------------------
 // RAII thread attachment.
@@ -267,7 +267,6 @@ public:
 
 private:
     bool attached_{};
-    bool owns_{};
     // Opaque pointer to this thread's FLS bookkeeping block.  Kept as void* so
     // the header does not have to expose the FLS implementation, and so it is
     // obvious that nothing here may become a `thread_local` -- see the comment
@@ -285,6 +284,9 @@ private:
     std::string_view assembly_name,
     std::string_view namespaze,
     std::string_view name);
+// Gameplay types may be split across hotfix images; do not assume Assembly-CSharp.
+[[nodiscard]] Il2CppClass* FindClassAnyImage(
+    std::string_view namespaze, std::string_view name);
 
 [[nodiscard]] std::string ClassName(const Il2CppClass* klass);
 [[nodiscard]] std::string TypeName(const Il2CppType* type);
@@ -299,6 +301,17 @@ private:
     Il2CppClass* klass,
     std::string_view field_name);
 [[nodiscard]] FieldInfo* FindField(Il2CppClass* klass, std::string_view field_name);
+// An instance field with metadata-confirmed storage size wholly inside the object's size.
+// Static fields, unavailable metadata and incompatible layouts have no usable offset.
+struct InstanceFieldResolution {
+    bool metadata_available{};
+    std::optional<std::size_t> offset;
+    const Il2CppType* type{};
+};
+[[nodiscard]] InstanceFieldResolution ResolveInstanceField(
+    Il2CppClass* klass, std::string_view field_name, std::size_t field_size);
+[[nodiscard]] std::optional<std::size_t> InstanceFieldOffset(
+    Il2CppClass* klass, std::string_view field_name, std::size_t field_size);
 
 // Reads a managed string into UTF-8.  Uses il2cpp_string_length/chars, so it
 // does not depend on our struct layout guess.

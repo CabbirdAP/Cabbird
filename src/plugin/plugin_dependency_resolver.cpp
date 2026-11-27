@@ -93,8 +93,10 @@ PluginDependencyPlan ResolvePluginDependencies(const PluginCatalogSnapshot& cata
                 }
                 continue;
             }
-            if (!dependency.optional) required_dependencies[consumer].push_back(dependency_node->second);
-            outgoing[dependency_node->second].push_back(consumer);
+            if (!dependency.optional) {
+                required_dependencies[consumer].push_back(dependency_node->second);
+                outgoing[dependency_node->second].push_back(consumer);
+            }
         }
     }
 

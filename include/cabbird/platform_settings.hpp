@@ -38,13 +38,15 @@ enum class PlatformMinimumLogLevel : std::uint8_t {
 
 struct PlatformSettingsValues final {
     LanguagePreference interface_language{LanguagePreference::Auto};
-    CabbirdUiPalette interface_palette{CabbirdUiPalette::CabbirdHub};
+    CabbirdUiPalette interface_palette{CabbirdUiPalette::Paper};
     CabbirdUiCustomColors interface_custom_colors;
     std::uint32_t interface_scale_percent{kPlatformInterfaceScaleDefaultPercent};
     std::uint32_t interface_opacity_percent{100};
     bool interface_reduced_motion{};
+    bool interface_reduced_transparency{};
     bool interface_remember_last_route{true};
     std::uint32_t input_menu_toggle{0x2d};
+    std::uint32_t input_hide_all_toggle{0x2e};
     PlatformInputCapturePolicy input_capture_policy{PlatformInputCapturePolicy::Automatic};
     bool input_gamepad_navigation{true};
     PlatformUpdateChannel updates_channel{PlatformUpdateChannel::Stable};

@@ -1,7 +1,10 @@
 #pragma once
 
+#include "cabbird/cabbird_ui_theme.hpp"
+
 #include <Windows.h>
 
+#include <array>
 #include <cstdint>
 #include <filesystem>
 #include <string>
@@ -19,8 +22,35 @@ struct LauncherClientConfiguration final {
     std::filesystem::path launcher_executable;
 };
 
+struct LauncherThemeArtwork final {
+    // Relative to the Cabbird runtime root, so the installation remains movable.
+    std::string background;
+    int background_mode{-1};  // -1 follows layout; 0 disabled, 1 center, 2 crop, 3 stretch.
+    float surface_opacity{};  // -1 follows the layout's veil.
+
+    friend bool operator==(const LauncherThemeArtwork&, const LauncherThemeArtwork&) = default;
+};
+
+inline constexpr std::array<int, 5> kLauncherFrameRates{15, 30, 60, 120, 240};
+inline constexpr int kLauncherDefaultFrameRate = 120;
+
+[[nodiscard]] inline constexpr int LauncherFrameRatePreset(const double requested) noexcept {
+    for (std::size_t index = 1; index < kLauncherFrameRates.size(); ++index) {
+        if (requested <= (kLauncherFrameRates[index - 1] + kLauncherFrameRates[index]) / 2.0)
+            return kLauncherFrameRates[index - 1];
+    }
+    return kLauncherFrameRates.back();
+}
+
 struct LauncherConfiguration final {
     AzurPromiliaClient selected_client{AzurPromiliaClient::MainlandChina};
+    // Launcher appearance is independent of the in-game platform settings.
+    std::string theme{"paper"};
+    // Empty preserves the runtime ini language when upgrading an older launcher.
+    std::string language;
+    LauncherThemeArtwork artwork;
+    CabbirdUiCustomColors custom_colors;
+    int frame_rate_limit{kLauncherDefaultFrameRate};
     LauncherClientConfiguration mainland_china;
     LauncherClientConfiguration global;
 

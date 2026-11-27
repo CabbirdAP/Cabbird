@@ -36,6 +36,7 @@ struct AnalyzerConfig {
     bool platform_embedded{true};
     bool platform_attach_to_process_window{true};
     unsigned platform_toggle_key{0x2d};
+    unsigned platform_hide_all_key{0x2e};
     cabbird::LanguagePreference platform_language{cabbird::LanguagePreference::Auto};
     std::filesystem::path plugin_directory{L"plugins"};
     double update_slow_milliseconds{2.0};
@@ -60,9 +61,6 @@ struct AnalyzerConfig {
     // 因此关掉时采样间隔会被下限抬到 8。留着这个开关是为了让「崩溃是不是这条快路径造成的」
     // 能由拿着游戏的人用一行配置回答，而不是只能改代码重编译。
     bool entity_direct_position{true};
-    // 全部关卡 actor 扫描远重于持久化关卡扫描，因此按 tick 节流而不是每帧重扫；
-    // 默认约一秒一次，足以跟上大世界的刷怪与清怪。
-    std::size_t actor_tick_interval{60};
     std::string game_id{"ap"};
     std::vector<ConfigDiagnostic> diagnostics;
     static AnalyzerConfig Load(const std::filesystem::path& path);

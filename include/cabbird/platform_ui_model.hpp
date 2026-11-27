@@ -39,6 +39,7 @@ enum class PlatformUiPluginFilter : std::uint8_t {
     Running,
     Disabled,
     Issues,
+    Favorites,
 };
 
 enum class PlatformUiPluginSort : std::uint8_t {
@@ -93,6 +94,7 @@ struct InstalledPluginView final : unitymem::PluginView {
     std::vector<PluginCatalogIssue> catalog_issues;
     std::optional<PluginCompatibilityResult> compatibility_result;
     std::vector<PluginCompatibilityIssue> compatibility_issues;
+    std::vector<PluginDependencyManifest> dependencies;
     std::vector<std::string> dependency_ids;
 
     [[nodiscard]] PlatformUiPluginState UiState() const noexcept;
@@ -218,6 +220,8 @@ struct PlatformUiState final {
     std::string selected_plugin_id;
     std::string diagnostics_plugin_id;
     std::string diagnostics_log_filter;
+    // A shell preference, kept in sync with PluginManager's persisted UI state.
+    std::unordered_set<std::string> favorite_plugin_ids;
 };
 
 struct PlatformUiIntent final {
@@ -386,32 +390,37 @@ struct PlatformUiIntentSubmission final {
 [[nodiscard]] bool MatchesPluginSearch(
     const InstalledPluginView& plugin, std::string_view search) noexcept;
 [[nodiscard]] bool MatchesPluginFilter(
-    const InstalledPluginView& plugin, PlatformUiPluginFilter filter) noexcept;
+    const InstalledPluginView& plugin, PlatformUiPluginFilter filter,
+    const std::unordered_set<std::string>& favorites = {}) noexcept;
 [[nodiscard]] std::vector<InstalledPluginView> FilterAndSortPlugins(
     const std::vector<InstalledPluginView>& plugins,
     std::string_view search,
     PlatformUiPluginFilter filter,
     PlatformUiPluginSort sort,
-    bool include_developer = true);
+    bool include_developer = true,
+    const std::unordered_set<std::string>& favorites = {});
 [[nodiscard]] std::vector<std::string> FilteredPluginIds(
     const std::vector<InstalledPluginView>& plugins,
     std::string_view search,
     PlatformUiPluginFilter filter,
     PlatformUiPluginSort sort,
-    bool include_developer = true);
+    bool include_developer = true,
+    const std::unordered_set<std::string>& favorites = {});
 
 struct PlatformUiPluginFilterCounts final {
     std::size_t all{};
     std::size_t running{};
     std::size_t disabled{};
     std::size_t issues{};
+    std::size_t favorites{};
 
     [[nodiscard]] std::size_t For(PlatformUiPluginFilter filter) const noexcept;
 };
 
 [[nodiscard]] PlatformUiPluginFilterCounts CountFilteredPlugins(
     const std::vector<InstalledPluginView>& plugins, std::string_view search,
-    bool include_developer = true);
+    bool include_developer = true,
+    const std::unordered_set<std::string>& favorites = {});
 [[nodiscard]] std::string ReconcilePluginSelection(
     const std::vector<InstalledPluginView>& sorted_plugins,
     std::string_view previous_selection);
@@ -454,6 +463,9 @@ public:
     PlatformUiModel();
     explicit PlatformUiModel(PlatformUiSnapshot snapshot);
 
+    // The model owns the control revision. Frame-local telemetry and repository
+    // progress may refresh without invalidating a queued plugin operation.
+    // A change to the installed catalog, generation or control state advances it.
     void Publish(PlatformUiSnapshot snapshot);
     [[nodiscard]] const PlatformUiSnapshot& Snapshot() const noexcept { return snapshot_; }
     [[nodiscard]] const PlatformUiState& State() const noexcept { return state_; }

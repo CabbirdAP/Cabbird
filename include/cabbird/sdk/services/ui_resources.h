@@ -51,7 +51,10 @@ typedef enum CabbirdGlyphRangeV1 {
     CABBIRD_GLYPH_RANGE_V1_LATIN = 1,
     CABBIRD_GLYPH_RANGE_V1_CYRILLIC = 2,
     CABBIRD_GLYPH_RANGE_V1_JAPANESE = 3,
-    CABBIRD_GLYPH_RANGE_V1_CHINESE_FULL = 4
+    CABBIRD_GLYPH_RANGE_V1_CHINESE_FULL = 4,
+    // The Basic Multilingual Plane private use area (U+E000..U+F8FF), where icon fonts
+    // such as Material Symbols place their glyphs.
+    CABBIRD_GLYPH_RANGE_V1_PRIVATE_USE = 5
 } CabbirdGlyphRangeV1;
 
 typedef struct CabbirdFontRequestV1 {
@@ -212,6 +215,12 @@ typedef struct CabbirdTextureServiceV1 {
     CabbirdStatusV1 (CABBIRD_CALL *draw)(
         void* user, CabbirdGenerationHandleV1 handle, float width, float height,
         uint32_t tint_rgba);
+    // Optional append-only: draws the texture on the foreground of the main viewport at
+    // (x, y) in viewport pixels, above every window, like the cabbird.ui overlay calls.
+    // Valid only during on_draw.
+    CabbirdStatusV1 (CABBIRD_CALL *draw_overlay)(
+        void* user, CabbirdGenerationHandleV1 handle, float x, float y, float width,
+        float height, uint32_t tint_rgba);
 } CabbirdTextureServiceV1;
 
 typedef struct CabbirdInputServiceV1 {

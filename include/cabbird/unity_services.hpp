@@ -518,11 +518,14 @@ struct HostResolvedPlayer {
     double position[3]{};
     double distance_to_camera{};
     bool identity_from_proximity{};
+    std::uintptr_t entity{};
 };
 [[nodiscard]] HostResolvedPlayer ResolvedHostPlayer();
 
 struct HostUnityPlayerStats {
     bool live{};
+    std::uint64_t sample_count{};
+    std::uint32_t sample_tick_interval{};
     // Which entity the host decided is the local player, and how.
     std::uint64_t entity_id{};
     char data_class[32]{};
@@ -552,7 +555,7 @@ struct HostUnityPlayerStats {
 // The sibling project splits them, and its manifests make the reason visible: its
 // `NtePosition` declares `anomaly.nte.player` alone, while `NteTeleport` declares
 // `anomaly.nte.player` AND `anomaly.nte.player-teleport`.  This tree's two plugins landed on the
-// same line by themselves -- `player_coords` has no control that writes, `player_teleport` has
+// same line by themselves -- `PlayerCoords` has no control that writes, `PlayerTeleport` has
 // nothing else -- so the split here is the one the plugins already implied.
 //
 // THE DIVISION OF LABOUR, STATED PRECISELY

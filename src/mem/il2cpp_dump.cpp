@@ -36,8 +36,8 @@ namespace {
 //
 // Two things follow, and both are implemented here and in the caller:
 //
-//   1. Those initialising walks are opt-in (see DumpOptions), and the thread is
-//      attached to the IL2CPP domain first (DumpOptions::attach_thread).
+//   1. Those initialising walks are opt-in (see DumpOptions). Collection runs
+//      only on the observed attached Game thread, never an attached Worker.
 //   2. Every call into the runtime that can fault is wrapped, so the worst case is
 //      a skipped class rather than a dead game.  A swallowed fault is COUNTED and
 //      reported in DumpStats, because a silently missing class is the one outcome
@@ -729,460 +729,218 @@ bool WriteMetadataBlob(const MetadataBlob& blob, const std::wstring& path, std::
     return true;
 }
 
-DumpStats DumpTypeSystem(std::string& out, const DumpOptions& options) {
-    DumpStats stats{};
+bool CollectTypeSystemBatch(DumpSnapshot& snapshot, DumpCaptureCursor& cursor,
+                            const DumpOptions& options, std::size_t class_budget) {
+    auto& stats = snapshot.stats;
     const Api& api = Functions();
-
-    // Publish progress from inside the walk.  `report` is a no-op when the caller asked
-    // for no callback, so every other caller's behaviour is unchanged.
-    //
-    // TIME IS THE PRIMARY TRIGGER, not the class count.  A class-count-only schedule
-    // reported nothing for seconds at a time on the first real-machine run (an image with
-    // `include_methods` can hold few classes but enormous method counts), which made the
-    // host's own liveness display cry wolf.  `steady_clock::now()` once per class is a few
-    // nanoseconds against the ~8 interop calls each method costs, so this is free by
-    // comparison.
-    std::uint64_t last_report_ms = 0;
-    // Deliberately NOT a nested lambda: capturing a lambda inside another lambda made the
-    // inner call ambiguous to the compiler (C3861/C2440), and the walk does not need the
-    // indirection -- `steady_clock::now()` inline is one line and has no capture problems.
-    const auto report = [&options, &stats, &last_report_ms](bool force) noexcept {
-        if (options.progress == nullptr) return;
-        const std::uint64_t now = static_cast<std::uint64_t>(
-            std::chrono::duration_cast<std::chrono::milliseconds>(
-                std::chrono::steady_clock::now().time_since_epoch())
-                .count());
-        if (!force) {
-            const bool time_due = options.progress_interval_ms != 0 &&
-                now - last_report_ms >= options.progress_interval_ms;
-            const bool count_due = options.progress_class_interval != 0 &&
-                (stats.classes & (options.progress_class_interval - 1)) == 0;
-            if (!time_due && !count_due) return;
+    // The caller is the observed Game dispatcher. Attaching an arbitrary Worker
+    // is not permission to access Unity's lazy managed metadata.
+    stats.thread_attached = api.il2cpp_thread_current && api.il2cpp_thread_current() != nullptr;
+    if (!stats.thread_attached) {
+        snapshot.unavailable_reason = "Game thread is not attached to IL2CPP";
+        return true;
+    }
+    if (!cursor.initialized) {
+        g_contained_faults.store(0);
+        auto* domain = api.il2cpp_domain_get ? api.il2cpp_domain_get() : nullptr;
+        std::size_t assembly_count{};
+        const auto** assemblies = domain && api.il2cpp_domain_get_assemblies
+            ? api.il2cpp_domain_get_assemblies(domain, &assembly_count) : nullptr;
+        if (!assemblies) {
+            snapshot.unavailable_reason = "IL2CPP domain or assemblies unavailable";
+            return true;
         }
-        last_report_ms = now;
-        options.progress(options.progress_user, stats.images, stats.classes, stats.fields);
+        for (std::size_t i = 0; i < assembly_count; ++i)
+            cursor.assemblies.push_back(reinterpret_cast<std::uintptr_t>(assemblies[i]));
+        cursor.initialized = true;
+    }
+    std::size_t captured{};
+    const auto type_name = [&api](const Il2CppType* type) {
+        return type && api.il2cpp_type_get_name && api.il2cpp_free ? TypeName(type) : std::string("?");
     };
-
-    // Attach before the first runtime call, not merely before the initialising
-    // ones: `il2cpp_domain_get` itself is only meaningful for a thread the
-    // runtime can describe.  ThreadScope is reference-counted and leaves a
-    // thread the runtime already knows alone, so this is safe to enter even on
-    // Unity's own main thread.
-    std::unique_ptr<ThreadScope> thread_scope;
-    if (options.attach_thread) {
-        thread_scope = std::make_unique<ThreadScope>();
-        stats.thread_attached = thread_scope->attached();
-    }
-
-    // Clear the counter so a caller reading stats.contained_faults sees exactly
-    // the faults from THIS dump rather than a running total.
-    g_contained_faults.store(0);
-
-    // The metadata recovery runs BEFORE the walk, and it does not need the walk's
-    // results.  Two reasons for this order rather than "after":
-    //
-    //   * A walk can be long (measured: 891 ms for fields only, tens of seconds with
-    //     methods across every image), and the blob is the input the file parser needs.
-    //     Reporting the recoverable half first means a run that is killed mid-walk
-    //     still leaves the metadata on disk.
-    //   * A fault in the metadata scan cannot be confused with a fault in the walk:
-    //     `contained_faults` is reset above and the scan takes no guarded runtime
-    //     calls, so a non-zero counter afterwards belongs to the walk alone.
-    if (options.recover_metadata) {
-        std::string metadata_error;
-        const MetadataBlob* blob = CachedMetadataBlob(metadata_error, &stats.metadata_scan_ms);
-        if (blob != nullptr) {
-            stats.metadata_size = blob->size;
-            stats.metadata_version = blob->version;
-            stats.metadata_address = blob->address;
-            if (!options.metadata_path.empty()) {
-                std::string write_error;
-                stats.metadata_written = WriteMetadataBlob(*blob, options.metadata_path, write_error);
-            }
+    std::uint64_t last_report{};
+    const auto report = [&](bool force) {
+        if (!options.progress) return;
+        const auto now = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count());
+        const bool count_due = options.progress_class_interval && stats.classes % options.progress_class_interval == 0;
+        if (force || count_due || now - last_report >= options.progress_interval_ms) {
+            last_report = now;
+            options.progress(options.progress_user, stats.images, stats.classes, stats.fields);
         }
-    }
-
-    Il2CppDomain* domain = api.il2cpp_domain_get != nullptr ? api.il2cpp_domain_get() : nullptr;
-    if (domain == nullptr) {
-        out += "// no IL2CPP domain\n";
-        return stats;
-    }
-
-    std::size_t assembly_count = 0;
-    const Il2CppAssembly** assemblies =
-        api.il2cpp_domain_get_assemblies != nullptr
-            ? api.il2cpp_domain_get_assemblies(domain, &assembly_count)
-            : nullptr;
-    if (assemblies == nullptr) {
-        out += "// no assemblies\n";
-        return stats;
-    }
-
-    // The body is built separately from the header.
-    //
-    // It used to be appended to `out` directly, with a three-line title at the top.  That
-    // makes the provenance counters -- how many method pointers landed inside the module,
-    // how many runtime calls faulted -- impossible to write, because they are only known
-    // AFTER the walk, and a file whose header says "inside=0" before the walk has run is
-    // worse than one that says nothing.  So the body accumulates here and the header is
-    // composed from the finished stats at the end.
-    std::string body;
-
-    for (std::size_t assembly_index = 0; assembly_index < assembly_count; ++assembly_index) {
-        if (assemblies[assembly_index] == nullptr ||
-            api.il2cpp_assembly_get_image == nullptr) {
-            continue;
+    };
+    for (; cursor.assembly_index < cursor.assemblies.size(); ++cursor.assembly_index) {
+        const auto* assembly = reinterpret_cast<const Il2CppAssembly*>(cursor.assemblies[cursor.assembly_index]);
+        auto* image = assembly && api.il2cpp_assembly_get_image ? api.il2cpp_assembly_get_image(assembly) : nullptr;
+        if (!image || !api.il2cpp_image_get_class_count) continue;
+        if (!cursor.image_active) {
+            DumpImageSnapshot target;
+            const char* image_name = api.il2cpp_image_get_name ? api.il2cpp_image_get_name(image) : nullptr;
+            target.name = image_name ? image_name : "?";
+            target.class_count = api.il2cpp_image_get_class_count(image);
+            if (!target.class_count) continue;
+            const auto limit = options.max_classes_per_image ? std::min(target.class_count, options.max_classes_per_image) : target.class_count;
+            stats.truncated_classes += target.class_count - limit;
+            snapshot.images.push_back(std::move(target));
+            cursor.image_active = true;
+            ++stats.images;
         }
-        Il2CppImage* image = api.il2cpp_assembly_get_image(assemblies[assembly_index]);
-        if (image == nullptr) {
-            continue;
-        }
-        const char* image_name =
-            api.il2cpp_image_get_name != nullptr ? api.il2cpp_image_get_name(image) : nullptr;
-        const std::size_t class_count =
-            api.il2cpp_image_get_class_count != nullptr
-                ? api.il2cpp_image_get_class_count(image)
-                : 0;
-        if (class_count == 0) {
-            continue;  // nothing to say about an empty image
-        }
-        ++stats.images;
-
-        body += "// ===== image: ";
-        body += image_name != nullptr ? image_name : "?";
-        body += " (";
-        body += std::to_string(class_count);
-        body += " classes)\n\n";
-
-        const std::size_t limit =
-            options.max_classes_per_image == 0
-                ? class_count
-                : std::min(class_count, options.max_classes_per_image);
-        if (limit < class_count) {
-            stats.truncated_classes += class_count - limit;
-        }
-
-        for (std::size_t class_index = 0; class_index < limit; ++class_index) {
-            Il2CppClass* klass =
-                api.il2cpp_image_get_class != nullptr ? api.il2cpp_image_get_class(image, class_index)
-                                                      : nullptr;
-            if (klass == nullptr) {
-                continue;
-            }
-            ++stats.classes;
-
-            // Value types are `struct` in C#, and Il2CppDumper writes them that way.
-            // This dumper used to call every one of them a `class` and lean on the
-            // `: System.ValueType` base to convey the truth -- which read as a
-            // contradiction rather than as information.
-            //
-            // Found by diffing this output against Il2CppDumper's: `public struct
-            // AzurBrick` there, `public class AzurBrick : System.ValueType` here.
-            // Both files were "correct"; only one was readable.
-            const bool is_value_type =
-                api.il2cpp_class_is_valuetype != nullptr && api.il2cpp_class_is_valuetype(klass);
-            body += is_value_type ? "public struct " : "public class ";
-            body += QualifyClass(klass);
-
-            Il2CppClass* parent =
-                api.il2cpp_class_get_parent != nullptr ? api.il2cpp_class_get_parent(klass) : nullptr;
-            if (parent != nullptr) {
-                body += " : ";
-                body += QualifyClass(parent);
-            }
-
-            // Interfaces are emitted on the same `:` line as the base class, the
-            // way C# and Il2CppDumper both write them.  Without them a reader
-            // cannot tell which contract a class actually implements.
-            //
-            // Guarded and opt-in: see the fault-containment block at the top of
-            // this file for why this specific call is the one that killed a game.
-            if (options.include_interfaces && api.il2cpp_class_get_interfaces != nullptr) {
-                void* iterator = nullptr;
-                bool first = parent == nullptr;
-                std::size_t emitted = 0;
-                while (Il2CppClass* iface = GuardedGetInterfaces(api, klass, &iterator)) {
-                    if (emitted >= kMaxInterfacesPerClass) {
-                        body += ", /* ... */";
-                        break;
-                    }
-                    body += first ? " : " : ", ";
-                    first = false;
-                    body += QualifyClass(iface);
-                    ++emitted;
+        auto& target = snapshot.images.back();
+        const auto limit = options.max_classes_per_image ? std::min(target.class_count, options.max_classes_per_image) : target.class_count;
+        const bool methods = options.include_methods && MethodImageMatches(target.name, options.method_image_filter);
+        for (; cursor.class_index < limit; ++cursor.class_index) {
+            auto* klass = api.il2cpp_image_get_class ? api.il2cpp_image_get_class(image, cursor.class_index) : nullptr;
+            if (!klass) continue;
+            DumpClassSnapshot next;
+            next.name = QualifyClass(klass);
+            next.value_type = api.il2cpp_class_is_valuetype && api.il2cpp_class_is_valuetype(klass);
+            auto* parent = api.il2cpp_class_get_parent ? api.il2cpp_class_get_parent(klass) : nullptr;
+            if (parent) next.parent = QualifyClass(parent);
+            if (options.include_interfaces && api.il2cpp_class_get_interfaces) {
+                void* iterator{};
+                while (auto* iface = GuardedGetInterfaces(api, klass, &iterator)) {
+                    if (next.interfaces.size() == kMaxInterfacesPerClass) break;
+                    next.interfaces.push_back(QualifyClass(iface));
                 }
             }
-            body += "\n{\n";
-
-            if (options.include_fields && api.il2cpp_class_get_fields != nullptr) {
-                void* iterator = nullptr;
-                std::size_t field_count = 0;
-                while (FieldInfo* field = api.il2cpp_class_get_fields(klass, &iterator)) {
-                    if (options.max_fields_per_class != 0 &&
-                        field_count >= options.max_fields_per_class) {
-                        body += "    // ... more fields elided\n";
-                        break;
+            if (options.include_fields && api.il2cpp_class_get_fields) {
+                void* iterator{};
+                while (auto* field = api.il2cpp_class_get_fields(klass, &iterator)) {
+                    if (options.max_fields_per_class && next.fields.size() == options.max_fields_per_class) {
+                        next.fields_truncated = true; break;
                     }
-                    const char* field_name =
-                        api.il2cpp_field_get_name != nullptr ? api.il2cpp_field_get_name(field)
-                                                             : nullptr;
-                    const std::size_t offset =
-                        api.il2cpp_field_get_offset != nullptr
-                            ? api.il2cpp_field_get_offset(field)
-                            : 0;
-                    // Guarded: a per-field call is the highest-frequency runtime
-                    // call this dumper makes (101,231 of them on this game), so it
-                    // is also the one with the most chances to meet a bad pointer.
-                    std::uint32_t field_flags = 0;
-                    if (api.il2cpp_field_get_flags != nullptr) {
-                        GuardedFieldFlags(api, field, field_flags);
-                    }
-                    body += "    ";
-                    body += FieldModifiers(field_flags);
-                    if (api.il2cpp_field_get_type != nullptr && api.il2cpp_type_get_name != nullptr) {
-                        const Il2CppType* type = api.il2cpp_field_get_type(field);
-                        const char* type_name = type != nullptr ? api.il2cpp_type_get_name(type) : nullptr;
-                        body += type_name != nullptr ? type_name : "?";
-                    } else {
-                        body += "?";
-                    }
-                    body += " ";
-                    body += field_name != nullptr ? field_name : "?";
-                    body += "; // ";
-                    // THREAD-STATIC FIELDS.
-                    //
-                    // IL2CPP reports the offset of a [ThreadStatic] field as
-                    // (size_t)-1, which printed verbatim is `0xFFFFFFFFFFFFFFFF` --
-                    // a value that looks like an address and is not one.  It is a
-                    // marker, and a useful one: it says the field has no fixed
-                    // location at all and lives in per-thread storage, so a modder
-                    // cannot reach it with an object pointer and an offset.
-                    //
-                    // Measured, not assumed: all 39 fields in this game carrying
-                    // that value are `static`, and every one of them is [ThreadStatic]
-                    // (`t_threadRandom`, `type_resolve_in_progress`, ...).  Il2CppDumper
-                    // renders the same fields with its own sentinel rather than the
-                    // raw number, and the comparison is what surfaced this.
-                    const bool thread_static =
-                        (field_flags & kFieldAttributeStatic) != 0 && offset == kThreadStaticOffset;
-                    if (thread_static) {
-                        body += "thread-static";
-                    } else {
-                        body += HexText(offset);
-                    }
-                    // Static and const fields carry no instance offset, so printing
-                    // a bare `0x0` next to them invites the reader to treat it as a
-                    // real answer.  Say so instead.  (For thread-static the line
-                    // above already said something better, so only add this when it
-                    // did not.)
-                    if (!thread_static &&
-                        (field_flags & (kFieldAttributeStatic | kFieldAttributeLiteral)) != 0) {
-                        body += " (no instance offset)";
-                    }
-                    if ((field_flags & kFieldAttributeNotSerialized) != 0) {
-                        body += " [NotSerialized]";
-                    }
-                    body += "\n";
+                    DumpFieldSnapshot item;
+                    const char* name = api.il2cpp_field_get_name ? api.il2cpp_field_get_name(field) : nullptr;
+                    item.name = name ? name : "?";
+                    item.type = type_name(api.il2cpp_field_get_type ? api.il2cpp_field_get_type(field) : nullptr);
+                    item.offset = api.il2cpp_field_get_offset ? api.il2cpp_field_get_offset(field) : 0;
+                    if (api.il2cpp_field_get_flags) GuardedFieldFlags(api, field, item.flags);
+                    next.fields.push_back(std::move(item));
                     ++stats.fields;
-                    ++field_count;
                 }
             }
-
-            // nullptr-safe: image_name can be null, and constructing a std::string
-            // from a null char* is undefined behaviour.
-            const std::string image_name_string = image_name != nullptr ? image_name : "";
-            if (options.include_methods && MethodImageMatches(image_name_string, options.method_image_filter) &&
-                api.il2cpp_class_get_methods != nullptr) {
-                void* iterator = nullptr;
-                std::size_t method_count = 0;
-                while (const MethodInfo* method = GuardedGetMethods(api, klass, &iterator)) {
-                    if (options.max_methods_per_class != 0 &&
-                        method_count >= options.max_methods_per_class) {
-                        body += "    // ... more methods elided\n";
-                        break;
+            if (methods && api.il2cpp_class_get_methods) {
+                void* iterator{};
+                while (const auto* method = GuardedGetMethods(api, klass, &iterator)) {
+                    if (options.max_methods_per_class && next.methods.size() == options.max_methods_per_class) {
+                        next.methods_truncated = true; break;
                     }
-                    const char* method_name =
-                        api.il2cpp_method_get_name != nullptr ? api.il2cpp_method_get_name(method)
-                                                              : nullptr;
-                    body += "    ";
-                    if (api.il2cpp_method_get_flags != nullptr) {
-                        std::uint32_t iflags = 0;
-                        const std::uint32_t flags = api.il2cpp_method_get_flags(method, &iflags);
-                        body += MethodModifiers(flags);
-                    } else {
-                        body += "public ";
+                    DumpMethodSnapshot item;
+                    const char* name = api.il2cpp_method_get_name ? api.il2cpp_method_get_name(method) : nullptr;
+                    item.name = name ? name : "?";
+                    item.result = type_name(api.il2cpp_method_get_return_type ? api.il2cpp_method_get_return_type(method) : nullptr);
+                    if (api.il2cpp_method_get_flags) {
+                        std::uint32_t iflags{};
+                        item.flags = api.il2cpp_method_get_flags(method, &iflags);
                     }
-                    if (api.il2cpp_method_get_return_type != nullptr &&
-                        api.il2cpp_type_get_name != nullptr) {
-                        const Il2CppType* type = api.il2cpp_method_get_return_type(method);
-                        const char* type_name = type != nullptr ? api.il2cpp_type_get_name(type) : nullptr;
-                        body += type_name != nullptr ? type_name : "?";
-                    } else {
-                        body += "?";
-                    }
-                    body += " ";
-                    body += method_name != nullptr ? method_name : "?";
-                    body += "(";
-                    const std::uint32_t parameter_count =
-                        api.il2cpp_method_get_param_count != nullptr
-                            ? api.il2cpp_method_get_param_count(method)
-                            : 0;
-                    for (std::uint32_t parameter = 0; parameter < parameter_count; ++parameter) {
-                        if (parameter != 0) {
-                            body += ", ";
-                        }
-                        if (api.il2cpp_method_get_param != nullptr &&
-                            api.il2cpp_type_get_name != nullptr) {
-                            const Il2CppType* type = api.il2cpp_method_get_param(method, parameter);
-                            // A generic parameter of an open generic method resolves
-                            // to null; that is expected, not an error.
-                            const char* type_name =
-                                type != nullptr ? api.il2cpp_type_get_name(type) : nullptr;
-                            body += type_name != nullptr ? type_name : "?";
-                        } else {
-                            body += "?";
-                        }
-                    }
-                    body += ");";
-
-                    // The address block is what makes a dump usable for RE rather
-                    // than merely readable.  It is only printed when the pointer
-                    // actually landed inside GameAssembly.dll -- see
-                    // ReadMethodPointer for why it is measured and not assumed.
-                    {
-                        std::uintptr_t pointer = 0;
-                        if (ReadMethodPointer(method, options.module_base, options.module_size,
-                                              pointer)) {
-                            ++stats.method_pointers_inside;
-                            body += " // RVA: ";
-                            body += HexText(options.module_base != 0 ? pointer - options.module_base
-                                                                     : pointer);
-                            body += " Offset: ";
-                            body += HexText(options.module_base != 0 ? pointer - options.module_base
-                                                                     : pointer);
-                            body += " VA: ";
-                            body += HexText(pointer);
-                        } else {
-                            ++stats.method_pointers_outside;
-                            body += " // RVA: <not in module>";
-                        }
-                    }
-
-                    if (api.il2cpp_method_get_token != nullptr) {
-                        std::uint32_t method_token = 0;
-                        if (GuardedMethodToken(api, method, method_token)) {
-                            body += " Token: ";
-                            body += HexText(method_token);
-                        } else {
-                            body += " Token: <unreadable>";
-                        }
-                    }
-                    body += "\n";
+                    const auto count = api.il2cpp_method_get_param_count ? api.il2cpp_method_get_param_count(method) : 0;
+                    for (std::uint32_t pi = 0; pi < count; ++pi)
+                        item.parameters.push_back(type_name(api.il2cpp_method_get_param ? api.il2cpp_method_get_param(method, pi) : nullptr));
+                    item.pointer_valid = ReadMethodPointer(method, options.module_base, options.module_size, item.pointer);
+                    if (item.pointer_valid) ++stats.method_pointers_inside; else ++stats.method_pointers_outside;
+                    item.token_valid = api.il2cpp_method_get_token && GuardedMethodToken(api, method, item.token);
+                    next.methods.push_back(std::move(item));
                     ++stats.methods;
-                    ++method_count;
                 }
             }
-
-            // Properties come after methods, matching Il2CppDumper's ordering so
-            // the two dumps can be diffed by eye.
-            //
-            // Guarded and opt-in: il2cpp_class_get_properties runs
-            // Class::SetupProperties internally, which WRITES to the class.  See
-            // the fault-containment block at the top of this file.
-            if (options.include_properties && api.il2cpp_class_get_properties != nullptr) {
-                void* iterator = nullptr;
-                std::size_t property_count = 0;
-                while (const PropertyInfo* property =
-                           GuardedGetProperties(api, klass, &iterator)) {
-                    if (property_count >= kMaxPropertiesPerClass) {
-                        body += "    // ... more properties elided\n";
-                        break;
+            if (options.include_properties && api.il2cpp_class_get_properties) {
+                void* iterator{};
+                while (const auto* property = GuardedGetProperties(api, klass, &iterator)) {
+                    if (next.properties.size() == kMaxPropertiesPerClass) { next.properties_truncated = true; break; }
+                    DumpPropertySnapshot item;
+                    const char* name = api.il2cpp_property_get_name ? GuardedPropertyName(api, property) : nullptr;
+                    item.name = name ? name : "?";
+                    const auto* getter = api.il2cpp_property_get_get_method ? GuardedPropertyAccessor(api, property, true) : nullptr;
+                    const auto* setter = api.il2cpp_property_get_set_method ? GuardedPropertyAccessor(api, property, false) : nullptr;
+                    item.getter = getter != nullptr; item.setter = setter != nullptr;
+                    const Il2CppType* type{};
+                    if (getter && api.il2cpp_method_get_return_type) type = api.il2cpp_method_get_return_type(getter);
+                    else if (setter && api.il2cpp_method_get_param_count && api.il2cpp_method_get_param) {
+                        const auto count = api.il2cpp_method_get_param_count(setter);
+                        if (count) type = api.il2cpp_method_get_param(setter, count - 1);
                     }
-                    const char* property_name =
-                        api.il2cpp_property_get_name != nullptr
-                            ? GuardedPropertyName(api, property)
-                            : nullptr;
-                    const MethodInfo* getter =
-                        api.il2cpp_property_get_get_method != nullptr
-                            ? GuardedPropertyAccessor(api, property, true)
-                            : nullptr;
-                    const MethodInfo* setter =
-                        api.il2cpp_property_get_set_method != nullptr
-                            ? GuardedPropertyAccessor(api, property, false)
-                            : nullptr;
-
-                    body += "    public ";
-                    // The property's type is the getter's return type; a setter-only
-                    // property has to take it from the setter's last parameter.
-                    const Il2CppType* type = nullptr;
-                    if (getter != nullptr && api.il2cpp_method_get_return_type != nullptr) {
-                        type = api.il2cpp_method_get_return_type(getter);
-                    } else if (setter != nullptr && api.il2cpp_method_get_param != nullptr &&
-                               api.il2cpp_method_get_param_count != nullptr) {
-                        const std::uint32_t count = api.il2cpp_method_get_param_count(setter);
-                        if (count > 0) {
-                            type = api.il2cpp_method_get_param(setter, count - 1);
-                        }
-                    }
-                    if (type != nullptr && api.il2cpp_type_get_name != nullptr) {
-                        const char* type_name = api.il2cpp_type_get_name(type);
-                        body += type_name != nullptr ? type_name : "?";
-                    } else {
-                        body += "?";
-                    }
-                    body += " ";
-                    body += property_name != nullptr ? property_name : "?";
-                    body += " { ";
-                    if (getter != nullptr) {
-                        body += "get; ";
-                    }
-                    if (setter != nullptr) {
-                        body += "set; ";
-                    }
-                    body += "}\n";
+                    item.type = type_name(type);
+                    next.properties.push_back(std::move(item));
                     ++stats.properties;
-                    ++property_count;
                 }
             }
-
-            body += "}\n\n";
-            // One class done.  The interval mask inside `report` turns this into a
-            // published update every `progress_class_interval` classes, which is what
-            // makes a long walk visible instead of indistinguishable from a hang.
+            target.classes.push_back(std::move(next));
+            ++stats.classes;
             report(false);
+            if (++captured >= class_budget) {
+                ++cursor.class_index;
+                stats.contained_faults = g_contained_faults.load();
+                report(true);
+                return false;
+            }
         }
-        // Forced at the image boundary so a large image cannot leave the last partial
-        // interval unreported, and so the image counter advances exactly once per image
-        // rather than only when a class happened to land on the mask.
+        cursor.class_index = 0;
+        cursor.image_active = false;
         report(true);
     }
-
-    // Publish the fault count last, so it covers the whole walk.
     stats.contained_faults = g_contained_faults.load();
+    return true;
+}
 
-    // Assemble the file: identity, provenance, then the walk.
-    //
-    // INCOMPLETE goes in the FIRST line rather than at the end.  The previous revision
-    // appended the warning to the tail of a 9-30 MB file, i.e. exactly where a reader
-    // who opens the head never looks -- and the whole reason for counting contained
-    // faults is that a silently partial dump is the one outcome worse than a visible
-    // failure.  The tail line is kept as well, because a reader that greps for it (the
-    // existing scripts do) must keep finding it.
-    out += "// dump.cs generated from the LIVE IL2CPP type system\n";
-    out += "// field offsets are runtime-verified; they are the reason this exists\n";
-    out += "// alongside Il2CppDumper rather than replacing it\n";
-    if (stats.contained_faults != 0) {
-        out += "// INCOMPLETE: " + std::to_string(stats.contained_faults) +
-               " runtime call(s) faulted and were skipped; classes may be missing\n";
-    }
+DumpSnapshot CollectTypeSystem(const DumpOptions& options) {
+    DumpSnapshot snapshot;
+    DumpCaptureCursor cursor;
+    while (!CollectTypeSystemBatch(snapshot, cursor, options)) {}
+    return snapshot;
+}
+
+void FormatTypeSystem(std::string& out, const DumpSnapshot& snapshot, const DumpOptions& options) {
+    const auto& stats = snapshot.stats;
+    out += "// dump.cs generated from a Game-domain IL2CPP snapshot\n";
+    if (!snapshot.unavailable_reason.empty()) out += "// unavailable: " + snapshot.unavailable_reason + "\n";
+    if (stats.contained_faults) out += "// INCOMPLETE: " + std::to_string(stats.contained_faults) + " runtime call(s) faulted\n";
     AppendProvenanceHeader(out, stats, options);
-    out += "\n";
-    out += body;
-    if (stats.contained_faults != 0) {
-        out += "// WARNING: " + std::to_string(stats.contained_faults) +
-               " runtime call(s) faulted and were skipped; this dump is INCOMPLETE\n";
+    for (const auto& image : snapshot.images) {
+        out += "\n// ===== image: " + image.name + " (" + std::to_string(image.class_count) + " classes)\n\n";
+        for (const auto& klass : image.classes) {
+            out += klass.value_type ? "public struct " : "public class ";
+            out += klass.name;
+            bool base = !klass.parent.empty();
+            if (base) out += " : " + klass.parent;
+            for (const auto& iface : klass.interfaces) { out += base ? ", " : " : "; out += iface; base = true; }
+            out += "\n{\n";
+            for (const auto& field : klass.fields) {
+                out += "    " + FieldModifiers(field.flags) + field.type + " " + field.name + "; // ";
+                const bool thread_static = (field.flags & kFieldAttributeStatic) && field.offset == kThreadStaticOffset;
+                out += thread_static ? "thread-static" : HexText(field.offset);
+                if (!thread_static && (field.flags & (kFieldAttributeStatic | kFieldAttributeLiteral))) out += " (no instance offset)";
+                if (field.flags & kFieldAttributeNotSerialized) out += " [NotSerialized]";
+                out += "\n";
+            }
+            if (klass.fields_truncated) out += "    // ... more fields elided\n";
+            for (const auto& method : klass.methods) {
+                out += "    " + MethodModifiers(method.flags) + method.result + " " + method.name + "(";
+                for (std::size_t i = 0; i < method.parameters.size(); ++i) { if (i) out += ", "; out += method.parameters[i]; }
+                out += "); // RVA: ";
+                if (method.pointer_valid) {
+                    const auto relative = options.module_base ? method.pointer - options.module_base : method.pointer;
+                    out += HexText(relative) + " Offset: " + HexText(relative) + " VA: " + HexText(method.pointer);
+                } else out += "<not in module>";
+                out += method.token_valid ? " Token: " + HexText(method.token) : " Token: <unreadable>";
+                out += "\n";
+            }
+            if (klass.methods_truncated) out += "    // ... more methods elided\n";
+            for (const auto& property : klass.properties) {
+                out += "    public " + property.type + " " + property.name + " { ";
+                if (property.getter) out += "get; ";
+                if (property.setter) out += "set; ";
+                out += "}\n";
+            }
+            if (klass.properties_truncated) out += "    // ... more properties elided\n";
+            out += "}\n\n";
+        }
     }
-    return stats;
+}
+
+DumpStats DumpTypeSystem(std::string& out, const DumpOptions& options) {
+    auto snapshot = CollectTypeSystem(options);
+    FormatTypeSystem(out, snapshot, options);
+    return snapshot.stats;
 }
 
 }  // namespace cabbird::il2cpp

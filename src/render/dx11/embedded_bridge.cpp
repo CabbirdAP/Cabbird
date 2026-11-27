@@ -1,7 +1,10 @@
 #include "cabbird/unitymem_compat.hpp"
 #include "embedded_host_internal.hpp"
+#include "embedded_present_scope.hpp"
 
 #include "cabbird/host_ui_service.hpp"
+#include "cabbird/cabbird_ui_theme.hpp"
+#include "cabbird/reliable_storage.hpp"
 #include "cabbird/structured_logger.hpp"
 #include "cabbird/thread_local_value.hpp"
 #include "cabbird/unity_adapter.hpp"
@@ -49,6 +52,10 @@ ResizeBuffersFn g_resize_buffers{};
 ResizeBuffers1Fn g_resize_buffers1{};
 std::unique_ptr<cabbird::HookManager> g_hooks;
 std::atomic_bool g_performance_diagnostics_enabled{};
+namespace {
+cabbird::ThreadLocalScalar<bool> g_present_active;
+cabbird::ThreadLocalScalar<bool> g_resize_active;
+}
 
 void EmbeddedPerformanceProbe::SetEnabled(const bool enabled) noexcept {
     const bool previous = enabled_.exchange(enabled, std::memory_order_acq_rel);
@@ -290,6 +297,8 @@ std::uint64_t CaptureGeneration(const EmbeddedState* state) noexcept {
 }
 
 HRESULT STDMETHODCALLTYPE HookPresent(IDXGISwapChain* swap_chain, UINT interval, UINT flags) {
+    const EmbeddedPresentScope present_scope(g_present_active);
+    if (!present_scope.Outermost()) return g_present(swap_chain, interval, flags);
     const bool requested = g_performance_diagnostics_enabled.load(std::memory_order_relaxed);
     const auto lease_started = requested ? std::chrono::steady_clock::now()
                                          : std::chrono::steady_clock::time_point{};
@@ -301,12 +310,7 @@ HRESULT STDMETHODCALLTYPE HookPresent(IDXGISwapChain* swap_chain, UINT interval,
     if (sampled) state->performance.ObservePresent();
     const auto render_started = sampled ? std::chrono::steady_clock::now()
                                         : std::chrono::steady_clock::time_point{};
-    static cabbird::ThreadLocalScalar<bool> rendering;
-    if (callback && !rendering.Get()) {
-        rendering.Set(true);
-        RenderEmbedded(swap_chain, flags);
-        rendering.Set(false);
-    }
+    if (callback) RenderEmbedded(swap_chain, flags);
     const auto original_started = sampled ? std::chrono::steady_clock::now()
                                           : std::chrono::steady_clock::time_point{};
     const HRESULT result = g_present(swap_chain, interval, flags);
@@ -330,6 +334,8 @@ HRESULT STDMETHODCALLTYPE HookPresent(IDXGISwapChain* swap_chain, UINT interval,
 HRESULT STDMETHODCALLTYPE HookPresent1(
     IDXGISwapChain1* swap_chain, UINT interval, UINT flags,
     const DXGI_PRESENT_PARAMETERS* parameters) {
+    const EmbeddedPresentScope present_scope(g_present_active);
+    if (!present_scope.Outermost()) return g_present1(swap_chain, interval, flags, parameters);
     const bool requested = g_performance_diagnostics_enabled.load(std::memory_order_relaxed);
     const auto lease_started = requested ? std::chrono::steady_clock::now()
                                          : std::chrono::steady_clock::time_point{};
@@ -341,12 +347,7 @@ HRESULT STDMETHODCALLTYPE HookPresent1(
     if (sampled) state->performance.ObservePresent();
     const auto render_started = sampled ? std::chrono::steady_clock::now()
                                         : std::chrono::steady_clock::time_point{};
-    static cabbird::ThreadLocalScalar<bool> rendering;
-    if (callback && !rendering.Get()) {
-        rendering.Set(true);
-        RenderEmbedded(swap_chain, flags);
-        rendering.Set(false);
-    }
+    if (callback) RenderEmbedded(swap_chain, flags);
     const auto original_started = sampled ? std::chrono::steady_clock::now()
                                           : std::chrono::steady_clock::time_point{};
     const HRESULT result = g_present1(swap_chain, interval, flags, parameters);
@@ -378,7 +379,10 @@ HRESULT STDMETHODCALLTYPE HookResizeBuffers(
     auto* state = g_state.load(std::memory_order_acquire);
     const std::uint64_t capture_generation = CaptureGeneration(state);
     const bool affected = static_cast<bool>(callback);
+    const EmbeddedPresentScope resize_scope(g_resize_active);
+    if (callback && resize_scope.Outermost()) PrepareEmbeddedResize(swap_chain);
     const HRESULT result = g_resize_buffers(swap_chain, count, width, height, format, flags);
+    if (callback && resize_scope.Outermost()) CompleteEmbeddedResize(swap_chain);
     const bool success = SUCCEEDED(result);
     if (affected && state != nullptr && state->diagnostics.resize) {
         try {
@@ -406,9 +410,12 @@ HRESULT STDMETHODCALLTYPE HookResizeBuffers1(
     auto* state = g_state.load(std::memory_order_acquire);
     const std::uint64_t capture_generation = CaptureGeneration(state);
     const bool affected = static_cast<bool>(callback);
+    const EmbeddedPresentScope resize_scope(g_resize_active);
+    if (callback && resize_scope.Outermost()) PrepareEmbeddedResize(swap_chain);
     const HRESULT result = g_resize_buffers1(
         swap_chain, count, width, height, format, flags,
         creation_node_mask, present_queue);
+    if (callback && resize_scope.Outermost()) CompleteEmbeddedResize(swap_chain);
     const bool success = SUCCEEDED(result);
     if (affected && state != nullptr && state->diagnostics.resize) {
         try {
@@ -518,6 +525,45 @@ void RunEmbeddedPlatform(
     state.root = root;
     state.config = config;
     state.diagnostics = std::move(diagnostics);
+    // This existing platform Worker prepares all disk-backed render inputs
+    // before publishing hooks. Present and device recovery only use memory.
+    static_cast<void>(PrepareCabbirdUiFontSources(root));
+    ReliableStorage ui_storage(root.native());
+    const auto initial_ini = ui_storage.Read(L"cabbird-imgui.ini", 1024U * 1024U);
+    std::shared_ptr<const std::string> persisted_ini;
+    if (initial_ini && !initial_ini.bytes.empty()) {
+        persisted_ini = std::make_shared<const std::string>(
+            reinterpret_cast<const char*>(initial_ini.bytes.data()), initial_ini.bytes.size());
+        state.imgui_ini_snapshot.store(persisted_ini, std::memory_order_release);
+    }
+    const auto persist_render_state = [&]() noexcept {
+        bool preferences_saved = true;
+        try {
+            const auto snapshot = state.imgui_ini_snapshot.load(std::memory_order_acquire);
+            if (snapshot != nullptr && snapshot != persisted_ini) {
+                const auto saved = ui_storage.WriteAtomic(L"cabbird-imgui.ini",
+                    std::as_bytes(std::span(snapshot->data(), snapshot->size())));
+                // A failed publish stays dirty for the next maintenance pass
+                // and for the final flush after the graphics generation stops.
+                if (saved) persisted_ini = snapshot;
+                else preferences_saved = false;
+            }
+            std::vector<std::string> diagnostics;
+            {
+                std::scoped_lock lock(state.diagnostic_mutex);
+                diagnostics.swap(state.pending_diagnostics);
+            }
+            if (!diagnostics.empty()) {
+                std::ofstream log(root / L"cabbird-platform.log", std::ios::app);
+                for (const auto& message : diagnostics) {
+                    log << "pid=" << GetCurrentProcessId() << ' ' << message << '\n';
+                }
+            }
+        } catch (...) {
+            preferences_saved = false;
+        }
+        return preferences_saved;
+    };
     state.diagnostics.performance_probe = [&performance = state.performance](
         const PlatformUiPerformanceStage stage,
         const std::chrono::steady_clock::duration elapsed) noexcept {
@@ -658,6 +704,13 @@ void RunEmbeddedPlatform(
                     state.plugins_loaded = false;
                 }
             }
+            if (!persist_render_state() && state.diagnostics.logger != nullptr) {
+                LogDetails details;
+                details.thread_domain = LogThreadDomain::Worker;
+                details.event_id = "render.preferences_save_failed";
+                static_cast<void>(state.diagnostics.logger->Log(LogLevel::Error, "render",
+                    "Could not persist the final ImGui window preferences", std::move(details)));
+            }
             state.renderer = RendererLifecycle::Stopped;
             auto* expected = &state;
             static_cast<void>(g_state.compare_exchange_strong(
@@ -687,7 +740,10 @@ void RunEmbeddedPlatform(
             if (game_pump) static_cast<void>(game_pump());
             const auto lock_started = sampled ? std::chrono::steady_clock::now()
                                               : std::chrono::steady_clock::time_point{};
-            std::unique_lock plugin_lock(*plugin_mutex);
+            // Lifecycle mutation owns this gate. A borrowed Unity frame must
+            // skip plugin work instead of waiting for that operation to finish.
+            std::unique_lock plugin_lock(*plugin_mutex, std::try_to_lock);
+            if (!plugin_lock.owns_lock()) return;
             const auto update_started = sampled ? std::chrono::steady_clock::now()
                                                 : std::chrono::steady_clock::time_point{};
             if (tick_enabled->load(std::memory_order_relaxed)) {
@@ -717,14 +773,7 @@ void RunEmbeddedPlatform(
     // Missing game bindings degrade game services, not UI startup. Never create or
     // start a second adapter here; the profile lifecycle has already attempted it.
 
-    EmbeddedState* expected_state{};
-    if (!g_state.compare_exchange_strong(
-            expected_state, &state, std::memory_order_acq_rel, std::memory_order_acquire)) {
-        return;
-    }
-    hooks_owned = true;
-    const bool installed = InstallHooks();
-    if (g_hooks == nullptr) hooks_owned = false;
+    // Publish a complete diagnostics snapshot before Present can copy it.
     const auto upstream_hooks = state.diagnostics.hooks;
     state.diagnostics.hooks = [upstream_hooks] {
         auto result = upstream_hooks ? upstream_hooks() : std::vector<cabbird::HookRecordView>{};
@@ -734,6 +783,15 @@ void RunEmbeddedPlatform(
         }
         return result;
     };
+
+    EmbeddedState* expected_state{};
+    if (!g_state.compare_exchange_strong(
+            expected_state, &state, std::memory_order_acq_rel, std::memory_order_acquire)) {
+        return;
+    }
+    hooks_owned = true;
+    const bool installed = InstallHooks();
+    if (g_hooks == nullptr) hooks_owned = false;
     std::ofstream(root / L"cabbird-platform.log", std::ios::app)
         // Named for what it actually installs.  This read `d3d12_hooks=` since the D3D12 days and
         // was never renamed when the renderer moved to D3D11, so anyone diagnosing a D3D11 title
@@ -788,6 +846,7 @@ void RunEmbeddedPlatform(
         const auto persistence_started = sampled ? std::chrono::steady_clock::now()
                                                  : std::chrono::steady_clock::time_point{};
         plugin_owner->PersistUiWindowState();
+        persist_render_state();
         if (sampled) {
             state.performance.RecordPersistence(
                 std::chrono::steady_clock::now() - persistence_started);

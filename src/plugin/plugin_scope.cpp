@@ -4,11 +4,9 @@
  * entry points differ in one way that matters:
  *
  *   AcquireCallback()        ordinary path.  Refuses once sources are frozen.
- *   AcquireLifecycleLease()  shutdown path.  Still granted after freeze, because
- *                            otherwise on_stop could never run and the plugin could
- *                            never be unloaded cleanly.  That asymmetry is the whole
- *                            trick: freeze the floodgates, but leave one door open for
- *                            the person turning off the lights.
+ *   AcquireLifecycleLease()  shutdown path. Granted only after BeginStop has
+ *                            drained ordinary callbacks, so
+ *                            on_stop cannot race an unfinished update or draw.
  *
  * Both count as in-flight, so the host's final "is anything still running?" check sees
  * the lifecycle callback too.
@@ -39,6 +37,9 @@ const char* PluginResourceKindName(PluginResourceKind kind) noexcept {
         case PluginResourceKind::Json: return "json";
         case PluginResourceKind::UnityScene: return "unity_scene";
         case PluginResourceKind::Il2cppSubscription: return "il2cpp_subscription";
+    case PluginResourceKind::Web: return "web";
+    case PluginResourceKind::GameStopCleanup: return "game-stop-cleanup";
+    case PluginResourceKind::PlayerMotion: return "player-motion";
     }
     return "unknown";
 }
@@ -64,11 +65,23 @@ std::uint64_t ResourceLedger::Register(
 }
 
 bool ResourceLedger::Release(std::uint64_t token) noexcept {
+    return ReleaseMatching(token, std::nullopt, 0);
+}
+
+bool ResourceLedger::Release(
+    std::string_view owner, std::uint64_t generation, std::uint64_t token) noexcept {
+    return ReleaseMatching(token, owner, generation);
+}
+
+bool ResourceLedger::ReleaseMatching(
+    std::uint64_t token, std::optional<std::string_view> owner,
+    std::uint64_t generation) noexcept {
     Entry entry;
     {
         std::lock_guard<std::mutex> lock(mutex_);
         const auto it = entries_.find(token);
-        if (it == entries_.end()) {
+        if (it == entries_.end() || (owner &&
+            (it->second.record.owner != *owner || it->second.record.generation != generation))) {
             return false;
         }
         entry = std::move(it->second);
@@ -78,42 +91,31 @@ bool ResourceLedger::Release(std::uint64_t token) noexcept {
     // hook or frees a texture, and doing that while holding the ledger mutex would
     // make any re-entrant registration (a revoker that cleans up two things) deadlock.
     if (entry.revoker) {
-        entry.revoker();
+        try { entry.revoker(); } catch (...) {}
     }
     return true;
 }
 
 std::size_t ResourceLedger::Revoke(std::string_view owner, std::uint64_t generation) noexcept {
-    std::vector<Entry> revoked;
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        for (auto it = entries_.begin(); it != entries_.end();) {
-            if (it->second.record.owner == owner && it->second.record.generation == generation) {
-                revoked.push_back(std::move(it->second));
-                it = entries_.erase(it);
-            } else {
-                ++it;
-            }
-        }
-    }
-    for (Entry& entry : revoked) {
-        if (entry.revoker) {
-            entry.revoker();
-        }
-    }
-    return revoked.size();
+    return RevokeMatching(owner, generation, std::nullopt);
 }
 
 std::size_t ResourceLedger::RevokeExcept(
     std::string_view owner, std::uint64_t generation,
     PluginResourceKind preserved_kind) noexcept {
+    return RevokeMatching(owner, generation, preserved_kind);
+}
+
+std::size_t ResourceLedger::RevokeMatching(
+    std::string_view owner, std::uint64_t generation,
+    std::optional<PluginResourceKind> preserved_kind) noexcept {
     std::vector<Entry> revoked;
     {
         std::lock_guard<std::mutex> lock(mutex_);
         for (auto it = entries_.begin(); it != entries_.end();) {
             const bool matches = it->second.record.owner == owner &&
                                  it->second.record.generation == generation;
-            if (matches && it->second.record.kind != preserved_kind) {
+            if (matches && (!preserved_kind || it->second.record.kind != *preserved_kind)) {
                 revoked.push_back(std::move(it->second));
                 it = entries_.erase(it);
             } else {
@@ -121,9 +123,14 @@ std::size_t ResourceLedger::RevokeExcept(
             }
         }
     }
+    // Tokens are assigned at registration, so descending order tears down children
+    // before resources they depend on. Hash-table iteration has no lifecycle order.
+    std::sort(revoked.begin(), revoked.end(), [](const Entry& left, const Entry& right) {
+        return left.record.token > right.record.token;
+    });
     for (Entry& entry : revoked) {
         if (entry.revoker) {
-            entry.revoker();
+            try { entry.revoker(); } catch (...) {}
         }
     }
     return revoked.size();
@@ -159,6 +166,7 @@ struct PluginScope::BarrierState {
     std::condition_variable cv;
     std::size_t in_flight{0};
     bool accepting{true};
+    bool lifecycle_allowed{};
 };
 
 PluginScope::CallbackLease::~CallbackLease() { Reset(); }
@@ -204,6 +212,8 @@ std::uint64_t PluginScope::Register(
     if (!ledger_) {
         return 0;
     }
+    std::lock_guard<std::mutex> lock(barrier_->mutex);
+    if (!barrier_->accepting) return 0;
     return ledger_->Register(owner_, generation_, kind, std::move(label), std::move(revoker));
 }
 
@@ -211,7 +221,7 @@ bool PluginScope::Release(std::uint64_t token) noexcept {
     if (!ledger_ || token == 0) {
         return false;
     }
-    return ledger_->Release(token);
+    return ledger_->Release(owner_, generation_, token);
 }
 
 PluginScope::CallbackLease PluginScope::AcquireCallback(std::uint64_t generation) noexcept {
@@ -240,8 +250,7 @@ PluginScope::CallbackLease PluginScope::AcquireLifecycleLease(std::uint64_t gene
         return {};
     }
     std::lock_guard<std::mutex> lock(barrier_->mutex);
-    // Deliberately NOT gated on `accepting`: the lifecycle path has to remain usable
-    // after FreezeCallbackSources, or on_stop could never be called.
+    if (!barrier_->lifecycle_allowed) return {};
     ++barrier_->in_flight;
     return CallbackLease(barrier_);
 }
@@ -252,10 +261,16 @@ bool PluginScope::BeginStop(std::chrono::milliseconds timeout) noexcept {
     }
     std::unique_lock<std::mutex> lock(barrier_->mutex);
     barrier_->accepting = false;
-    // A zero-timeout wait is still a wait: it gives any callback that is releasing its
-    // lease right now a chance to finish before we declare failure.
-    barrier_->cv.wait_for(lock, timeout, [this] { return barrier_->in_flight == 0; });
-    return barrier_->in_flight == 0;
+    bool drained{};
+    if (timeout == std::chrono::milliseconds::max()) {
+        barrier_->cv.wait(lock, [this] { return barrier_->in_flight == 0; });
+        drained = true;
+    } else {
+        drained = barrier_->cv.wait_for(
+            lock, timeout, [this] { return barrier_->in_flight == 0; });
+    }
+    if (drained) barrier_->lifecycle_allowed = true;
+    return drained;
 }
 
 std::size_t PluginScope::RevokeAllExcept(PluginResourceKind preserved_kind) noexcept {
@@ -276,7 +291,11 @@ std::vector<PluginResourceRecord> PluginScope::Resources() const {
     if (!ledger_) {
         return {};
     }
-    return ledger_->Snapshot(owner_);
+    auto resources = ledger_->Snapshot(owner_);
+    resources.erase(std::remove_if(resources.begin(), resources.end(), [this](const auto& record) {
+        return record.generation != generation_;
+    }), resources.end());
+    return resources;
 }
 
 PluginScopeSnapshot PluginScope::Snapshot() const {
@@ -287,12 +306,10 @@ PluginScopeSnapshot PluginScope::Snapshot() const {
         std::lock_guard<std::mutex> lock(barrier_->mutex);
         out.accepting_callbacks = barrier_->accepting;
         out.in_flight_callbacks = barrier_->in_flight;
-        // A lifecycle lease is legal once ordinary sources are frozen, which is how a
-        // stopping plugin still gets its on_stop callback.
-        out.lifecycle_allowed = !barrier_->accepting;
+        out.lifecycle_allowed = barrier_->lifecycle_allowed;
     }
     if (ledger_) {
-        out.resources = ledger_->Snapshot(owner_).size();
+        out.resources = Resources().size();
     }
     return out;
 }

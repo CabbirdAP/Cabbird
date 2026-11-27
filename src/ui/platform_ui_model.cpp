@@ -11,25 +11,6 @@
 namespace cabbird {
 namespace {
 
-/* THERE IS NO REQUIRED-FEATURE LIST HERE ANY MORE, AND THAT IS THE MIGRATION.
- *
- * This file used to carry `kRequiredUnityCompatibilityFeatures` -- seven ids
- * (unity.framework/world/names/objects/session/player/entities) that were upstream's
- * `ue5.framework/world/names/objects` plus `nte.session/player/entities` with the
- * namespace mechanically rewritten.  `unity.session` was the tell: "session" is an NTE
- * concept with no Unity meaning at all.
- *
- * Nothing in this tree ever declared those ids.  The matrix's own data is the profile
- * document (`profiles/unity-build-profiles.json`), whose rows are the METHODS it
- * declares; the upstream BuildProfile layer, when a repository-managed profile exists,
- * declares whatever FEATURES that document names.  A hardcoded list of ids that no
- * document produces cannot gate anything -- it could only ever downgrade a level, which
- * is exactly what it did (a fully bound profile reported "CoreOnly").
- *
- * So the level rule is now about the rows that exist: `Supported` means every declared
- * row is available and validated, nothing more.
- */
-
 std::string Lower(std::string_view value) {
     std::string result;
     result.reserve(value.size());
@@ -41,7 +22,10 @@ std::string Lower(std::string_view value) {
 
 bool ContainsInsensitive(std::string_view value, std::string_view needle) {
     if (needle.empty()) return true;
-    return Lower(value).find(Lower(needle)) != std::string::npos;
+    return std::search(value.begin(), value.end(), needle.begin(), needle.end(),
+        [](const unsigned char left, const unsigned char right) {
+            return std::tolower(left) == std::tolower(right);
+        }) != value.end();
 }
 
 std::string Join(const std::vector<std::string>& values, std::string_view separator) {
@@ -98,6 +82,7 @@ void SetCatalogState(InstalledPluginView& view, const PluginCatalogEntry& entry)
         view.audience = manifest.audience;
         if (view.source.empty()) view.source = entry.entry_file;
         if (view.package_directory.empty()) view.package_directory = entry.package_root;
+        view.dependencies = manifest.dependencies;
         view.dependency_ids.clear();
         view.dependency_ids.reserve(manifest.dependencies.size());
         for (const auto& dependency : manifest.dependencies) {
@@ -166,35 +151,6 @@ void ApplyMetadataState(
     }
 }
 
-bool IsStartLike(PlatformUiPluginMutation mutation) noexcept {
-    return mutation == PlatformUiPluginMutation::Start ||
-        mutation == PlatformUiPluginMutation::Enable;
-}
-
-bool IsStopLike(PlatformUiPluginMutation mutation) noexcept {
-    return mutation == PlatformUiPluginMutation::Stop ||
-        mutation == PlatformUiPluginMutation::Disable;
-}
-
-void AddAffected(
-    std::map<std::string, AffectedPlugin, std::less<>>& affected,
-    std::string id,
-    bool directly_requested,
-    std::string reason) {
-    if (id.empty()) return;
-    // Keep the map key intact while moving the display object; argument evaluation
-    // order is unspecified and moving `id` inline can otherwise produce an empty key.
-    const std::string key = id;
-    auto [iterator, inserted] = affected.emplace(
-        key, AffectedPlugin{std::move(id), directly_requested, std::move(reason)});
-    if (!inserted && directly_requested) iterator->second.directly_requested = true;
-}
-
-bool HasDependency(const InstalledPluginView& plugin, std::string_view id) noexcept {
-    return std::find(plugin.dependency_ids.begin(), plugin.dependency_ids.end(), id) !=
-        plugin.dependency_ids.end();
-}
-
 std::string StateSortKey(const InstalledPluginView& plugin) {
     return Lower(plugin.state);
 }
@@ -206,6 +162,37 @@ std::string SortKey(const InstalledPluginView& plugin, PlatformUiPluginSort sort
     case PlatformUiPluginSort::Name: return Lower(plugin.name);
     }
     return {};
+}
+
+bool SamePluginControlState(
+    const InstalledPluginView& left, const InstalledPluginView& right) noexcept {
+    return left.id == right.id && left.generation == right.generation &&
+        left.state == right.state && left.enabled == right.enabled &&
+        left.visible == right.visible && left.visibility_control == right.visibility_control &&
+        left.has_runtime_view == right.has_runtime_view &&
+        left.has_catalog_entry == right.has_catalog_entry &&
+        left.catalog_status == right.catalog_status && left.compatible == right.compatible &&
+        left.dependency_state == right.dependency_state &&
+        std::equal(left.dependencies.begin(), left.dependencies.end(),
+            right.dependencies.begin(), right.dependencies.end(), [](const auto& left, const auto& right) {
+                return left.id == right.id && left.version_expression == right.version_expression &&
+                    left.optional == right.optional;
+            }) &&
+        left.dependency_ids == right.dependency_ids && left.version == right.version &&
+        left.package_directory == right.package_directory && left.source == right.source;
+}
+
+bool SameInstalledControlState(
+    const PlatformUiSnapshot& left, const PlatformUiSnapshot& right) noexcept {
+    if (left.installed_plugins.size() != right.installed_plugins.size()) return false;
+    // Snapshot builders publish canonical order. The fast path makes normal
+    // telemetry refresh linear; a reordered provider still describes the same state.
+    if (std::equal(left.installed_plugins.begin(), left.installed_plugins.end(),
+            right.installed_plugins.begin(), SamePluginControlState)) {
+        return true;
+    }
+    return std::is_permutation(left.installed_plugins.begin(), left.installed_plugins.end(),
+        right.installed_plugins.begin(), right.installed_plugins.end(), SamePluginControlState);
 }
 
 }  // namespace
@@ -437,12 +424,14 @@ bool MatchesPluginSearch(const InstalledPluginView& plugin, std::string_view sea
 }
 
 bool MatchesPluginFilter(
-    const InstalledPluginView& plugin, PlatformUiPluginFilter filter) noexcept {
+    const InstalledPluginView& plugin, PlatformUiPluginFilter filter,
+    const std::unordered_set<std::string>& favorites) noexcept {
     switch (filter) {
     case PlatformUiPluginFilter::All: return true;
     case PlatformUiPluginFilter::Running: return plugin.IsRunning();
     case PlatformUiPluginFilter::Disabled: return plugin.IsDisabled();
     case PlatformUiPluginFilter::Issues: return plugin.HasIssue();
+    case PlatformUiPluginFilter::Favorites: return favorites.contains(plugin.id);
     }
     return false;
 }
@@ -452,21 +441,28 @@ std::vector<InstalledPluginView> FilterAndSortPlugins(
     std::string_view search,
     PlatformUiPluginFilter filter,
     PlatformUiPluginSort sort,
-    bool include_developer) {
-    std::vector<InstalledPluginView> result;
-    result.reserve(plugins.size());
+    bool include_developer,
+    const std::unordered_set<std::string>& favorites) {
+    struct SortEntry final {
+        const InstalledPluginView* plugin;
+        std::string key;
+        std::string id;
+    };
+    std::vector<SortEntry> sorted;
+    sorted.reserve(plugins.size());
     for (const auto& plugin : plugins) {
         if (!include_developer && plugin.audience == PluginAudience::Developer) continue;
-        if (MatchesPluginSearch(plugin, search) && MatchesPluginFilter(plugin, filter)) {
-            result.push_back(plugin);
+        if (MatchesPluginSearch(plugin, search) && MatchesPluginFilter(plugin, filter, favorites)) {
+            sorted.push_back({&plugin, SortKey(plugin, sort), Lower(plugin.id)});
         }
     }
-    std::stable_sort(result.begin(), result.end(), [&](const auto& left, const auto& right) {
-        const std::string left_key = SortKey(left, sort);
-        const std::string right_key = SortKey(right, sort);
-        if (left_key != right_key) return left_key < right_key;
-        return Lower(left.id) < Lower(right.id);
+    std::stable_sort(sorted.begin(), sorted.end(), [](const auto& left, const auto& right) {
+        if (left.key != right.key) return left.key < right.key;
+        return left.id < right.id;
     });
+    std::vector<InstalledPluginView> result;
+    result.reserve(sorted.size());
+    for (const auto& entry : sorted) result.push_back(*entry.plugin);
     return result;
 }
 
@@ -475,9 +471,10 @@ std::vector<std::string> FilteredPluginIds(
     std::string_view search,
     PlatformUiPluginFilter filter,
     PlatformUiPluginSort sort,
-    bool include_developer) {
+    bool include_developer,
+    const std::unordered_set<std::string>& favorites) {
     const auto filtered = FilterAndSortPlugins(
-        plugins, search, filter, sort, include_developer);
+        plugins, search, filter, sort, include_developer, favorites);
     std::vector<std::string> result;
     result.reserve(filtered.size());
     for (const auto& plugin : filtered) result.push_back(plugin.id);
@@ -490,13 +487,14 @@ std::size_t PlatformUiPluginFilterCounts::For(PlatformUiPluginFilter filter) con
     case PlatformUiPluginFilter::Running: return running;
     case PlatformUiPluginFilter::Disabled: return disabled;
     case PlatformUiPluginFilter::Issues: return issues;
+    case PlatformUiPluginFilter::Favorites: return favorites;
     }
     return 0;
 }
 
 PlatformUiPluginFilterCounts CountFilteredPlugins(
     const std::vector<InstalledPluginView>& plugins, std::string_view search,
-    bool include_developer) {
+    bool include_developer, const std::unordered_set<std::string>& favorites) {
     PlatformUiPluginFilterCounts result;
     for (const auto& plugin : plugins) {
         if (!include_developer && plugin.audience == PluginAudience::Developer) continue;
@@ -505,6 +503,7 @@ PlatformUiPluginFilterCounts CountFilteredPlugins(
         if (plugin.IsRunning()) ++result.running;
         if (plugin.IsDisabled()) ++result.disabled;
         if (plugin.HasIssue()) ++result.issues;
+        if (favorites.contains(plugin.id)) ++result.favorites;
     }
     return result;
 }
@@ -525,7 +524,7 @@ void ReconcileUiStateSelection(
     bool include_developer) {
     const auto sorted = FilterAndSortPlugins(
         snapshot.installed_plugins, state.search, state.plugin_filter, state.plugin_sort,
-        include_developer);
+        include_developer, state.favorite_plugin_ids);
     state.selected_plugin_id = ReconcilePluginSelection(sorted, state.selected_plugin_id);
 }
 
@@ -669,260 +668,6 @@ UnityCompatibilitySnapshot BuildUnityCompatibilitySnapshot(
     return result;
 }
 
-PlatformUiAffectedSetPreflight PreflightPluginMutation(
-    const PlatformUiSnapshot& snapshot, const PlatformUiIntent& intent) {
-    PlatformUiAffectedSetPreflight result;
-    result.mutation = ResolvePlatformUiMutation(intent);
-    result.subject_id = intent.subject_id;
-
-    std::map<std::string, AffectedPlugin, std::less<>> affected;
-    const auto add_plugin = [&](std::string_view id, bool direct, std::string reason) {
-        AddAffected(affected, std::string(id), direct, std::move(reason));
-    };
-
-    if (result.mutation == PlatformUiPluginMutation::ReloadAll) {
-        for (const auto& plugin : snapshot.installed_plugins) {
-            add_plugin(plugin.id, false, "batch reload");
-        }
-    } else {
-        const auto* target = snapshot.FindPlugin(intent.subject_id);
-        if (target == nullptr) {
-            result.decision = PlatformUiPreflightDecision::Blocked;
-            result.reason = "plugin was not found in the Installed snapshot";
-            return result;
-        }
-        add_plugin(target->id, true, "requested plugin");
-        if (IsStartLike(result.mutation) || result.mutation == PlatformUiPluginMutation::Reload) {
-            if (target->UiState() == PlatformUiPluginState::Rejected ||
-                target->UiState() == PlatformUiPluginState::Incompatible) {
-                result.decision = PlatformUiPreflightDecision::Blocked;
-                result.reason = std::string(ToString(target->UiState()));
-            } else if (target->dependency_state != PluginDependencyState::Ready) {
-                result.decision = PlatformUiPreflightDecision::Blocked;
-                result.reason = "dependency graph blocks this operation";
-            } else if (result.mutation == PlatformUiPluginMutation::Reload &&
-                       !target->has_runtime_view) {
-                result.decision = PlatformUiPreflightDecision::Blocked;
-                result.reason = "plugin has no active generation to reload";
-            }
-            if (result.mutation == PlatformUiPluginMutation::Reload) {
-                // ReloadPackages replaces the selected generation and every
-                // transitive dependent that holds imports from it.
-                bool changed = true;
-                while (changed) {
-                    changed = false;
-                    for (const auto& plugin : snapshot.installed_plugins) {
-                        if (affected.contains(plugin.id)) continue;
-                        for (const auto& item : affected) {
-                            if (HasDependency(plugin, item.first)) {
-                                add_plugin(
-                                    plugin.id, false,
-                                    "dependent generation must reload");
-                                changed = true;
-                                break;
-                            }
-                        }
-                    }
-                }
-            } else {
-                // Starting a plugin requires its complete dependency closure.
-                std::unordered_set<std::string> visiting;
-                std::function<void(const InstalledPluginView&)> add_dependencies =
-                    [&](const InstalledPluginView& plugin) {
-                        if (!visiting.insert(plugin.id).second) return;
-                        for (const auto& dependency_id : plugin.dependency_ids) {
-                            const auto* dependency = snapshot.FindPlugin(dependency_id);
-                            if (dependency == nullptr) {
-                                result.decision = PlatformUiPreflightDecision::Blocked;
-                                result.reason = "required dependency is missing: " + dependency_id;
-                                continue;
-                            }
-                            add_plugin(dependency->id, false, "required dependency");
-                            if (dependency->dependency_state != PluginDependencyState::Ready ||
-                                dependency->UiState() == PlatformUiPluginState::Rejected ||
-                                dependency->UiState() == PlatformUiPluginState::Incompatible) {
-                                result.decision = PlatformUiPreflightDecision::Blocked;
-                                result.reason = "required dependency is blocked: " + dependency->id;
-                            }
-                            add_dependencies(*dependency);
-                        }
-                    };
-                add_dependencies(*target);
-            }
-        } else if (IsStopLike(result.mutation)) {
-            // Stopping a dependency also stops all installed dependents first.
-            bool changed = true;
-            while (changed) {
-                changed = false;
-                for (const auto& plugin : snapshot.installed_plugins) {
-                    if (affected.find(plugin.id) != affected.end()) continue;
-                    for (const auto& item : affected) {
-                        if (HasDependency(plugin, item.first)) {
-                            add_plugin(plugin.id, false, "dependent plugin must stop first");
-                            changed = true;
-                            break;
-                        }
-                    }
-                }
-            }
-        } else if (result.mutation == PlatformUiPluginMutation::SetVisible) {
-            if (!target->visibility_control || !target->IsRunning()) {
-                result.decision = PlatformUiPreflightDecision::Blocked;
-                result.reason = "plugin does not expose an active visibility control";
-            }
-        }
-    }
-
-    for (auto& [id, item] : affected) result.affected.push_back(std::move(item));
-    if (result.decision == PlatformUiPreflightDecision::Blocked) return result;
-    if (result.affected.empty()) {
-        result.decision = PlatformUiPreflightDecision::Blocked;
-        result.reason = "no Installed plugins are available";
-        return result;
-    }
-    const bool confirmation = result.affected.size() > 1 ||
-        result.mutation == PlatformUiPluginMutation::ReloadAll;
-    result.decision = confirmation
-        ? PlatformUiPreflightDecision::ConfirmationRequired
-        : PlatformUiPreflightDecision::Direct;
-    if (confirmation && result.reason.empty()) {
-        result.reason = "operation affects multiple plugins";
-    }
-    return result;
-}
-
-PlatformUiIntentValidation ValidatePlatformUiIntent(
-    const PlatformUiSnapshot& snapshot,
-    const PlatformUiIntent& intent,
-    const std::unordered_set<std::uint64_t>& submitted_intents) {
-    PlatformUiIntentValidation result;
-    if (intent.intent_id != 0 && submitted_intents.contains(intent.intent_id)) {
-        result.duplicate_intent = true;
-        result.code = PlatformUiResultCode::DuplicateIntent;
-        result.reason = "intent id has already been submitted";
-        return result;
-    }
-    if (intent.intent_id != 0) {
-        const auto duplicate = std::find_if(snapshot.operation_results.begin(),
-            snapshot.operation_results.end(), [&](const auto& operation) {
-                return operation.intent_id == intent.intent_id;
-            });
-        if (duplicate != snapshot.operation_results.end()) {
-            result.duplicate_intent = true;
-            result.code = PlatformUiResultCode::DuplicateIntent;
-            result.reason = "intent id already has an operation result";
-            return result;
-        }
-    }
-    if (intent.expected_revision != snapshot.revision) {
-        result.revision_conflict = true;
-        result.code = PlatformUiResultCode::RevisionConflict;
-        result.reason = "the UI snapshot revision is stale";
-        return result;
-    }
-
-    switch (intent.kind) {
-    case PlatformUiIntentKind::OpenRoute:
-        result.accepted = true;
-        result.code = PlatformUiResultCode::Accepted;
-        return result;
-    case PlatformUiIntentKind::ViewPluginLogs:
-        if (!intent.subject_id.empty() && snapshot.FindPlugin(intent.subject_id) == nullptr) {
-            result.subject_missing = true;
-            result.code = PlatformUiResultCode::SubjectNotFound;
-            result.reason = "plugin was not found in the Installed snapshot";
-            return result;
-        }
-        result.accepted = true;
-        result.code = PlatformUiResultCode::Accepted;
-        return result;
-    case PlatformUiIntentKind::PlanPluginMutation:
-        if (intent.mutation == PlatformUiPluginMutation::None) {
-            result.code = PlatformUiResultCode::InvalidIntent;
-            result.reason = "planning intent must specify a plugin mutation";
-            return result;
-        }
-        break;
-    default:
-        break;
-    }
-
-    result.preflight = PreflightPluginMutation(snapshot, intent);
-    if (!result.preflight->Allowed()) {
-        result.code = PlatformUiResultCode::PreflightBlocked;
-        result.reason = result.preflight->reason;
-        return result;
-    }
-    if (result.preflight->RequiresConfirmation() && !intent.confirmed) {
-        result.code = PlatformUiResultCode::PreflightRequired;
-        result.reason = result.preflight->reason;
-        return result;
-    }
-    result.accepted = true;
-    result.code = PlatformUiResultCode::Accepted;
-    return result;
-}
-
-PlatformUiOperationResult MakeSubmittedOperation(
-    const PlatformUiIntent& intent,
-    const PlatformUiAffectedSetPreflight* preflight,
-    std::uint64_t operation_id,
-    std::uint64_t observed_revision) {
-    PlatformUiOperationResult result;
-    result.operation_id = operation_id;
-    result.intent_id = intent.intent_id;
-    result.expected_revision = intent.expected_revision;
-    result.observed_revision = observed_revision;
-    result.state = PlatformUiOperationState::Submitted;
-    result.code = PlatformUiResultCode::Accepted;
-    result.mutation = ResolvePlatformUiMutation(intent);
-    result.subject_id = intent.subject_id;
-    if (preflight != nullptr) {
-        result.plugins.reserve(preflight->affected.size());
-        for (const auto& affected : preflight->affected) {
-            result.plugins.push_back({affected.id, PluginOperationOutcome::Skipped,
-                PluginOperationReason::AlreadyPending, affected.reason, 0, 0, false});
-        }
-    }
-    return result;
-}
-
-void FinalizeOperation(PlatformUiOperationResult& operation) {
-    if (operation.plugins.empty()) {
-        operation.state = PlatformUiOperationState::Failed;
-        operation.code = PlatformUiResultCode::BackendFailure;
-        operation.message = "operation returned no per-plugin result";
-        operation.retryable = true;
-        return;
-    }
-    std::size_t succeeded{};
-    std::size_t failed{};
-    std::size_t skipped{};
-    for (const auto& plugin : operation.plugins) {
-        succeeded += plugin.outcome == PluginOperationOutcome::Succeeded;
-        failed += plugin.outcome == PluginOperationOutcome::Failed;
-        skipped += plugin.outcome == PluginOperationOutcome::Skipped;
-        operation.retryable = operation.retryable || plugin.retryable;
-    }
-    if (failed == 0 && skipped == 0) {
-        operation.state = PlatformUiOperationState::Succeeded;
-        operation.code = PlatformUiResultCode::Accepted;
-        operation.message = "all plugins succeeded";
-    } else if (succeeded == 0 && failed == 0 && skipped != 0) {
-        operation.state = PlatformUiOperationState::Cancelled;
-        operation.code = PlatformUiResultCode::BackendFailure;
-        operation.message = "all plugins were skipped";
-    } else if (succeeded == 0) {
-        operation.state = PlatformUiOperationState::Failed;
-        operation.code = PlatformUiResultCode::BackendFailure;
-        operation.message = "all plugins failed";
-    } else {
-        operation.state = PlatformUiOperationState::PartiallyFailed;
-        operation.code = PlatformUiResultCode::BackendFailure;
-        operation.message = "some plugins did not succeed";
-    }
-}
-
 PlatformUiModel::PlatformUiModel() = default;
 
 PlatformUiModel::PlatformUiModel(PlatformUiSnapshot snapshot)
@@ -931,6 +676,8 @@ PlatformUiModel::PlatformUiModel(PlatformUiSnapshot snapshot)
 }
 
 void PlatformUiModel::Publish(PlatformUiSnapshot snapshot) {
+    snapshot.revision = snapshot_.revision +
+        (snapshot_.revision == 0 || !SameInstalledControlState(snapshot_, snapshot) ? 1U : 0U);
     snapshot_ = std::move(snapshot);
     ReconcileUiStateSelection(snapshot_, state_);
     pending_operations_.erase(
@@ -943,13 +690,13 @@ void PlatformUiModel::Publish(PlatformUiSnapshot snapshot) {
 std::vector<InstalledPluginView> PlatformUiModel::VisiblePlugins(
     bool include_developer) const {
     return FilterAndSortPlugins(snapshot_.installed_plugins, state_.search,
-        state_.plugin_filter, state_.plugin_sort, include_developer);
+        state_.plugin_filter, state_.plugin_sort, include_developer, state_.favorite_plugin_ids);
 }
 
 PlatformUiPluginFilterCounts PlatformUiModel::FilterCounts(
     bool include_developer) const {
     return CountFilteredPlugins(
-        snapshot_.installed_plugins, state_.search, include_developer);
+        snapshot_.installed_plugins, state_.search, include_developer, state_.favorite_plugin_ids);
 }
 
 PlatformUiIntent PlatformUiModel::NewIntent(

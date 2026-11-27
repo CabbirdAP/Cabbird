@@ -5,13 +5,15 @@
 
 ## 阅读顺序
 
-1. [生命周期与 Core 服务](lifecycle-and-core.md) — 入口符号、描述符、回调顺序、`cabbird.core`。
+1. [生命周期与 Core 服务](lifecycle-and-core.md) — 入口符号、描述符、回调顺序、Game 停止清理、`cabbird.core`。
 2. [Manifest 与 capability](manifest-and-capabilities.md) — 插件怎么被识别、被授权、被拒绝。
 3. [平台作用域服务](platform-services.md) — config / storage / scheduler / localization / json / commands / notifications。
 4. [UI 服务](ui-services.md) — 窗口、字体、纹理、输入，以及 ESP 绘制。
-5. [Unity 服务](unity-services.md) — build / world / objects / entities / transform / player / dump / overlay。
+5. [Unity 服务](unity-services.md) — entities / transform / player / player-teleport / player-motion / dump / overlay。
 6. [Interop 与内存](interop-and-memory.md) — hook / patch / signature / IL2CPP。
-7. [插件间 IPC](ipc.md) — 端点、模式、affinity、错误码。
+7. [兼容资料与元数据](compatibility-profiles.md) — 包内 Profile、独立只读 Unity 元数据解析。
+8. [插件间 IPC](ipc.md) — 端点、模式、affinity、错误码。
+9. [WebSocket 广播](websocket.md)与[本机网页](web.md) — 本机消息队列、带令牌的网页应用与 Worker 回调。
 
 ## 公共约定
 
@@ -78,13 +80,13 @@ typedef enum CabbirdStatusCodeV1 {
 |---|---|---|
 | `Lifecycle` | 宿主自己创建的线程 | `on_load` / `on_start` / `on_stop` / `on_unload` |
 | `Worker` | 宿主工作线程 | 调度任务、仓储、后台动作 |
-| `Game` | **引擎的帧线程**（被 pump） | `on_update`；**唯一允许调用 IL2CPP 的地方** |
+| `Game` | **引擎的帧线程**（被 pump） | `on_update` 与注册的 Game 停止清理；托管方法只在这个域调用 |
 | `Render` | 调用 `Present` 的线程（被 pump） | `on_draw`；只画，不做别的 |
 
 > [!CAUTION]
-> **`on_draw` 里禁止**：分配、加锁、磁盘访问、加载 DLL、任何 IL2CPP 懒初始化调用。
+> **`on_draw` 里禁止**：同步磁盘访问、扫描插件包、加载 DLL、等待生命周期任务、任何 IL2CPP 懒初始化调用。
 > `on_update` 里禁止创建线程与阻塞——它跑在游戏的帧里。
-> 需要跨域的动作请投递到 `Game` 域。
+> UI / Worker 将值类型请求交给 `on_update` 消费；`cabbird.scheduler` 仅调度 Worker。
 
 ## 服务一览
 
@@ -93,18 +95,23 @@ typedef enum CabbirdStatusCodeV1 {
 | `cabbird.core` | [`services/core.h`](../../include/cabbird/sdk/services/core.h) | [生命周期与 Core](lifecycle-and-core.md) |
 | `cabbird.plugin-state` | [`services/plugin_state.h`](../../include/cabbird/sdk/services/plugin_state.h) | [生命周期与 Core](lifecycle-and-core.md) |
 | `cabbird.config` `cabbird.storage` `cabbird.runtime-info` `cabbird.diagnostics` `cabbird.scheduler` `cabbird.commands` `cabbird.notifications` | [`services/platform.h`](../../include/cabbird/sdk/services/platform.h) | [平台作用域服务](platform-services.md) |
+| `cabbird.profile` | [`services/profile.h`](../../include/cabbird/sdk/services/profile.h) | [兼容资料与元数据](compatibility-profiles.md) |
+| `cabbird.unity.metadata` | [`services/unity_metadata.h`](../../include/cabbird/sdk/services/unity_metadata.h) | [兼容资料与元数据](compatibility-profiles.md) |
 | `cabbird.json` | [`services/json.h`](../../include/cabbird/sdk/services/json.h) | [平台作用域服务](platform-services.md) |
 | `cabbird.localization` | [`services/localization.h`](../../include/cabbird/sdk/services/localization.h) | [平台作用域服务](platform-services.md) |
+| `cabbird.websocket` | [`services/websocket.h`](../../include/cabbird/sdk/services/websocket.h) | [WebSocket 广播](websocket.md) |
+| `cabbird.web` | [`services/web.h`](../../include/cabbird/sdk/services/web.h) | [本机网页](web.md) |
 | `cabbird.ui` | [`services/ui.h`](../../include/cabbird/sdk/services/ui.h) | [UI 服务](ui-services.md) |
 | `cabbird.window` `cabbird.font` `cabbird.texture` `cabbird.input` | [`services/ui_resources.h`](../../include/cabbird/sdk/services/ui_resources.h) | [UI 服务](ui-services.md) |
-| `cabbird.unity.*`（12 个） | [`services/unity.h`](../../include/cabbird/sdk/services/unity.h) | [Unity 服务](unity-services.md) |
+| `cabbird.unity.*`（6 个） | [`services/unity.h`](../../include/cabbird/sdk/services/unity.h) | [Unity 服务](unity-services.md) |
 | `cabbird.unity.il2cpp` | [`services/il2cpp.h`](../../include/cabbird/sdk/services/il2cpp.h) | [Interop 与内存](interop-and-memory.md) |
 | `cabbird.interop.hook` `cabbird.interop.patch` `cabbird.interop.signature` | [`services/interop.h`](../../include/cabbird/sdk/services/interop.h) | [Interop 与内存](interop-and-memory.md) |
 | `cabbird.ipc` | [`services/ipc.h`](../../include/cabbird/sdk/services/ipc.h) | [插件间 IPC](ipc.md) |
 
 `cabbird_sdk.h` 是伞头文件：`#include "cabbird/sdk/cabbird_sdk.h"` 就拿到全部公开 ABI。
-它**故意不包含** `services/azur.h`（上游的 NTE 表，本作不适用）与 `services/websocket.h`；
-`cabbird.websocket` 出现在 capability 表里但**没有服务头文件发布它**，按 `UNAVAILABLE` 处理。
+它不包含 `services/azur.h`（上游的 NTE 游戏专用表，本作不适用）；
+`cabbird.websocket` 与 `cabbird.web` 是独立版本化的平台服务，不依赖引擎类型。
 
-C++ 插件可以用 `include/cabbird/sdk/cpp.hpp`（薄封装）与
-`include/cabbird/sdk/il2cpp.hpp`（`cabbird::sdk::il2cpp::Context` 等帮助类）。
+C++ 插件可使用 `include/cabbird/sdk/cpp.hpp`（薄封装）、
+`include/cabbird/sdk/localization.hpp`（Localizer）、`include/cabbird/sdk/profile.hpp`（Profile 快照）与
+`include/cabbird/sdk/il2cpp.hpp`（`cabbird::sdk::il2cpp::Context`）。这些助手在插件侧编译，C++ 对象不跨 DLL 边界。

@@ -3,6 +3,8 @@
 
 #include "cabbird/hook_manager.hpp"
 #include "cabbird/reliable_storage.hpp"
+#include "cabbird/signature_updater.hpp"
+#include "cabbird/thread_local_value.hpp"
 #include "cabbird/sdk/version.h"
 
 #include <Windows.h>
@@ -37,6 +39,8 @@ constexpr std::size_t kMaximumConfigBytes = 1024U * 1024U;
 constexpr std::size_t kMaximumConfigEnvelopeBytes = kMaximumConfigBytes + 256U;
 constexpr std::size_t kMaximumSchemaBytes = 256U * 1024U;
 constexpr std::size_t kMaximumCallbackOutputBytes = 1024U * 1024U;
+
+ThreadLocalObject<std::string> g_layout_diagnostic;
 
 CabbirdStatusV1 Status(const std::uint32_t code, const char* message = nullptr) noexcept {
     return {code, 0, {message, message == nullptr ? 0U : std::strlen(message)}};
@@ -249,6 +253,11 @@ public:
         void* callback_user{};
     };
 
+    struct GameStopCleanupState final : ResourceState {
+        CabbirdGameStopCleanupV1 callback{};
+        void* callback_user{};
+    };
+
     struct CommandState final : ResourceState {
         std::string name;
         std::string description;
@@ -309,6 +318,8 @@ public:
         if (worker_.joinable()) worker_.join();
         RevokeAllResources();
     }
+
+    bool IsWorkerThread() const noexcept { return worker_.get_id() == std::this_thread::get_id(); }
 
     void Enqueue(
         std::chrono::milliseconds delay,
@@ -388,7 +399,17 @@ public:
         return result;
     }
 
+    std::shared_ptr<SignatureUpdater> SignatureKnowledge(const std::filesystem::path& state) {
+        const auto directory = state / L"signature-knowledge";
+        std::scoped_lock lock(signature_mutex_);
+        auto& cached = signature_updaters_[directory.wstring()];
+        if (!cached) cached = std::make_shared<SignatureUpdater>(directory);
+        return cached;
+    }
+
     CoreMemoryServices memory_services_;
+    std::mutex signature_mutex_;
+    std::unordered_map<std::wstring, std::shared_ptr<SignatureUpdater>> signature_updaters_;
     std::shared_ptr<ResourceLedger> ledger_;
     std::unique_ptr<HookManager> hooks_;
     std::chrono::steady_clock::time_point started_;
@@ -397,6 +418,7 @@ public:
     std::unordered_map<std::uint64_t, std::shared_ptr<ConfigState>> configs_;
     std::unordered_map<std::uint64_t, std::shared_ptr<SelfTestState>> self_tests_;
     std::unordered_map<std::uint64_t, std::shared_ptr<TaskState>> tasks_;
+    std::unordered_map<std::uint64_t, std::shared_ptr<GameStopCleanupState>> game_stop_cleanups_;
     std::unordered_map<std::uint64_t, std::shared_ptr<CommandState>> commands_;
     std::unordered_map<std::uint64_t, std::shared_ptr<NotificationState>> notifications_;
     std::unordered_map<std::uint64_t, std::shared_ptr<HookState>> hooks_by_token_;
@@ -453,6 +475,7 @@ private:
             collect(configs_);
             collect(self_tests_);
             collect(tasks_);
+            collect(game_stop_cleanups_);
             collect(commands_);
             collect(notifications_);
             collect(hooks_by_token_);
@@ -679,6 +702,10 @@ ScopedPlatformServices::ScopedPlatformServices(
           std::move(memory_services), std::move(ledger), std::move(hook_backend))) {}
 
 ScopedPlatformServices::~ScopedPlatformServices() = default;
+
+bool ScopedPlatformServices::IsWorkerThread() const noexcept {
+    return impl_ != nullptr && impl_->IsWorkerThread();
+}
 
 CabbirdStatusV1 ScopedPlatformServices::RegisterConfigSchema(
     const ScopedPluginServiceOwner& owner,
@@ -1096,6 +1123,65 @@ CabbirdStatusV1 ScopedPlatformServices::CancelTask(
         : Status(CABBIRD_STATUS_V1_NOT_FOUND, "task handle is stale");
 }
 
+CabbirdStatusV1 ScopedPlatformServices::RegisterGameStopCleanup(
+    const ScopedPluginServiceOwner& owner, CabbirdGameStopCleanupV1 callback,
+    void* callback_user, CabbirdGenerationHandleV1* handle) noexcept {
+    if (!owner.scope || !callback || !handle) return InvalidArgument();
+    std::shared_ptr<Impl::GameStopCleanupState> state;
+    try {
+        state = std::make_shared<Impl::GameStopCleanupState>();
+        state->owner = owner;
+        state->callback = callback;
+        state->callback_user = callback_user;
+        {
+            std::scoped_lock lock(impl_->mutex_);
+            state->token = owner.scope->Register(PluginResourceKind::GameStopCleanup,
+                "game.stop-cleanup", [this, state] {
+                    std::scoped_lock lock(impl_->mutex_);
+                    RemoveState(impl_->game_stop_cleanups_, state);
+                });
+            if (!state->token) return Status(CABBIRD_STATUS_V1_UNAVAILABLE, "plugin scope is stopping");
+            impl_->game_stop_cleanups_.emplace(state->token, state);
+        }
+        *handle = {state->token, owner.scope->Generation()};
+        return Status(CABBIRD_STATUS_V1_OK);
+    } catch (...) {
+        if (state && state->token) static_cast<void>(owner.scope->Release(state->token));
+        return Status(CABBIRD_STATUS_V1_FAILED, "game cleanup registration failed");
+    }
+}
+
+CabbirdStatusV1 ScopedPlatformServices::UnregisterGameStopCleanup(
+    const ScopedPluginServiceOwner& owner, CabbirdGenerationHandleV1 handle) noexcept {
+    std::shared_ptr<Impl::GameStopCleanupState> state;
+    {
+        std::scoped_lock lock(impl_->mutex_);
+        const auto found = impl_->game_stop_cleanups_.find(handle.id);
+        if (found != impl_->game_stop_cleanups_.end()) state = found->second;
+    }
+    if (!Owns(state, owner, handle)) return Status(CABBIRD_STATUS_V1_NOT_FOUND, "game cleanup handle is stale");
+    return owner.scope->Release(handle.id)
+        ? Status(CABBIRD_STATUS_V1_OK) : Status(CABBIRD_STATUS_V1_NOT_FOUND);
+}
+
+std::vector<ScopedGameStopCleanup> ScopedPlatformServices::GameStopCleanups(
+    const ScopedPluginServiceOwner& owner) const {
+    std::vector<std::pair<std::uint64_t, ScopedGameStopCleanup>> ordered;
+    {
+        std::scoped_lock lock(impl_->mutex_);
+        for (const auto& [token, state] : impl_->game_stop_cleanups_) {
+            if (state->active.load(std::memory_order_acquire) && SameOwner(state->owner, owner))
+                ordered.emplace_back(token, ScopedGameStopCleanup{
+                    state->owner.scope, state->callback, state->callback_user});
+        }
+    }
+    std::sort(ordered.begin(), ordered.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+    std::vector<ScopedGameStopCleanup> result;
+    result.reserve(ordered.size());
+    for (auto& entry : ordered) result.push_back(std::move(entry.second));
+    return result;
+}
+
 CabbirdStatusV1 ScopedPlatformServices::RegisterCommand(
     const ScopedPluginServiceOwner& owner,
     const std::string_view name,
@@ -1240,7 +1326,8 @@ CabbirdStatusV1 ScopedPlatformServices::ResolveSignature(
     const std::string_view module_name,
     const std::string_view section_name,
     const std::string_view pattern,
-    std::uintptr_t* address) noexcept {
+    std::uintptr_t* address,
+    const bool allow_recovery_io) noexcept {
     if (owner.scope == nullptr || address == nullptr || !IsSafeToken(module_name) ||
         !IsSafeToken(section_name) || !IsText(pattern) || pattern.size() > 1024 ||
         !impl_->memory_services_.memory || !impl_->memory_services_.patterns) {
@@ -1251,15 +1338,225 @@ CabbirdStatusV1 ScopedPlatformServices::ResolveSignature(
         if (module.empty()) return InvalidArgument("module name is not UTF-8");
         const auto module_info = impl_->memory_services_.memory->FindModule(module);
         if (!module_info) return Status(CABBIRD_STATUS_V1_NOT_FOUND, "module is not loaded");
-        const unitymem::Pattern parsed = impl_->memory_services_.patterns->Parse(pattern);
-        const auto matches = impl_->memory_services_.patterns->ScanSection(
-            *module_info, section_name, parsed, 2);
+        const auto sections = impl_->memory_services_.memory->EnumerateSections(*module_info);
+        const auto section = std::ranges::find_if(sections, [&](const auto& value) {
+            return value.name == section_name;
+        });
+        if (section == sections.end()) return Status(CABBIRD_STATUS_V1_NOT_FOUND, "section is not loaded");
+        const cabbird::mem::Pattern parsed = impl_->memory_services_.patterns->Parse(pattern);
+        auto matches = impl_->memory_services_.patterns->ScanSection(
+            *section, parsed, 2);
+        std::shared_ptr<SignatureUpdater> updater;
+        std::optional<SignatureScanContext> scan_context;
+        if (allow_recovery_io && !owner.state_directory.empty()) {
+            if (section->characteristics & IMAGE_SCN_MEM_EXECUTE) {
+                updater = impl_->SignatureKnowledge(owner.state_directory);
+                scan_context = SignatureScanContext{*module_info, *section,
+                    [&](auto target, auto output, auto size) {
+                        return impl_->memory_services_.memory->ReadMemoryInto(target, output, size);
+                    },
+                    [&](auto text, auto limit) {
+                        return impl_->memory_services_.patterns->ScanSection(
+                            *section, impl_->memory_services_.patterns->Parse(text), limit);
+                    }};
+            }
+        }
+        if (matches.empty() && updater) {
+            const auto recovered = updater->Recover(*scan_context, "plugin-signature-v1", pattern);
+            if (recovered.instruction != 0) matches.push_back(recovered.instruction);
+        }
         if (matches.empty()) return Status(CABBIRD_STATUS_V1_NOT_FOUND, "signature did not match");
         if (matches.size() != 1) return Status(CABBIRD_STATUS_V1_CONFLICT, "signature matched multiple targets");
+        if (updater) {
+            // Knowledge persistence is optional; its failure cannot invalidate
+            // an otherwise successful exact signature resolution.
+            try {
+                static_cast<void>(updater->Learn(
+                    *scan_context, "plugin-signature-v1", pattern, matches.front(), {}, true));
+            } catch (const std::exception&) {
+            }
+        }
         *address = matches.front();
         return Status(CABBIRD_STATUS_V1_OK);
     } catch (...) {
         return Status(CABBIRD_STATUS_V1_FAILED, "signature preflight failed");
+    }
+}
+
+CabbirdStatusV1 ScopedPlatformServices::ResolveSignatures(
+    const ScopedPluginServiceOwner& owner,
+    const std::string_view module_name,
+    const std::string_view section_name,
+    const CabbirdStringViewV1* patterns,
+    const std::uint32_t count,
+    std::uint32_t* status_codes,
+    std::uintptr_t* addresses,
+    const bool allow_recovery_io) noexcept {
+    if (count == 0 || count > CABBIRD_SIGNATURE_BATCH_MAX_PATTERNS_V3 ||
+        patterns == nullptr || status_codes == nullptr || addresses == nullptr)
+        return InvalidArgument("invalid signature batch");
+    std::fill_n(status_codes, count, CABBIRD_STATUS_V1_NOT_FOUND);
+    std::fill_n(addresses, count, std::uintptr_t{});
+    if (owner.scope == nullptr || !IsSafeToken(module_name) || !IsSafeToken(section_name) ||
+        !impl_->memory_services_.memory || !impl_->memory_services_.patterns)
+        return InvalidArgument();
+    if (!allow_recovery_io)
+        return Status(CABBIRD_STATUS_V1_UNAVAILABLE, "batch resolution requires Lifecycle or Worker");
+    try {
+        std::vector<cabbird::mem::Pattern> parsed;
+        parsed.reserve(count);
+        for (std::uint32_t index = 0; index < count; ++index) {
+            const auto text = patterns[index].data
+                ? std::string_view(patterns[index].data, patterns[index].size) : std::string_view{};
+            if (!IsText(text) || text.size() > 1024) return InvalidArgument("invalid signature pattern");
+            parsed.push_back(impl_->memory_services_.patterns->Parse(text));
+        }
+        const std::wstring module = WideUtf8(module_name);
+        if (module.empty()) return InvalidArgument("module name is not UTF-8");
+        const auto module_info = impl_->memory_services_.memory->FindModule(module);
+        if (!module_info) return Status(CABBIRD_STATUS_V1_NOT_FOUND, "module is not loaded");
+        const auto sections = impl_->memory_services_.memory->EnumerateSections(*module_info);
+        const auto section = std::ranges::find_if(sections, [&](const auto& value) {
+            return value.name == section_name;
+        });
+        if (section == sections.end()) return Status(CABBIRD_STATUS_V1_NOT_FOUND, "section is not loaded");
+        const auto matches = impl_->memory_services_.patterns->ScanSectionBatch(*section, parsed, 2);
+        std::shared_ptr<SignatureUpdater> updater;
+        std::optional<SignatureScanContext> scan_context;
+        if (!owner.state_directory.empty() && (section->characteristics & IMAGE_SCN_MEM_EXECUTE)) {
+            updater = impl_->SignatureKnowledge(owner.state_directory);
+            scan_context = SignatureScanContext{*module_info, *section,
+                [&](auto target, auto output, auto size) {
+                    return impl_->memory_services_.memory->ReadMemoryInto(target, output, size);
+                },
+                [&](auto text, auto limit) {
+                    return impl_->memory_services_.patterns->ScanSection(
+                        *section, impl_->memory_services_.patterns->Parse(text), limit);
+                }};
+        }
+        for (std::uint32_t index = 0; index < count; ++index) {
+            if (matches[index].size() > 1) {
+                status_codes[index] = CABBIRD_STATUS_V1_CONFLICT;
+                continue;
+            }
+            const auto text = std::string_view(patterns[index].data, patterns[index].size);
+            if (matches[index].size() == 1) {
+                addresses[index] = matches[index].front();
+                status_codes[index] = CABBIRD_STATUS_V1_OK;
+                if (updater) {
+                    try {
+                        static_cast<void>(updater->Learn(
+                            *scan_context, "plugin-signature-v1", text, addresses[index], {}, true));
+                    } catch (const std::exception&) {
+                    }
+                }
+            } else if (updater) {
+                const auto recovered = updater->Recover(*scan_context, "plugin-signature-v1", text);
+                if (recovered.instruction != 0) {
+                    addresses[index] = recovered.instruction;
+                    status_codes[index] = CABBIRD_STATUS_V1_OK;
+                }
+            }
+        }
+        return Status(CABBIRD_STATUS_V1_OK);
+    } catch (const std::invalid_argument&) {
+        return InvalidArgument("signature pattern is invalid");
+    } catch (...) {
+        return Status(CABBIRD_STATUS_V1_FAILED, "signature batch failed");
+    }
+}
+
+CabbirdStatusV1 ScopedPlatformServices::ResolveSignatureLayout(
+    const ScopedPluginServiceOwner& owner, const CabbirdSignatureLayoutRequestV2* request,
+    std::uintptr_t* addresses, const std::uint32_t address_count,
+    std::uint32_t* offsets, const std::uint32_t offset_count,
+    const bool allow_recovery_io) noexcept {
+    if (request == nullptr || request->struct_size < sizeof(*request) ||
+        request->field_count == 0 || request->field_count > CABBIRD_SIGNATURE_LAYOUT_MAX_FIELDS_V2 ||
+        request->witness_count == 0 || request->witness_count > CABBIRD_SIGNATURE_LAYOUT_MAX_WITNESSES_V2 ||
+        address_count != request->witness_count || offset_count != request->field_count ||
+        addresses == nullptr || offsets == nullptr) return InvalidArgument("invalid layout request or output counts");
+    std::fill_n(addresses, address_count, std::uintptr_t{});
+    std::fill_n(offsets, offset_count, std::uint32_t{});
+    if (owner.scope == nullptr) return InvalidArgument("plugin scope is unavailable");
+    if (!allow_recovery_io) return Status(CABBIRD_STATUS_V1_UNAVAILABLE, "layout resolution requires Lifecycle or Worker");
+    if (owner.state_directory.empty() || !impl_->memory_services_.memory || !impl_->memory_services_.patterns)
+        return Status(CABBIRD_STATUS_V1_UNAVAILABLE, "layout resolution requires plugin state and memory services");
+    try {
+        const auto text = [](CabbirdStringViewV1 value) {
+            return value.data ? std::string_view(value.data, value.size) : std::string_view{};
+        };
+        const auto module_name = text(request->module_name);
+        const auto section_name = text(request->section_name);
+        if (!IsSafeToken(module_name) || !IsSafeToken(section_name) ||
+            request->fields == nullptr || request->witnesses == nullptr) return InvalidArgument();
+        SignatureLayoutDefinition definition;
+        std::vector<bool> used(request->field_count);
+        for (std::uint32_t i{}; i < request->field_count; ++i) {
+            const auto& field = request->fields[i];
+            if (field.struct_size < sizeof(field)) return InvalidArgument("layout field is truncated");
+            const auto id = text(field.id);
+            if (!IsSafeToken(id) ||
+                (field.alignment != 1 && field.alignment != 2 && field.alignment != 4 && field.alignment != 8) ||
+                field.seed_offset % field.alignment != 0 ||
+                std::ranges::any_of(definition.fields, [&](const auto& other) { return other.id == id; }))
+                return InvalidArgument("invalid layout field");
+            definition.fields.push_back({std::string(id), field.seed_offset, field.alignment});
+        }
+        for (std::uint32_t i{}; i < request->witness_count; ++i) {
+            const auto& witness = request->witnesses[i];
+            if (witness.struct_size < sizeof(witness)) return InvalidArgument("layout witness is truncated");
+            const auto id = text(witness.id);
+            const auto pattern = text(witness.pattern);
+            if (!IsSafeToken(id) ||
+                !IsText(pattern) || pattern.size() > 1024 || witness.members == nullptr ||
+                witness.member_count == 0 || witness.member_count > CABBIRD_SIGNATURE_LAYOUT_MAX_FIELDS_V2 ||
+                std::ranges::any_of(definition.witnesses, [&](const auto& other) { return other.id == id; }))
+                return InvalidArgument("invalid layout witness");
+            static_cast<void>(impl_->memory_services_.patterns->Parse(pattern));
+            SignatureLayoutWitness parsed{std::string(id), std::string(pattern), {}};
+            for (std::uint32_t j{}; j < witness.member_count; ++j) {
+                const auto& member = witness.members[j];
+                if (member.struct_size < sizeof(member) || member.field_index >= request->field_count ||
+                    (member.width != 1 && member.width != 2 && member.width != 4 && member.width != 8) ||
+                    member.access == 0 || (member.access & ~7u) != 0)
+                    return InvalidArgument("invalid layout member binding");
+                parsed.members.push_back({member.field_index, member.addend, member.width, member.access});
+                used[member.field_index] = true;
+            }
+            definition.witnesses.push_back(std::move(parsed));
+        }
+        if (std::ranges::any_of(used, [](bool value) { return !value; }))
+            return InvalidArgument("each layout field requires a witness");
+        const auto module = WideUtf8(module_name);
+        if (module.empty()) return InvalidArgument("module name is not UTF-8");
+        const auto module_info = impl_->memory_services_.memory->FindModule(module);
+        if (!module_info) return Status(CABBIRD_STATUS_V1_NOT_FOUND, "module is not loaded");
+        const auto sections = impl_->memory_services_.memory->EnumerateSections(*module_info);
+        const auto section = std::ranges::find_if(sections, [&](const auto& value) { return value.name == section_name; });
+        if (section == sections.end() || !(section->characteristics & IMAGE_SCN_MEM_EXECUTE))
+            return Status(CABBIRD_STATUS_V1_NOT_FOUND, "layout witness requires a declared executable section");
+        const SignatureScanContext scan_context{*module_info, *section,
+            [&](auto target, auto output, auto size) {
+                return impl_->memory_services_.memory->ReadMemoryInto(target, output, size);
+            },
+            [&](auto pattern, auto limit) {
+                return impl_->memory_services_.patterns->ScanSection(*section,
+                    impl_->memory_services_.patterns->Parse(pattern), limit);
+            }};
+        const auto resolved = impl_->SignatureKnowledge(owner.state_directory)->ResolveLayout(scan_context, definition);
+        // The SDK copies this message before the next call on this thread.
+        auto& diagnostic = g_layout_diagnostic.Get();
+        diagnostic = resolved.diagnostic;
+        if (!resolved.Ok()) return Status(resolved.conflict ? CABBIRD_STATUS_V1_CONFLICT : CABBIRD_STATUS_V1_NOT_FOUND,
+            diagnostic.c_str());
+        std::copy(resolved.addresses.begin(), resolved.addresses.end(), addresses);
+        std::copy(resolved.offsets.begin(), resolved.offsets.end(), offsets);
+        return Status(CABBIRD_STATUS_V1_OK, diagnostic.c_str());
+    } catch (const std::invalid_argument&) {
+        return InvalidArgument("layout witness pattern is invalid");
+    } catch (...) {
+        return Status(CABBIRD_STATUS_V1_FAILED, "signature layout resolution failed");
     }
 }
 
@@ -1468,7 +1765,10 @@ bool ScopedPlatformServices::RevokeScope(
                 if (state && SameOwner(state->owner, owner)) other_tokens.push_back(token);
             }
         };
-        if (phase == ScopedPlatformRevokePhase::Final) collect(impl_->configs_);
+        if (phase == ScopedPlatformRevokePhase::Final) {
+            collect(impl_->configs_);
+            collect(impl_->game_stop_cleanups_);
+        }
         collect(impl_->self_tests_);
         collect(impl_->tasks_);
         collect(impl_->commands_);
@@ -1481,9 +1781,24 @@ bool ScopedPlatformServices::RevokeScope(
     std::sort(hooks.begin(), hooks.end(), [](const auto& left, const auto& right) {
         return left->token > right->token;
     });
-    for (const auto& state : hooks) {
-        if (!RemoveHook(*impl_, state, deadline)) return false;
-        static_cast<void>(owner.scope->Release(state->token));
+    if (!hooks.empty()) {
+        // Disable the owner in one backend batch, drain its callback leases,
+        // then remove the disabled hooks without more thread suspensions.
+        if (impl_->hooks_ == nullptr ||
+            !impl_->hooks_->RemoveOwner(
+                owner.scope->Owner(), owner.scope->Generation(),
+                RemainingUntil(deadline))) {
+            return false;
+        }
+        for (const auto& state : hooks) {
+            state->installed = false;
+            state->active.store(false, std::memory_order_release);
+            static_cast<void>(owner.scope->Release(state->token));
+        }
+        std::scoped_lock lock(impl_->mutex_);
+        for (const auto& state : hooks) {
+            impl_->hooks_by_token_.erase(state->token);
+        }
     }
     std::sort(other_tokens.begin(), other_tokens.end(), std::greater<>());
     other_tokens.erase(std::unique(other_tokens.begin(), other_tokens.end()), other_tokens.end());

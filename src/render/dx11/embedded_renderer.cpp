@@ -1,25 +1,22 @@
 #include "embedded_host_internal.hpp"
 #include "cabbird/unity_services.hpp"
 #include "cabbird/host_ui_service.hpp"
-#include "cabbird/menu_hotkey_press_latch.hpp"
 #include "cabbird/platform_ui_input_policy.hpp"
 #include "cabbird/cabbird_ui_theme.hpp"
+#include "cabbird/liquid_glass.hpp"
 #include "cabbird/structured_logger.hpp"
 
 #include "embedded_ui_resource_render_backend.hpp"
 
 #include <imgui.h>
 #include <backends/imgui_impl_dx11.h>
-#include <backends/imgui_impl_dx11.h>
 #include <backends/imgui_impl_win32.h>
 
 #include <array>
 #include <cstring>
-#include <fstream>
 #include <functional>
 #include <limits>
 #include <mutex>
-#include <set>
 #include <sstream>
 #include <utility>
 
@@ -35,20 +32,21 @@ namespace {
 // reason, which keeps a per-frame path from turning into a log flood while
 // still surfacing the first cause and any later change of cause.
 void ReportEmbeddedGate(
-        const EmbeddedState& state, const char* reason, const std::string& detail = {},
+        EmbeddedState& state, const char* reason, const std::string& detail = {},
         const char* prefix = "embedded overlay not started: ") noexcept {
     try {
-        static std::mutex mutex;
-        static std::set<std::string> reported;
         const std::string key = std::string(reason) + '|' + detail;
-        {
-            std::scoped_lock lock(mutex);
-            if (!reported.insert(key).second) return;
-        }
+        if (state.reported_gates.contains(key)) return;
         std::string message = std::string(prefix) + reason;
         if (!detail.empty()) message += " (" + detail + ")";
-        std::ofstream(state.root / L"cabbird-platform.log", std::ios::app)
-            << "pid=" << GetCurrentProcessId() << ' ' << message << std::endl;
+        {
+            // The Worker swaps the queue under this lock, then opens/writes
+            // the log outside it. A busy queue simply retries next frame.
+            std::unique_lock lock(state.diagnostic_mutex, std::try_to_lock);
+            if (!lock.owns_lock()) return;
+            state.pending_diagnostics.push_back(message);
+            state.reported_gates.insert(key);
+        }
         if (state.diagnostics.logger != nullptr) {
             cabbird::LogDetails details;
             details.thread_domain = cabbird::LogThreadDomain::Render;
@@ -57,6 +55,24 @@ void ReportEmbeddedGate(
                 cabbird::LogLevel::Warning, "embedded-renderer", message, std::move(details)));
         }
     } catch (...) {
+    }
+}
+
+void CaptureImGuiSettings(EmbeddedState& state) noexcept {
+    if (state.imgui_context == nullptr) return;
+    try {
+        std::size_t size{};
+        const char* const data = ImGui::SaveIniSettingsToMemory(&size);
+        const auto previous = state.imgui_ini_snapshot.load(std::memory_order_acquire);
+        if (previous == nullptr || std::string_view(*previous) != std::string_view(data, size)) {
+            state.imgui_ini_snapshot.store(
+                std::make_shared<const std::string>(data, size), std::memory_order_release);
+        }
+        ImGui::GetIO().WantSaveIniSettings = false;
+    } catch (...) {
+        // Leave a retry requested if allocation fails; never replace the last
+        // good preference snapshot with an incomplete one.
+        ImGui::GetIO().WantSaveIniSettings = true;
     }
 }
 
@@ -488,11 +504,18 @@ bool InitializeGraphicsD3D11(EmbeddedState& state, IDXGISwapChain* swap_chain) {
         static_cast<void>(ReleaseGraphics(state, RendererLifecycle::DeviceLost));
         return false;
     }
-    static_cast<void>(ConfigureCabbirdUiFontAtlas(state.root));
+    if (!ConfigureCabbirdUiFontAtlasFromMemory(state.root)) {
+        ReportEmbeddedGate(state, "prepared UI font sources incomplete", {},
+            "embedded overlay degraded: ");
+    }
     ImGuiIO& io = ImGui::GetIO();
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard | ImGuiConfigFlags_NoMouseCursorChange;
-    state.imgui_ini_path = (state.root / L"cabbird-imgui.ini").string();
-    io.IniFilename = state.imgui_ini_path.c_str();
+    io.IniFilename = nullptr;
+    io.LogFilename = nullptr;
+    const auto ini = state.imgui_ini_snapshot.load(std::memory_order_acquire);
+    if (ini != nullptr && !ini->empty()) {
+        ImGui::LoadIniSettingsFromMemory(ini->data(), ini->size());
+    }
     if (!ImGui_ImplWin32_Init(state.window)) {
         static_cast<void>(ReleaseGraphics(state, RendererLifecycle::DeviceLost));
         return false;
@@ -503,6 +526,9 @@ bool InitializeGraphicsD3D11(EmbeddedState& state, IDXGISwapChain* swap_chain) {
         return false;
     }
     state.dx11_initialized = true;
+    // A failed material backend keeps the solid, readable UI fallback.
+    static_cast<void>(cabbird::glass::InitializeRenderer(
+        state.d3d11_device, state.d3d11_context));
     state.render_api = EmbeddedRenderApi::D3D11;
     return CompleteGraphicsInitialization(state);
 }
@@ -520,6 +546,7 @@ bool InitializeGraphics(EmbeddedState& state, IDXGISwapChain* swap_chain) {
 
 bool ReleaseGraphics(
     EmbeddedState& state, RendererLifecycle final_state, bool force_release) {
+    state.completed_ui_frame = false;
     state.renderer = final_state;
     if (state.imgui_context != nullptr &&
         ImGui::GetCurrentContext() != state.imgui_context) {
@@ -560,7 +587,8 @@ bool ReleaseGraphics(
         }
     }
     RestoreEmbeddedInput(state);
-        if (state.dx11_initialized) {
+    cabbird::glass::ShutdownRenderer();
+    if (state.dx11_initialized) {
         ImGui_ImplDX11_Shutdown();
         state.dx11_initialized = false;
     }
@@ -569,6 +597,7 @@ bool ReleaseGraphics(
         state.win32_initialized = false;
     }
     if (state.imgui_context != nullptr) {
+        CaptureImGuiSettings(state);
         ImGui::DestroyContext(state.imgui_context);
         state.imgui_context = nullptr;
     }
@@ -593,7 +622,10 @@ void RenderEmbedded(IDXGISwapChain* swap_chain, UINT flags) {
     {
     const auto lock_started = sampled ? std::chrono::steady_clock::now()
                                       : std::chrono::steady_clock::time_point{};
-    std::unique_lock render_lock(state->render_mutex);
+    // A concurrent resize/teardown owns this frame. Let DXGI present the game
+    // immediately rather than waiting for the overlay's lifecycle work.
+    std::unique_lock render_lock(state->render_mutex, std::try_to_lock);
+    if (!render_lock.owns_lock()) return;
     if (sampled) {
         state->performance.Record(
             EmbeddedPerformanceStage::RenderLockWait,
@@ -615,21 +647,60 @@ void RenderEmbedded(IDXGISwapChain* swap_chain, UINT flags) {
         !InitializeGraphics(*state, swap_chain)) return;
     if (state->source_swap_chain != swap_chain) return;
 
+    // One lease covers resource preparation and drawing. When Game/Lifecycle
+    // owns the gate, retain the completed UI instead of presenting a bare game
+    // frame. No plugin callback, atlas rebuild or resource collection runs in
+    // that path; their draw resources remain owned by this Render generation.
+    const auto prepare_lock_started = sampled ? std::chrono::steady_clock::now()
+                                              : std::chrono::steady_clock::time_point{};
+    std::unique_lock plugin_frame_lock(*state->plugin_mutex, std::try_to_lock);
+    if (state->plugins == nullptr) return;
+    if (!plugin_frame_lock.owns_lock()) {
+        if (!state->completed_ui_frame ||
+            ImGui::GetCurrentContext() != state->imgui_context ||
+            state->d3d11_context == nullptr || state->d3d11_render_target == nullptr) return;
+        ImDrawData* const data = ImGui::GetDrawData();
+        if (data == nullptr) return;
+        ID3D11Resource* resource{};
+        state->d3d11_render_target->GetResource(&resource);
+        ID3D11Texture2D* texture{};
+        const HRESULT queried = resource->QueryInterface(IID_PPV_ARGS(&texture));
+        resource->Release();
+        if (FAILED(queried)) return;
+        D3D11_TEXTURE2D_DESC target{};
+        texture->GetDesc(&target);
+        texture->Release();
+        if (data->DisplaySize.x * data->FramebufferScale.x != target.Width ||
+            data->DisplaySize.y * data->FramebufferScale.y != target.Height) return;
+        // Glass callbacks and their deque payloads belong to this completed
+        // ImGui frame. Captures still read the current game's backbuffer.
+        cabbird::glass::RenderDrawData(state->d3d11_context, data,
+            state->d3d11_render_target);
+        return;
+    }
+    // Preparation can retire textures or rebuild the atlas used by the old
+    // draw data. It is no longer eligible for submission after this point.
+    state->completed_ui_frame = false;
+    if (sampled) {
+        state->performance.Record(EmbeddedPerformanceStage::RenderPrepareLockWait,
+            std::chrono::steady_clock::now() - prepare_lock_started);
+    }
+
     unsigned toggle_key = state->config.platform_toggle_key;
+    unsigned hide_all_key = state->config.platform_hide_all_key;
     if (state->diagnostics.settings_snapshot) {
         const auto settings = state->diagnostics.settings_snapshot();
-        if (settings.ready) toggle_key = settings.values.input_menu_toggle;
+        if (settings.ready) {
+            toggle_key = settings.values.input_menu_toggle;
+            hide_all_key = settings.values.input_hide_all_toggle;
+        }
     }
-    // The menu hotkey must only react while the game window owns focus, not
-    // while the user is typing in an unrelated application.
-    const bool game_focused =
-        state->window != nullptr && GetForegroundWindow() == state->window;
-    // Sample the physical key, then let the latch own the edge and hand it to exactly one
-    // consumer.  Upstream's policy function reads GetAsyncKeyState's low-order bit, which the
-    // per-frame async-input reconciler clears before this site ever looks; see the latch header.
-    cabbird::PollMenuHotkey(toggle_key);
-    if (cabbird::ShouldTogglePlatformMenus(
-            PlatformUiCapturingHotkey(), cabbird::TakeMenuHotkeyToggleState(game_focused))) {
+    const auto hotkeys = ConsumeEmbeddedMenuHotkeys(
+        *state, toggle_key, hide_all_key, PlatformUiCapturingHotkey());
+    if (hotkeys.toggle_hide_all) {
+        cabbird::SetHostUiAllHidden(!cabbird::HostUiAllHidden());
+    }
+    if (hotkeys.toggle_menu) {
         const bool expanding = cabbird::HostUiMenusCollapsed();
         cabbird::SetHostUiMenusCollapsed(!expanding);
         // The shell's own close button marks the management window closed, and
@@ -651,20 +722,9 @@ void RenderEmbedded(IDXGISwapChain* swap_chain, UINT flags) {
 
     PerformanceTimer ui_timer(
         state->performance, EmbeddedPerformanceStage::RenderUi, sampled);
-    ImGui_ImplDX11_NewFrame();
-    // NewFrame creates the ImGui font atlas first, reserving descriptor slot
-    // zero before scoped texture uploads allocate from the shared heap.
-    const auto prepare_lock_started = sampled ? std::chrono::steady_clock::now()
-                                              : std::chrono::steady_clock::time_point{};
     {
-        std::unique_lock plugin_lock(*state->plugin_mutex);
         const auto prepare_started = sampled ? std::chrono::steady_clock::now()
                                              : std::chrono::steady_clock::time_point{};
-        if (sampled) {
-            state->performance.Record(
-                EmbeddedPerformanceStage::RenderPrepareLockWait,
-                prepare_started - prepare_lock_started);
-        }
         SynchronizeHostFontScale(*state);
         state->plugins->PrepareUiResources();
         PreparePlatformUiResources();
@@ -673,6 +733,15 @@ void RenderEmbedded(IDXGISwapChain* swap_chain, UINT flags) {
                 EmbeddedPerformanceStage::RenderPrepareLocked,
                 std::chrono::steady_clock::now() - prepare_started);
         }
+    }
+    // Include staged plugin fonts before a first default-atlas upload.
+    ImGui_ImplDX11_NewFrame();
+    // The GPU atlas is resident now. Keep its font sources for device recovery,
+    // but release the Alpha8 and RGBA32 CPU raster copies between rebuilds.
+    ImFontAtlas* const atlas = ImGui::GetIO().Fonts;
+    if (atlas != nullptr && atlas->TexID != ImTextureID{} &&
+        (atlas->TexPixelsAlpha8 != nullptr || atlas->TexPixelsRGBA32 != nullptr)) {
+        atlas->ClearTexData();
     }
     const auto frame_begin_started = sampled ? std::chrono::steady_clock::now()
                                              : std::chrono::steady_clock::time_point{};
@@ -687,17 +756,9 @@ void RenderEmbedded(IDXGISwapChain* swap_chain, UINT flags) {
             std::chrono::steady_clock::now() - frame_begin_started);
     }
     bool input_frame_published{};
-    const auto draw_lock_started = sampled ? std::chrono::steady_clock::now()
-                                           : std::chrono::steady_clock::time_point{};
     {
-        std::unique_lock plugin_lock(*state->plugin_mutex);
         auto phase_started = sampled ? std::chrono::steady_clock::now()
                                      : std::chrono::steady_clock::time_point{};
-        if (sampled) {
-            state->performance.Record(
-                EmbeddedPerformanceStage::RenderDrawLockWait,
-                phase_started - draw_lock_started);
-        }
         input_frame_published = PublishEmbeddedInputFrame(*state);
         if (sampled) {
             const auto phase_completed = std::chrono::steady_clock::now();
@@ -714,7 +775,9 @@ void RenderEmbedded(IDXGISwapChain* swap_chain, UINT flags) {
                 phase_completed - phase_started);
             phase_started = phase_completed;
         }
-        state->plugins->Draw(ImGui::GetCurrentContext());
+        if (!cabbird::HostUiAllHidden()) {
+            state->plugins->Draw(ImGui::GetCurrentContext());
+        }
         if (sampled) {
             const auto phase_completed = std::chrono::steady_clock::now();
             state->performance.Record(
@@ -729,6 +792,7 @@ void RenderEmbedded(IDXGISwapChain* swap_chain, UINT flags) {
                 std::chrono::steady_clock::now() - phase_started);
         }
     }
+    plugin_frame_lock.unlock();
     const auto finalize_started = sampled ? std::chrono::steady_clock::now()
                                           : std::chrono::steady_clock::time_point{};
     if (probing) {
@@ -751,8 +815,12 @@ void RenderEmbedded(IDXGISwapChain* swap_chain, UINT flags) {
     //
     // Costs nothing when nobody subscribed -- RunHostOverlayFrame returns before touching
     // ImGui in that case, so an ordinary session pays one taken mutex and an empty copy.
-    cabbird::RunHostOverlayFrame(ImGui::GetCurrentContext(), &CabbirdUiFontForPixelSize);
+    if (!cabbird::HostUiAllHidden()) {
+        cabbird::RunHostOverlayFrame(ImGui::GetCurrentContext(), &CabbirdUiFontForPixelSize);
+    }
     ImGui::Render();
+    if (ImGui::GetIO().WantSaveIniSettings) CaptureImGuiSettings(*state);
+    cabbird::glass::PrepareDrawData(ImGui::GetDrawData());
     NotifyRenderThread(*state, capture_generation);
     if (sampled) {
         state->performance.Record(
@@ -767,24 +835,9 @@ void RenderEmbedded(IDXGISwapChain* swap_chain, UINT flags) {
         static_cast<void>(ReleaseGraphics(*state, RendererLifecycle::DeviceLost));
         return;
     }
-    // The game leaves its own targets bound. Binding the back buffer for the
-    // overlay draw and nothing else is the whole of the D3D11 submission:
-    // the immediate context is already ordered behind the game's work.
-    //
-    // ImGui's D3D11 backend restores whatever was bound when it was entered,
-    // which by then is the overlay's own target, so the game's binding has
-    // to be saved and put back here instead.
-    ID3D11RenderTargetView* previous_targets[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT]{};
-    ID3D11DepthStencilView* previous_depth{};
-    state->d3d11_context->OMGetRenderTargets(
-        D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, previous_targets, &previous_depth);
-    ID3D11RenderTargetView* targets[]{state->d3d11_render_target};
-    state->d3d11_context->OMSetRenderTargets(1, targets, nullptr);
-    ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
-    state->d3d11_context->OMSetRenderTargets(
-        D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, previous_targets, previous_depth);
-    for (auto* previous : previous_targets) Release(previous);
-    Release(previous_depth);
+    cabbird::glass::RenderDrawData(state->d3d11_context, ImGui::GetDrawData(),
+        state->d3d11_render_target);
+    state->completed_ui_frame = true;
     command_timer.Stop();
     // Lifecycle mutations are submitted only after the render mutex and the
     // plugin draw lock have been released, so a slow reload cannot block
@@ -792,6 +845,33 @@ void RenderEmbedded(IDXGISwapChain* swap_chain, UINT flags) {
     }
     FlushPlatformUiActions();
 }
+void PrepareEmbeddedResize(IDXGISwapChain* swap_chain) {
+    auto* const state = g_state.load(std::memory_order_acquire);
+    if (state == nullptr) return;
+    std::scoped_lock lock(state->render_mutex);
+    if (state->source_swap_chain != swap_chain ||
+        state->renderer.load() != RendererLifecycle::Ready) return;
+    state->completed_ui_frame = false;
+    state->renderer = RendererLifecycle::ResizePending;
+    // DXGI rejects ResizeBuffers while a view still references its backbuffer.
+    ReleaseD3D11RenderTarget(*state);
+}
+
+void CompleteEmbeddedResize(IDXGISwapChain* swap_chain) {
+    auto* const state = g_state.load(std::memory_order_acquire);
+    if (state == nullptr) return;
+    std::scoped_lock lock(state->render_mutex);
+    if (state->source_swap_chain != swap_chain ||
+        state->renderer.load() != RendererLifecycle::ResizePending) return;
+    // Recover the current buffer even when ResizeBuffers failed: DXGI retains
+    // the old buffers on failure, and the overlay must keep drawing on them.
+    if (CreateD3D11RenderTarget(*state)) {
+        state->renderer = RendererLifecycle::Ready;
+    } else {
+        static_cast<void>(ReleaseGraphics(*state, RendererLifecycle::DeviceLost));
+    }
+}
+
 void HandlePresentResult(IDXGISwapChain* swap_chain, HRESULT result) {
     if (result != DXGI_ERROR_DEVICE_REMOVED && result != DXGI_ERROR_DEVICE_RESET) return;
     auto* state = g_state.load(std::memory_order_acquire);

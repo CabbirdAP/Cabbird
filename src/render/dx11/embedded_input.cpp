@@ -104,6 +104,8 @@ bool IsFocusLossMessage(UINT message, WPARAM wparam) noexcept {
 
 void ClearInputMailbox(
     EmbeddedInputMailbox& mailbox, cabbird::InputResetReason reason) noexcept {
+    mailbox.menu_hotkey.Reset();
+    mailbox.hide_all_hotkey.Reset();
     mailbox.frame = {};
     mailbox.last_published_mouse_x = 0.0F;
     mailbox.last_published_mouse_y = 0.0F;
@@ -156,6 +158,10 @@ void RecordKeyboardMessage(
     const UINT virtual_key = static_cast<UINT>(wparam);
     mailbox.frame.keys[virtual_key] = down;
     const UINT normalized = NormalizeModifierVirtualKey(virtual_key, lparam);
+    if (down) {
+        mailbox.menu_hotkey.RecordKeyDown(normalized, (lparam & 0x40000000L) != 0);
+        mailbox.hide_all_hotkey.RecordKeyDown(normalized, (lparam & 0x40000000L) != 0);
+    }
     if (normalized < cabbird::kInputKeyCount) mailbox.frame.keys[normalized] = down;
     UpdateModifiers(mailbox.frame);
 }
@@ -384,7 +390,8 @@ LRESULT CALLBACK EmbeddedWindowProc(HWND window, UINT message, WPARAM wparam, LP
         ImGui::GetCurrentContext() != nullptr) {
         // A locked window remains visible while menus are collapsed, but it
         // never owns input. The menu gate therefore precedes all ImGui flags.
-        const bool menus_expanded = !cabbird::HostUiMenusCollapsed();
+        const bool menus_expanded =
+            !cabbird::HostUiAllHidden() && !cabbird::HostUiMenusCollapsed();
         const ImGuiIO& io = ImGui::GetIO();
         const bool capture_mouse = cabbird::HostUiMenusCaptureMouse();
         const bool capture_keyboard = menus_expanded && io.WantCaptureKeyboard;
@@ -470,6 +477,22 @@ void RecordEmbeddedInputMessage(
         // WndProc must not allow synchronization failures to unwind into the
         // game. A subsequent Render frame will reconcile physical input.
     }
+}
+
+EmbeddedMenuHotkeyActions ConsumeEmbeddedMenuHotkeys(
+    EmbeddedState& state, unsigned menu_key, unsigned hide_all_key, bool recording_menu_key) {
+    std::scoped_lock lock(state.input_mailbox.mutex);
+    const bool focused =
+        state.window != nullptr && GetForegroundWindow() == state.window;
+    const auto consume = [&](cabbird::PlatformMenuHotkey& hotkey, unsigned key) {
+        const int key_state = state.input_installed ? 0 : GetAsyncKeyState(static_cast<int>(key));
+        hotkey.Configure(key, key_state);
+        return hotkey.Consume(recording_menu_key, focused, key_state, state.input_installed);
+    };
+    const bool toggle_menu = consume(state.input_mailbox.menu_hotkey, menu_key);
+    const bool toggle_hide_all = consume(state.input_mailbox.hide_all_hotkey, hide_all_key);
+    // A manually edited conflicting INI must not make one key run both actions.
+    return {toggle_menu, toggle_hide_all && menu_key != hide_all_key};
 }
 
 bool PublishEmbeddedInputFrame(EmbeddedState& state) noexcept {

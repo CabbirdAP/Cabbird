@@ -1,0 +1,16 @@
+{
+  "schemaVersion": 1,
+  "locale": "zh-CN",
+  "messages": {
+    "plugin.description": "显示游戏线程采集的受控玩家世界坐标；刷新设置与宿主管理窗口可跨重启恢复。",
+    "window.title": "玩家坐标",
+    "settings.watch": "持续刷新",
+    "action.refresh": "读取当前位置",
+    "snapshot.position": "世界枢轴：x = {0}   y = {1}   z = {2}",
+    "snapshot.bounds": "包围框中心：x = {0}   y = {1}   z = {2}",
+    "snapshot.empty": "世界枢轴：--",
+    "log.update_failed": "玩家坐标快照更新失败。",
+    "log.save_failed": "玩家坐标设置无法提交保存。",
+    "log.draw_failed": "玩家坐标窗口更新失败。"
+  }
+}

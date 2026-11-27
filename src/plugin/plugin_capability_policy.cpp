@@ -23,6 +23,7 @@ struct ServiceCapabilityMapping {
  * list is what stops it drifting again. */
 constexpr auto kKnownCapabilities = std::to_array<std::string_view>({
     "unity-il2cpp",
+    "unity-metadata",
     "commands",
     "configuration",
     "diagnostics",
@@ -48,7 +49,7 @@ constexpr auto kKnownCapabilities = std::to_array<std::string_view>({
      * two halves are one feature ... a split would create a third state that no manifest asks
      * for").  Both halves of that argument turned out wrong -- the sibling project's
      * `NtePosition` and `NteTeleport` manifests ask for exactly the two states, and this tree's
-     * own `player_coords` plugin is a manifest that wants to look without wanting to move.
+     * own `PlayerCoords` plugin is a manifest that wants to look without wanting to move.
      *
      * NAMED FOR THE READ, like the sibling's `nte-player-snapshot`, and that is not cosmetic:
      * `unity-player` said nothing about which half it was, which is how the write entries below
@@ -70,6 +71,7 @@ constexpr auto kKnownCapabilities = std::to_array<std::string_view>({
      * `unity-transform` names a MECHANISM ("move this object").  A teleporter wants the first; a
      * tool that repositions arbitrary objects wants the second. */
     "unity-player-teleport",
+    "unity-player-motion",
     
     "unity-transform",
     /* Reading the live IL2CPP type system out of the process.  Worth its own capability
@@ -81,10 +83,13 @@ constexpr auto kKnownCapabilities = std::to_array<std::string_view>({
     "ui",
     "json",
     "websocket",
+    "web",
 });  // kKnownCapabilities -- size derived from the list, so the count cannot drift
 
 constexpr auto kServiceCapabilities = std::to_array<ServiceCapabilityMapping>({
     {"cabbird.unity.il2cpp", "unity-il2cpp"},
+    {"cabbird.game-lifecycle", "unity-il2cpp"},
+    {"cabbird.unity.metadata", "unity-metadata"},
     {"cabbird.plugin-state", "configuration"},
     {"cabbird.config", "configuration"},
     {"cabbird.storage", "storage"},
@@ -93,6 +98,7 @@ constexpr auto kServiceCapabilities = std::to_array<ServiceCapabilityMapping>({
     {"cabbird.scheduler", "scheduler"},
     {"cabbird.ipc", "ipc"},
     {"cabbird.websocket", "websocket"},
+    {"cabbird.web", "web"},
     {"cabbird.commands", "commands"},
     {"cabbird.notifications", "notifications"},
     {"cabbird.interop.signature", "interop-signature"},
@@ -105,6 +111,7 @@ constexpr auto kServiceCapabilities = std::to_array<ServiceCapabilityMapping>({
     {"cabbird.texture", "ui-texture"},
     {"cabbird.input", "input"},
     {"cabbird.json", "json"},
+    {"cabbird.profile", "json"},
     {"cabbird.unity.overlay", "unity-overlay"},
     
     /* The entity set.  Its own capability for the same reason the table is its own service: a
@@ -121,6 +128,7 @@ constexpr auto kServiceCapabilities = std::to_array<ServiceCapabilityMapping>({
      * the player must not gain the ability to MOVE it, which is precisely what one shared
      * grant (`unity-player`, before the rename above) could not express. */
     {"cabbird.unity.player-teleport", "unity-player-teleport"},
+    {"cabbird.unity.player-motion", "unity-player-motion"},
     /* The engine-side transform capability.  Mapped to its OWN capability and not to
      * `unity-player-teleport`, so a manifest that only wants the player teleport does not
      * silently gain "move any object", and one that wants the mechanism does not have to claim

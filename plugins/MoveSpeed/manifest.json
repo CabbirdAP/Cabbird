@@ -1,0 +1,84 @@
+{
+  "schemaVersion": 2,
+  "id": "cabbird.move-speed",
+  "name": "Move Speed",
+  "author": "Cabbird",
+  "license": "AGPL-3.0-only",
+  "version": "1.0.0",
+  "description": "Scales verified locomotion and mount flight inputs while preserving ordinary jump curves and global time.",
+  "entry": "plugin.dll",
+  "api": {
+    "major": 1,
+    "minMinor": 0,
+    "maxMinor": 0
+  },
+  "games": [
+    "ap"
+  ],
+  "builds": [
+    "ap-*"
+  ],
+  "loadPhase": "game-ready",
+  "services": [
+    {
+      "id": "cabbird.core",
+      "minVersion": 1
+    },
+    {
+      "id": "cabbird.unity.player",
+      "minVersion": 1
+    },
+    {
+      "id": "cabbird.ui",
+      "minVersion": 1
+    },
+    {
+      "id": "cabbird.interop.hook",
+      "minVersion": 1
+    },
+    {
+      "id": "cabbird.localization",
+      "minVersion": 1
+    },
+    {
+      "id": "cabbird.config",
+      "minVersion": 1
+    },
+    {
+      "id": "cabbird.scheduler",
+      "minVersion": 1
+    },
+    {
+      "id": "cabbird.json",
+      "minVersion": 1
+    },
+    {
+      "id": "cabbird.profile",
+      "minVersion": 1
+    },
+    {
+      "id": "cabbird.unity.metadata",
+      "minVersion": 1
+    },
+    {
+      "id": "cabbird.window",
+      "minVersion": 1
+    },
+    {
+      "id": "cabbird.unity.il2cpp",
+      "minVersion": 1
+    }
+  ],
+  "capabilities": [
+    "ui",
+    "ui-window",
+    "interop-hook",
+    "memory-read",
+    "configuration",
+    "scheduler",
+    "json",
+    "unity-player-snapshot",
+    "unity-metadata",
+    "unity-il2cpp"
+  ]
+}

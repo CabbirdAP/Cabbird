@@ -1,0 +1,85 @@
+{
+  "schemaVersion": 2,
+  "id": "cabbird.fake-uid",
+  "name": "FakeUID",
+  "description": "Customizes the local Unity watermark UID text without changing account or network data.",
+  "author": "Cabbird",
+  "version": "1.0.0",
+  "entry": "plugin.dll",
+  "api": {
+    "major": 1,
+    "minMinor": 0,
+    "maxMinor": 0
+  },
+  "games": [
+    "ap"
+  ],
+  "builds": [
+    "ap-*"
+  ],
+  "loadPhase": "game-ready",
+  "services": [
+    {
+      "id": "cabbird.ui",
+      "minVersion": 1
+    },
+    {
+      "id": "cabbird.config",
+      "minVersion": 1
+    },
+    {
+      "id": "cabbird.unity.il2cpp",
+      "minVersion": 1,
+      "optional": true
+    },
+    {
+      "id": "cabbird.scheduler",
+      "minVersion": 1
+    },
+    {
+      "id": "cabbird.localization",
+      "minVersion": 1
+    },
+    {
+      "id": "cabbird.interop.hook",
+      "minVersion": 1,
+      "optional": true
+    },
+    {
+      "id": "cabbird.unity.metadata",
+      "minVersion": 1,
+      "optional": true
+    },
+    {
+      "id": "cabbird.core",
+      "minVersion": 1
+    },
+    {
+      "id": "cabbird.profile",
+      "minVersion": 1
+    },
+    {
+      "id": "cabbird.json",
+      "minVersion": 1
+    },
+    {
+      "id": "cabbird.game-lifecycle",
+      "minVersion": 1
+    },
+    {
+      "id": "cabbird.window",
+      "minVersion": 1
+    }
+  ],
+  "capabilities": [
+    "ui",
+    "configuration",
+    "unity-il2cpp",
+    "scheduler",
+    "interop-hook",
+    "unity-metadata",
+    "json",
+    "memory-read",
+    "ui-window"
+  ]
+}

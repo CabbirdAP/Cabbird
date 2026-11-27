@@ -1,0 +1,8 @@
+{
+  "schemaVersion": 1,
+  "locale": "zh-CN",
+  "messages": {
+    "window.title": "游戏帧计数器",
+    "ticks.count": "已验证的游戏线程帧数：{0}"
+  }
+}

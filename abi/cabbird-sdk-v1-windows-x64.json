@@ -85,16 +85,56 @@
       "size": 72,
       "align": 8,
       "fields": [
-        { "name": "struct_size", "offset": 0, "size": 4 },
-        { "name": "service_version", "offset": 4, "size": 4 },
-        { "name": "user", "offset": 8, "size": 8 },
-        { "name": "log", "offset": 16, "size": 8 },
-        { "name": "read_memory", "offset": 24, "size": 8 },
-        { "name": "write_memory", "offset": 32, "size": 8 },
-        { "name": "patch_memory", "offset": 40, "size": 8 },
-        { "name": "plugin_directory", "offset": 48, "size": 8 },
-        { "name": "module_base", "offset": 56, "size": 8 },
-        { "name": "last_status", "offset": 64, "size": 8 }
+        {
+          "name": "struct_size",
+          "offset": 0,
+          "size": 4
+        },
+        {
+          "name": "service_version",
+          "offset": 4,
+          "size": 4
+        },
+        {
+          "name": "user",
+          "offset": 8,
+          "size": 8
+        },
+        {
+          "name": "log",
+          "offset": 16,
+          "size": 8
+        },
+        {
+          "name": "read_memory",
+          "offset": 24,
+          "size": 8
+        },
+        {
+          "name": "write_memory",
+          "offset": 32,
+          "size": 8
+        },
+        {
+          "name": "plugin_directory",
+          "offset": 40,
+          "size": 8
+        },
+        {
+          "name": "patch_memory",
+          "offset": 48,
+          "size": 8
+        },
+        {
+          "name": "module_base",
+          "offset": 56,
+          "size": 8
+        },
+        {
+          "name": "last_status",
+          "offset": 64,
+          "size": 8
+        }
       ]
     },
     {
@@ -112,17 +152,1371 @@
     },
     {
       "name": "CabbirdUiServiceV1",
-      "size": 344,
+      "size": 464,
       "align": 8,
       "fields": [
-        { "name": "struct_size", "offset": 0, "size": 4 },
-        { "name": "service_version", "offset": 4, "size": 4 },
-        { "name": "user", "offset": 8, "size": 8 },
-        { "name": "begin_window", "offset": 24, "size": 8 },
-        { "name": "end_window", "offset": 32, "size": 8 },
-        { "name": "text", "offset": 40, "size": 8 },
-        { "name": "button", "offset": 48, "size": 8 },
-        { "name": "combo", "offset": 336, "size": 8 }
+        {
+          "name": "struct_size",
+          "offset": 0,
+          "size": 4
+        },
+        {
+          "name": "service_version",
+          "offset": 4,
+          "size": 4
+        },
+        {
+          "name": "user",
+          "offset": 8,
+          "size": 8
+        },
+        {
+          "name": "set_next_window_size",
+          "offset": 16,
+          "size": 8
+        },
+        {
+          "name": "begin_window",
+          "offset": 24,
+          "size": 8
+        },
+        {
+          "name": "end_window",
+          "offset": 32,
+          "size": 8
+        },
+        {
+          "name": "text",
+          "offset": 40,
+          "size": 8
+        },
+        {
+          "name": "button",
+          "offset": 48,
+          "size": 8
+        },
+        {
+          "name": "draw_entity_bbox",
+          "offset": 56,
+          "size": 8
+        },
+        {
+          "name": "checkbox",
+          "offset": 64,
+          "size": 8
+        },
+        {
+          "name": "slider_float",
+          "offset": 72,
+          "size": 8
+        },
+        {
+          "name": "color_edit4",
+          "offset": 80,
+          "size": 8
+        },
+        {
+          "name": "draw_entity_box3d",
+          "offset": 88,
+          "size": 8
+        },
+        {
+          "name": "draw_entity_label",
+          "offset": 96,
+          "size": 8
+        },
+        {
+          "name": "separator",
+          "offset": 104,
+          "size": 8
+        },
+        {
+          "name": "begin_child",
+          "offset": 112,
+          "size": 8
+        },
+        {
+          "name": "end_child",
+          "offset": 120,
+          "size": 8
+        },
+        {
+          "name": "begin_table",
+          "offset": 128,
+          "size": 8
+        },
+        {
+          "name": "table_next_row",
+          "offset": 136,
+          "size": 8
+        },
+        {
+          "name": "table_next_column",
+          "offset": 144,
+          "size": 8
+        },
+        {
+          "name": "end_table",
+          "offset": 152,
+          "size": 8
+        },
+        {
+          "name": "begin_menu",
+          "offset": 160,
+          "size": 8
+        },
+        {
+          "name": "end_menu",
+          "offset": 168,
+          "size": 8
+        },
+        {
+          "name": "open_popup",
+          "offset": 176,
+          "size": 8
+        },
+        {
+          "name": "begin_popup_modal",
+          "offset": 184,
+          "size": 8
+        },
+        {
+          "name": "end_popup",
+          "offset": 192,
+          "size": 8
+        },
+        {
+          "name": "close_current_popup",
+          "offset": 200,
+          "size": 8
+        },
+        {
+          "name": "filter_match",
+          "offset": 208,
+          "size": 8
+        },
+        {
+          "name": "frame_state",
+          "offset": 216,
+          "size": 8
+        },
+        {
+          "name": "set_next_window_size_constraints",
+          "offset": 224,
+          "size": 8
+        },
+        {
+          "name": "get_window_size",
+          "offset": 232,
+          "size": 8
+        },
+        {
+          "name": "input_uint32",
+          "offset": 240,
+          "size": 8
+        },
+        {
+          "name": "input_double",
+          "offset": 248,
+          "size": 8
+        },
+        {
+          "name": "developer_mode_enabled",
+          "offset": 256,
+          "size": 8
+        },
+        {
+          "name": "input_text",
+          "offset": 264,
+          "size": 8
+        },
+        {
+          "name": "button_enabled",
+          "offset": 272,
+          "size": 8
+        },
+        {
+          "name": "same_line",
+          "offset": 280,
+          "size": 8
+        },
+        {
+          "name": "set_cursor_pos_x",
+          "offset": 288,
+          "size": 8
+        },
+        {
+          "name": "text_link",
+          "offset": 296,
+          "size": 8
+        },
+        {
+          "name": "begin_tab_bar",
+          "offset": 304,
+          "size": 8
+        },
+        {
+          "name": "begin_tab_item",
+          "offset": 312,
+          "size": 8
+        },
+        {
+          "name": "end_tab_item",
+          "offset": 320,
+          "size": 8
+        },
+        {
+          "name": "end_tab_bar",
+          "offset": 328,
+          "size": 8
+        },
+        {
+          "name": "text_wrapped",
+          "offset": 336,
+          "size": 8
+        },
+        {
+          "name": "begin_child_auto_fit_y",
+          "offset": 344,
+          "size": 8
+        },
+        {
+          "name": "slider_float_enabled",
+          "offset": 352,
+          "size": 8
+        },
+        {
+          "name": "set_next_item_width",
+          "offset": 360,
+          "size": 8
+        },
+        {
+          "name": "overlay_viewport_size",
+          "offset": 368,
+          "size": 8
+        },
+        {
+          "name": "overlay_glass",
+          "offset": 376,
+          "size": 8
+        },
+        {
+          "name": "overlay_rect_filled",
+          "offset": 384,
+          "size": 8
+        },
+        {
+          "name": "overlay_line",
+          "offset": 392,
+          "size": 8
+        },
+        {
+          "name": "overlay_circle",
+          "offset": 400,
+          "size": 8
+        },
+        {
+          "name": "overlay_ring_sector",
+          "offset": 408,
+          "size": 8
+        },
+        {
+          "name": "overlay_measure_text",
+          "offset": 416,
+          "size": 8
+        },
+        {
+          "name": "overlay_text",
+          "offset": 424,
+          "size": 8
+        },
+        {
+          "name": "overlay_glass_ring_sector",
+          "offset": 432,
+          "size": 8
+        },
+        {
+          "name": "draw_screen_primitives",
+          "offset": 440,
+          "size": 8
+        },
+        {
+          "name": "checkbox_square",
+          "offset": 448,
+          "size": 8
+        },
+        {
+          "name": "button_selected",
+          "offset": 456,
+          "size": 8
+        }
+      ]
+    },
+    {
+      "name": "CabbirdProfileServiceV1",
+      "size": 24,
+      "align": 8,
+      "fields": [
+        {
+          "name": "struct_size",
+          "offset": 0,
+          "size": 4
+        },
+        {
+          "name": "service_version",
+          "offset": 4,
+          "size": 4
+        },
+        {
+          "name": "user",
+          "offset": 8,
+          "size": 8
+        },
+        {
+          "name": "load",
+          "offset": 16,
+          "size": 8
+        }
+      ]
+    },
+    {
+      "name": "CabbirdUnityMethodRequestV1",
+      "size": 88,
+      "align": 8,
+      "fields": [
+        {
+          "name": "struct_size",
+          "offset": 0,
+          "size": 4
+        },
+        {
+          "name": "method_kind",
+          "offset": 4,
+          "size": 4
+        },
+        {
+          "name": "module_name",
+          "offset": 8,
+          "size": 16
+        },
+        {
+          "name": "type_name",
+          "offset": 24,
+          "size": 16
+        },
+        {
+          "name": "method_name",
+          "offset": 40,
+          "size": 16
+        },
+        {
+          "name": "return_type",
+          "offset": 56,
+          "size": 16
+        },
+        {
+          "name": "parameter_types",
+          "offset": 72,
+          "size": 8
+        },
+        {
+          "name": "parameter_count",
+          "offset": 80,
+          "size": 8
+        }
+      ]
+    },
+    {
+      "name": "CabbirdUnityMethodResultV1",
+      "size": 24,
+      "align": 8,
+      "fields": [
+        {
+          "name": "struct_size",
+          "offset": 0,
+          "size": 4
+        },
+        {
+          "name": "reserved",
+          "offset": 4,
+          "size": 4
+        },
+        {
+          "name": "address",
+          "offset": 8,
+          "size": 8
+        },
+        {
+          "name": "rva",
+          "offset": 16,
+          "size": 8
+        }
+      ]
+    },
+    {
+      "name": "CabbirdUnityFieldRequestV1",
+      "size": 56,
+      "align": 8,
+      "fields": [
+        {
+          "name": "struct_size",
+          "offset": 0,
+          "size": 4
+        },
+        {
+          "name": "storage_size",
+          "offset": 4,
+          "size": 4
+        },
+        {
+          "name": "type_name",
+          "offset": 8,
+          "size": 16
+        },
+        {
+          "name": "field_name",
+          "offset": 24,
+          "size": 16
+        },
+        {
+          "name": "field_type",
+          "offset": 40,
+          "size": 16
+        }
+      ]
+    },
+    {
+      "name": "CabbirdUnityFieldResultV1",
+      "size": 16,
+      "align": 4,
+      "fields": [
+        {
+          "name": "struct_size",
+          "offset": 0,
+          "size": 4
+        },
+        {
+          "name": "offset",
+          "offset": 4,
+          "size": 4
+        },
+        {
+          "name": "storage_size",
+          "offset": 8,
+          "size": 4
+        },
+        {
+          "name": "reserved",
+          "offset": 12,
+          "size": 4
+        }
+      ]
+    },
+    {
+      "name": "CabbirdUnityMetadataServiceV1",
+      "size": 32,
+      "align": 8,
+      "fields": [
+        {
+          "name": "struct_size",
+          "offset": 0,
+          "size": 4
+        },
+        {
+          "name": "service_version",
+          "offset": 4,
+          "size": 4
+        },
+        {
+          "name": "user",
+          "offset": 8,
+          "size": 8
+        },
+        {
+          "name": "resolve_method",
+          "offset": 16,
+          "size": 8
+        },
+        {
+          "name": "resolve_instance_field",
+          "offset": 24,
+          "size": 8
+        }
+      ]
+    },
+    {
+      "name": "CabbirdWebSocketServerInfoV1",
+      "size": 32,
+      "align": 8,
+      "fields": [
+        {
+          "name": "struct_size",
+          "offset": 0,
+          "size": 4
+        },
+        {
+          "name": "port",
+          "offset": 4,
+          "size": 2
+        },
+        {
+          "name": "reserved",
+          "offset": 6,
+          "size": 2
+        },
+        {
+          "name": "connected_clients",
+          "offset": 8,
+          "size": 4
+        },
+        {
+          "name": "published_messages",
+          "offset": 16,
+          "size": 8
+        },
+        {
+          "name": "dropped_messages",
+          "offset": 24,
+          "size": 8
+        }
+      ]
+    },
+    {
+      "name": "CabbirdWebSocketServiceV1",
+      "size": 40,
+      "align": 8,
+      "fields": [
+        {
+          "name": "struct_size",
+          "offset": 0,
+          "size": 4
+        },
+        {
+          "name": "service_version",
+          "offset": 4,
+          "size": 4
+        },
+        {
+          "name": "user",
+          "offset": 8,
+          "size": 8
+        },
+        {
+          "name": "publish_text",
+          "offset": 16,
+          "size": 8
+        },
+        {
+          "name": "server_info",
+          "offset": 24,
+          "size": 8
+        },
+        {
+          "name": "set_port",
+          "offset": 32,
+          "size": 8
+        }
+      ]
+    },
+    {
+      "name": "CabbirdWebRequestV1",
+      "size": 56,
+      "align": 8,
+      "fields": [
+        {
+          "name": "struct_size",
+          "offset": 0,
+          "size": 4
+        },
+        {
+          "name": "reserved",
+          "offset": 4,
+          "size": 4
+        },
+        {
+          "name": "method",
+          "offset": 8,
+          "size": 16
+        },
+        {
+          "name": "path",
+          "offset": 24,
+          "size": 16
+        },
+        {
+          "name": "body",
+          "offset": 40,
+          "size": 16
+        }
+      ]
+    },
+    {
+      "name": "CabbirdWebResponseV1",
+      "size": 40,
+      "align": 8,
+      "fields": [
+        {
+          "name": "struct_size",
+          "offset": 0,
+          "size": 4
+        },
+        {
+          "name": "http_status",
+          "offset": 4,
+          "size": 4
+        },
+        {
+          "name": "content_type",
+          "offset": 8,
+          "size": 4
+        },
+        {
+          "name": "reserved",
+          "offset": 12,
+          "size": 4
+        },
+        {
+          "name": "body",
+          "offset": 16,
+          "size": 16
+        },
+        {
+          "name": "body_size",
+          "offset": 32,
+          "size": 8
+        }
+      ]
+    },
+    {
+      "name": "CabbirdWebServiceV1",
+      "size": 40,
+      "align": 8,
+      "fields": [
+        {
+          "name": "struct_size",
+          "offset": 0,
+          "size": 4
+        },
+        {
+          "name": "service_version",
+          "offset": 4,
+          "size": 4
+        },
+        {
+          "name": "user",
+          "offset": 8,
+          "size": 8
+        },
+        {
+          "name": "register_application",
+          "offset": 16,
+          "size": 8
+        },
+        {
+          "name": "unregister_application",
+          "offset": 24,
+          "size": 8
+        },
+        {
+          "name": "application_url",
+          "offset": 32,
+          "size": 8
+        }
+      ]
+    },
+    {
+      "name": "CabbirdUiScreenPrimitiveV1",
+      "size": 32,
+      "align": 4,
+      "fields": [
+        {
+          "name": "struct_size",
+          "offset": 0,
+          "size": 4
+        },
+        {
+          "name": "kind",
+          "offset": 4,
+          "size": 4
+        },
+        {
+          "name": "color_rgba",
+          "offset": 8,
+          "size": 4
+        },
+        {
+          "name": "x",
+          "offset": 12,
+          "size": 4
+        },
+        {
+          "name": "y",
+          "offset": 16,
+          "size": 4
+        },
+        {
+          "name": "width",
+          "offset": 20,
+          "size": 4
+        },
+        {
+          "name": "height",
+          "offset": 24,
+          "size": 4
+        },
+        {
+          "name": "thickness",
+          "offset": 28,
+          "size": 4
+        }
+      ]
+    },
+    {
+      "name": "CabbirdUiGlassStyleV1",
+      "size": 32,
+      "align": 4,
+      "fields": [
+        {
+          "name": "struct_size",
+          "offset": 0,
+          "size": 4
+        },
+        {
+          "name": "flags",
+          "offset": 4,
+          "size": 4
+        },
+        {
+          "name": "variant",
+          "offset": 8,
+          "size": 4
+        },
+        {
+          "name": "tint_rgba",
+          "offset": 12,
+          "size": 4
+        },
+        {
+          "name": "rounding",
+          "offset": 16,
+          "size": 4
+        },
+        {
+          "name": "scale",
+          "offset": 20,
+          "size": 4
+        },
+        {
+          "name": "opacity",
+          "offset": 24,
+          "size": 4
+        },
+        {
+          "name": "refraction_scale",
+          "offset": 28,
+          "size": 4
+        }
+      ]
+    },
+    {
+      "name": "CabbirdSignatureServiceV1",
+      "size": 24,
+      "align": 8,
+      "fields": [
+        {
+          "name": "struct_size",
+          "offset": 0,
+          "size": 4
+        },
+        {
+          "name": "service_version",
+          "offset": 4,
+          "size": 4
+        },
+        {
+          "name": "user",
+          "offset": 8,
+          "size": 8
+        },
+        {
+          "name": "resolve",
+          "offset": 16,
+          "size": 8
+        }
+      ]
+    },
+    {
+      "name": "CabbirdSignatureFieldV2",
+      "size": 32,
+      "align": 8,
+      "fields": [
+        {
+          "name": "struct_size",
+          "offset": 0,
+          "size": 4
+        },
+        {
+          "name": "id",
+          "offset": 8,
+          "size": 16
+        },
+        {
+          "name": "seed_offset",
+          "offset": 24,
+          "size": 4
+        },
+        {
+          "name": "alignment",
+          "offset": 28,
+          "size": 4
+        }
+      ]
+    },
+    {
+      "name": "CabbirdSignatureMemberV2",
+      "size": 20,
+      "align": 4,
+      "fields": [
+        {
+          "name": "struct_size",
+          "offset": 0,
+          "size": 4
+        },
+        {
+          "name": "field_index",
+          "offset": 4,
+          "size": 4
+        },
+        {
+          "name": "addend",
+          "offset": 8,
+          "size": 4
+        },
+        {
+          "name": "width",
+          "offset": 12,
+          "size": 4
+        },
+        {
+          "name": "access",
+          "offset": 16,
+          "size": 4
+        }
+      ]
+    },
+    {
+      "name": "CabbirdSignatureWitnessV2",
+      "size": 56,
+      "align": 8,
+      "fields": [
+        {
+          "name": "struct_size",
+          "offset": 0,
+          "size": 4
+        },
+        {
+          "name": "id",
+          "offset": 8,
+          "size": 16
+        },
+        {
+          "name": "pattern",
+          "offset": 24,
+          "size": 16
+        },
+        {
+          "name": "members",
+          "offset": 40,
+          "size": 8
+        },
+        {
+          "name": "member_count",
+          "offset": 48,
+          "size": 4
+        }
+      ]
+    },
+    {
+      "name": "CabbirdSignatureLayoutRequestV2",
+      "size": 72,
+      "align": 8,
+      "fields": [
+        {
+          "name": "struct_size",
+          "offset": 0,
+          "size": 4
+        },
+        {
+          "name": "module_name",
+          "offset": 8,
+          "size": 16
+        },
+        {
+          "name": "section_name",
+          "offset": 24,
+          "size": 16
+        },
+        {
+          "name": "fields",
+          "offset": 40,
+          "size": 8
+        },
+        {
+          "name": "field_count",
+          "offset": 48,
+          "size": 4
+        },
+        {
+          "name": "witnesses",
+          "offset": 56,
+          "size": 8
+        },
+        {
+          "name": "witness_count",
+          "offset": 64,
+          "size": 4
+        }
+      ]
+    },
+    {
+      "name": "CabbirdSignatureServiceV2",
+      "size": 32,
+      "align": 8,
+      "fields": [
+        {
+          "name": "struct_size",
+          "offset": 0,
+          "size": 4
+        },
+        {
+          "name": "service_version",
+          "offset": 4,
+          "size": 4
+        },
+        {
+          "name": "user",
+          "offset": 8,
+          "size": 8
+        },
+        {
+          "name": "resolve",
+          "offset": 16,
+          "size": 8
+        },
+        {
+          "name": "resolve_layout",
+          "offset": 24,
+          "size": 8
+        }
+      ]
+    },
+    {
+      "name": "CabbirdSignatureServiceV3",
+      "size": 40,
+      "align": 8,
+      "fields": [
+        {
+          "name": "struct_size",
+          "offset": 0,
+          "size": 4
+        },
+        {
+          "name": "service_version",
+          "offset": 4,
+          "size": 4
+        },
+        {
+          "name": "user",
+          "offset": 8,
+          "size": 8
+        },
+        {
+          "name": "resolve",
+          "offset": 16,
+          "size": 8
+        },
+        {
+          "name": "resolve_layout",
+          "offset": 24,
+          "size": 8
+        },
+        {
+          "name": "resolve_batch",
+          "offset": 32,
+          "size": 8
+        }
+      ]
+    },
+    {
+      "name": "CabbirdTextureServiceV1",
+      "size": 56,
+      "align": 8,
+      "fields": [
+        {
+          "name": "struct_size",
+          "offset": 0,
+          "size": 4
+        },
+        {
+          "name": "service_version",
+          "offset": 4,
+          "size": 4
+        },
+        {
+          "name": "user",
+          "offset": 8,
+          "size": 8
+        },
+        {
+          "name": "request",
+          "offset": 16,
+          "size": 8
+        },
+        {
+          "name": "release",
+          "offset": 24,
+          "size": 8
+        },
+        {
+          "name": "state",
+          "offset": 32,
+          "size": 8
+        },
+        {
+          "name": "draw",
+          "offset": 40,
+          "size": 8
+        },
+        {
+          "name": "draw_overlay",
+          "offset": 48,
+          "size": 8
+        }
+      ]
+    },
+    {
+      "name": "CabbirdIl2CppApiV1",
+      "size": 280,
+      "align": 8,
+      "fields": [
+        {
+          "name": "struct_size",
+          "offset": 0,
+          "size": 4
+        },
+        {
+          "name": "api_version",
+          "offset": 4,
+          "size": 4
+        },
+        {
+          "name": "il2cpp_domain_get",
+          "offset": 8,
+          "size": 8
+        },
+        {
+          "name": "il2cpp_domain_get_assemblies",
+          "offset": 16,
+          "size": 8
+        },
+        {
+          "name": "il2cpp_assembly_get_image",
+          "offset": 24,
+          "size": 8
+        },
+        {
+          "name": "il2cpp_image_get_name",
+          "offset": 32,
+          "size": 8
+        },
+        {
+          "name": "il2cpp_class_from_name",
+          "offset": 40,
+          "size": 8
+        },
+        {
+          "name": "il2cpp_class_get_parent",
+          "offset": 48,
+          "size": 8
+        },
+        {
+          "name": "il2cpp_class_get_type",
+          "offset": 56,
+          "size": 8
+        },
+        {
+          "name": "il2cpp_class_get_field_from_name",
+          "offset": 64,
+          "size": 8
+        },
+        {
+          "name": "il2cpp_class_get_method_from_name",
+          "offset": 72,
+          "size": 8
+        },
+        {
+          "name": "il2cpp_class_is_assignable_from",
+          "offset": 80,
+          "size": 8
+        },
+        {
+          "name": "il2cpp_field_get_type",
+          "offset": 88,
+          "size": 8
+        },
+        {
+          "name": "il2cpp_field_get_value",
+          "offset": 96,
+          "size": 8
+        },
+        {
+          "name": "il2cpp_method_get_param",
+          "offset": 104,
+          "size": 8
+        },
+        {
+          "name": "il2cpp_type_get_name",
+          "offset": 112,
+          "size": 8
+        },
+        {
+          "name": "il2cpp_type_get_object",
+          "offset": 120,
+          "size": 8
+        },
+        {
+          "name": "il2cpp_object_get_class",
+          "offset": 128,
+          "size": 8
+        },
+        {
+          "name": "il2cpp_runtime_invoke",
+          "offset": 136,
+          "size": 8
+        },
+        {
+          "name": "il2cpp_object_unbox",
+          "offset": 144,
+          "size": 8
+        },
+        {
+          "name": "il2cpp_string_new",
+          "offset": 152,
+          "size": 8
+        },
+        {
+          "name": "il2cpp_string_length",
+          "offset": 160,
+          "size": 8
+        },
+        {
+          "name": "il2cpp_string_chars",
+          "offset": 168,
+          "size": 8
+        },
+        {
+          "name": "il2cpp_array_length",
+          "offset": 176,
+          "size": 8
+        },
+        {
+          "name": "il2cpp_array_object_header_size",
+          "offset": 184,
+          "size": 8
+        },
+        {
+          "name": "il2cpp_gchandle_new",
+          "offset": 192,
+          "size": 8
+        },
+        {
+          "name": "il2cpp_gchandle_get_target",
+          "offset": 200,
+          "size": 8
+        },
+        {
+          "name": "il2cpp_gchandle_free",
+          "offset": 208,
+          "size": 8
+        },
+        {
+          "name": "il2cpp_free",
+          "offset": 216,
+          "size": 8
+        },
+        {
+          "name": "il2cpp_class_get_methods",
+          "offset": 224,
+          "size": 8
+        },
+        {
+          "name": "il2cpp_method_get_name",
+          "offset": 232,
+          "size": 8
+        },
+        {
+          "name": "il2cpp_method_get_param_count",
+          "offset": 240,
+          "size": 8
+        },
+        {
+          "name": "il2cpp_field_static_get_value",
+          "offset": 248,
+          "size": 8
+        },
+        {
+          "name": "il2cpp_field_get_flags",
+          "offset": 256,
+          "size": 8
+        },
+        {
+          "name": "il2cpp_method_get_return_type",
+          "offset": 264,
+          "size": 8
+        },
+        {
+          "name": "il2cpp_method_get_flags",
+          "offset": 272,
+          "size": 8
+        }
+      ]
+    },
+    {
+      "name": "CabbirdIl2CppServiceV1",
+      "size": 32,
+      "align": 8,
+      "fields": [
+        {
+          "name": "struct_size",
+          "offset": 0,
+          "size": 4
+        },
+        {
+          "name": "service_version",
+          "offset": 4,
+          "size": 4
+        },
+        {
+          "name": "user",
+          "offset": 8,
+          "size": 8
+        },
+        {
+          "name": "with_runtime",
+          "offset": 16,
+          "size": 8
+        },
+        {
+          "name": "release_handles",
+          "offset": 24,
+          "size": 8
+        }
+      ]
+    },
+    {
+      "name": "CabbirdGameLifecycleServiceV1",
+      "size": 32,
+      "align": 8,
+      "fields": [
+        {
+          "name": "struct_size",
+          "offset": 0,
+          "size": 4
+        },
+        {
+          "name": "service_version",
+          "offset": 4,
+          "size": 4
+        },
+        {
+          "name": "user",
+          "offset": 8,
+          "size": 8
+        },
+        {
+          "name": "register_stop_cleanup",
+          "offset": 16,
+          "size": 8
+        },
+        {
+          "name": "unregister_stop_cleanup",
+          "offset": 24,
+          "size": 8
+        }
+      ]
+    },
+    {
+      "name": "CabbirdUnityPlayerMotionRequestV1",
+      "size": 48,
+      "align": 8,
+      "fields": [
+        {
+          "name": "struct_size",
+          "offset": 0,
+          "size": 4
+        },
+        {
+          "name": "mode",
+          "offset": 4,
+          "size": 4
+        },
+        {
+          "name": "flags",
+          "offset": 8,
+          "size": 4
+        },
+        {
+          "name": "reserved",
+          "offset": 12,
+          "size": 4
+        },
+        {
+          "name": "entity_id",
+          "offset": 16,
+          "size": 8
+        },
+        {
+          "name": "velocity",
+          "offset": 24,
+          "size": 24
+        }
+      ]
+    },
+    {
+      "name": "CabbirdUnityPlayerMotionServiceV1",
+      "size": 40,
+      "align": 8,
+      "fields": [
+        {
+          "name": "struct_size",
+          "offset": 0,
+          "size": 4
+        },
+        {
+          "name": "service_version",
+          "offset": 4,
+          "size": 4
+        },
+        {
+          "name": "user",
+          "offset": 8,
+          "size": 8
+        },
+        {
+          "name": "acquire",
+          "offset": 16,
+          "size": 8
+        },
+        {
+          "name": "update",
+          "offset": 24,
+          "size": 8
+        },
+        {
+          "name": "release",
+          "offset": 32,
+          "size": 8
+        }
       ]
     }
   ]

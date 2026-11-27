@@ -32,10 +32,10 @@
  *   Unity's IL2CPP runtime is not thread-safe for lazy initialization.  Calling
  *   il2cpp_class_get_properties / get_interfaces / get_methods from a thread the VM
  *   does not know about has already killed this host process once (0xC0000005 in
- *   GameAssembly.dll, in-game).  on_update runs in the Game domain and on_draw in the
- *   Render domain; both are attached to the VM before the callback starts.  A plugin
- *   that creates its own worker thread must not touch IL2CPP from it -- it should post
- *   to the Game domain instead.
+ *   GameAssembly.dll, in-game). on_update runs in the observed Game domain;
+ *   on_draw runs in Render and must not call IL2CPP. Worker callbacks publish value
+ *   intents for on_update. Managed calls during stop require the explicit
+ *   cabbird.game-lifecycle Game cleanup contract.
  */
 #pragma once
 
@@ -55,7 +55,7 @@ typedef struct CabbirdHostApiV1 {
     CabbirdAllocatorV1 allocator;
     /* Returns a pointer to a service table of at least `minimum_version`.
      * On success the status code is OK and *service is non-null and stays valid for
-     * the lifetime of the process.  On failure the code is UNAVAILABLE (service not
+     * the current plugin generation. On failure the code is UNAVAILABLE (service not
      * present in this build) or NOT_FOUND (never existed), and *service is null;
      * UNAVAILABLE is a normal, expected outcome and must not be treated as a crash
      * condition. */

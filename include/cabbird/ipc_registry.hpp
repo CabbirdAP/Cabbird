@@ -61,6 +61,7 @@ class IpcRegistry final {
 public:
     explicit IpcRegistry(IpcPost post = {});
     ~IpcRegistry();
+    [[nodiscard]] bool IsWorkerThread() const noexcept;
 
     IpcRegistry(const IpcRegistry&) = delete;
     IpcRegistry& operator=(const IpcRegistry&) = delete;

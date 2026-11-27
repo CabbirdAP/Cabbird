@@ -1,0 +1,42 @@
+{
+  "schemaVersion": 1,
+  "game": "ap",
+  "module": "GameAssembly.dll",
+  "section": ".text",
+  "contract": "damage-replay-v4",
+  "layout": {
+    "sourcePlayerEntityIdOffset": 84,
+    "sourceEntityIdOffset": 80,
+    "attackerEntityIdOffset": 72,
+    "elementFreeOffset": 272,
+    "elementUniqueIdOffset": 176,
+    "elementVersionOffset": 552,
+    "receiverEntityIdOffset": 32,
+    "receiverVersionOffset": 124,
+    "controlledEntityIdOffset": 304,
+    "controlledPlayerIdOffset": 300,
+    "controlledObjectIndexOffset": 576,
+    "controlledVersionOffset": 580,
+    "objectClassOffset": 0,
+    "elementPoolIndexOffset": 548,
+    "collisionInfoOffset": 728,
+    "criticalRandomOffset": 724,
+    "attackerCacheEnabledOffset": 640,
+    "attackerPositionOffset": 644,
+    "attackerForwardOffset": 656,
+    "performanceCollisionsOffset": 704
+  },
+  "symbols": [
+    {
+      "name": "damageEntry",
+      "candidates": [
+        {
+          "entry": "48 83 EC 38 49 8B C0 48 89 4C 24 20 48 89 54 24 28 48 8B C8 45 33 C0 48 8D 54 24 20 E8 CF F1 3C 00 48 83 C4 38 C3",
+          "values": {
+            "rva": 17977280
+          }
+        }
+      ]
+    }
+  ]
+}

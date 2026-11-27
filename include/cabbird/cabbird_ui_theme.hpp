@@ -1,27 +1,9 @@
-/* cabbird/cabbird_ui_theme.hpp -- the product's visual identity.
- *
- * Ported from anomaly/include/anomaly/platform_ui_theme.hpp.  The palette constants,
- * the style metrics and the font atlas configuration are copied value-for-value, which
- * is the entire reason the two products look alike: "the same look" is a set of numbers
- * plus a style struct, not a resemblance to be re-derived from screenshots.
- *
- * What changed is only what had to:
- *   * namespace unitymem -> cabbird, and the Platform* prefix -> Cabbird*
- *   * palette "AnomalyHub" -> "CabbirdHub" (branding only; the colours are identical,
- *     so the default look is pixel-identical to Anomaly's default)
- *   * the font debug-name prefix, so the two products' atlases never collide
- *
- * ONE UPSTREAM BUG IS FIXED HERE, deliberately and visibly.  Anomaly's
- * ParsePlatformUiPalette() has no branch for "moss": ToString(Moss) returns "moss" but
- * Parse("moss") falls through to AnomalyHub.  The round trip is asymmetric, so an ini
- * asking for the moss palette is silently ignored -- no error, no log line, just the
- * wrong theme.  Cabbird parses every palette that ToString can emit; there is a test
- * asserting the round trip for all of them.
- */
+// Shared palette, typography and geometry for the host and public plugin UI.
 #pragma once
 
 #include <cstdint>
 #include <filesystem>
+#include <span>
 #include <string_view>
 
 /* ImGui's font type, forward-declared at GLOBAL scope so this header needs no imgui.h.
@@ -36,8 +18,6 @@ enum class CabbirdUiPalette : std::uint8_t {
     Aurora,
     Ember,
     Paper,
-    /* The default.  Named after the product but numerically identical to Anomaly's
-     * "AnomalyHub" palette, so the shipped default look is the same one. */
     CabbirdHub,
     Custom,
 };
@@ -106,6 +86,13 @@ void SetCabbirdUiPalette(CabbirdUiPalette palette) noexcept;
 [[nodiscard]] CabbirdUiPalette GetCabbirdUiPalette() noexcept;
 void SetCabbirdUiCustomColors(const CabbirdUiCustomColors& colors) noexcept;
 [[nodiscard]] const CabbirdUiCustomColors& GetCabbirdUiCustomColors() noexcept;
+// Only surface fills are attenuated. The owner must first paint an opaque
+// canvas underneath its wallpaper/veil; text, controls and popups stay opaque.
+// One restores the palette's normal fills and is the default without artwork.
+inline constexpr float kCabbirdUiSurfaceAlphaMinimum = 0.0f;
+void SetCabbirdUiSurfaceAlpha(float alpha) noexcept;
+[[nodiscard]] float GetCabbirdUiSurfaceAlpha() noexcept;
+[[nodiscard]] CabbirdUiColor CabbirdUiSurfaceColor() noexcept;
 [[nodiscard]] const CabbirdUiThemeColors& CabbirdUiTheme() noexcept;
 [[nodiscard]] CabbirdUiPalette ParseCabbirdUiPalette(std::string_view value) noexcept;
 [[nodiscard]] std::string_view ToString(CabbirdUiPalette palette) noexcept;
@@ -127,9 +114,33 @@ void ApplyCabbirdUiStyle() noexcept;
  *
  * Returns false when some font was unavailable.  That is worth reporting rather than
  * ignoring: a missing CJK font turns every Chinese label into '?' box glyphs. */
+struct CabbirdUiFontBake final {
+    // Empty spans retain the host's size ladder and full icon coverage.
+    std::span<const float> scales{};
+    std::span<const char32_t> icons{};
+    bool tight_atlas{false};
+    bool symbol_blocks{true};
+};
 [[nodiscard]] bool ConfigureCabbirdUiFontAtlas(
     const std::filesystem::path& runtime_root = {}) noexcept;
+[[nodiscard]] bool ConfigureCabbirdUiFontAtlas(
+    const std::filesystem::path& runtime_root, const CabbirdUiFontBake& bake) noexcept;
+// Prepare on Worker/Lifecycle before installing Present hooks. The memory
+// variant never opens files, including when a source was unavailable, and
+// retains prepared inputs for subsequent device/atlas rebuilds.
+[[nodiscard]] bool PrepareCabbirdUiFontSources(
+    const std::filesystem::path& runtime_root = {}) noexcept;
+[[nodiscard]] bool ConfigureCabbirdUiFontAtlasFromMemory(
+    const std::filesystem::path& runtime_root = {},
+    const CabbirdUiFontBake& bake = {}) noexcept;
+
+enum class CabbirdUiFontRetention : std::uint8_t { Rebuildable, Minimal };
+// Minimal is for a host that owns its entire font context and never rebuilds
+// it: it also releases the source files after the GPU upload has succeeded.
+void ReleaseCabbirdUiFontAtlas(CabbirdUiFontRetention retention) noexcept;
 [[nodiscard]] bool ApplyCabbirdUiFontScale(float scale) noexcept;
+[[nodiscard]] float CabbirdUiBaseFontSize() noexcept;
+[[nodiscard]] ::ImFont* CabbirdUiFontForScale(float scale) noexcept;
 
 /* The baked font to draw text `size_pixels` tall with, or null when the atlas was not built by
  * ConfigureCabbirdUiFontAtlas.

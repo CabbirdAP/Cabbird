@@ -4,7 +4,7 @@
 
 | 文件 | 谁写 | 里面有什么 |
 |---|---|---|
-| `Cabbird\cabbird-runtime.log` | 宿主 Core（`src/runtime/core_main.cpp`） | 启动、服务图、会话、停止 |
+| `Cabbird\cabbird-runtime.log` | 宿主 Core（`src/app/core_main.cpp`） | 启动、服务图、会话、停止 |
 | `Cabbird\cabbird-platform.log` | 平台界面与嵌入渲染后端 | 路由、插件操作、渲染就绪 |
 | `Cabbird\cabbird-pipe-error.log` | 诊断管道 | 管道错误 |
 
@@ -16,11 +16,12 @@
 
 1. **切换键对不对**：默认 `Insert`（`[Platform] ToggleKey=45`）。启动器 `启动设置 → 主窗口快捷键`
    可以改，改完写回 `cabbird.ini`。
+   如果连插件窗口也一起隐藏了，按 `Delete` 恢复全部 UI。
 2. **Core 到底有没有被映射进去**：看 `cabbird-runtime.log` 是否在启动后立刻有内容。
    空文件通常意味着映像没有被附加。
 3. **权限**：启动器需要管理员权限。它自己会尝试 `runas` 重新拉起；如果 UAC 被拒，
    附加会因为访问被拒而失败。
-4. **进程状态**：启动器进程表里的状态是 `拒绝访问` / `其他用户` / `不是 x64` 时，
+4. **进程状态**：启动页每两秒自动刷新。状态是 `拒绝访问` / `其他用户` / `不是 x64` 时，
    附加不会成功——这三个状态各自有独立含义，不要混为一谈。
 5. **界面被折叠/锁定**：宿主界面有展开/折叠/锁定状态，`请先解锁管理界面再折叠` 是它的提示语。
 
@@ -46,7 +47,7 @@
 
 - `cabbird.unity.entities` / `cabbird.unity.player` 这类服务需要一个**已验证的 Profile 绑定**；
   未绑定的 build 上它们是 `UNAVAILABLE`，插件照常加载并显示 unavailable。
-- `Unity 兼容性` 路由里的级别来自 [`profiles/unity-build-profiles.json`](../../profiles/unity-build-profiles.json)：
+- `诊断 → 概览 → 游戏运行时与 Profile` 中的级别来自 [`profiles/unity-build-profiles.json`](../../profiles/unity-build-profiles.json)：
   profile 声明的方法**全部绑定** = `支持`，部分 = `部分可用`，一个都没绑定 = `仅核心`，
   文档缺失或损坏 = `未知`（原因写具体错误，例如 `cannot open <路径>`）。
   功能矩阵每行 = profile 里的一个方法，`可用/验证` 列就是宿主真实的绑定结果。
@@ -68,14 +69,19 @@
 构建树里有 `cabbird-cli.exe`（`apps/cli/main.cpp`）：
 
 ```powershell
-cabbird-cli --pid <PID> modules      # 示例：查模块
+cabbird-cli --help
+cabbird-cli --pid <PID> status
+cabbird-cli --pid <PID> profile
+cabbird-cli --pid <PID> plugins
 ```
 
 - 它连的是命名管道 `\\.\pipe\LOCAL\Cabbird-<PID>`（前缀来自 `[Analyzer] PipePrefix`）；
+- 同一 Windows 用户和登录会话的普通权限控制台即可连接；Core 创建管道时使用关联的中完整性令牌，保留用户/登录会话 ACL 并拒绝远程客户端；
+- `status` / `profile` / `plugins` 读取已发布快照，不触发 Profile 重扫、实体扫描或插件操作；
 - 单条请求上限 **64 KiB**，参数里不允许换行；
 - 退出码：`2` 参数错，`3` 连不上管道，`4` 管道写/模式配置失败，`5` 读失败或没拿到响应。
 
-它**不在运行包里**，只存在于构建树；`cabbird_inject.exe` 也一样。
+CLI 随 Tools 组件提供，也可从构建树运行。`cabbird_inject.exe` 仅属于显式开启的开发 fixture。
 
 ## 7. 出事后怎么退回安全状态
 

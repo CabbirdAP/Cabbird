@@ -173,7 +173,7 @@ typedef enum CabbirdUnityEntityKindV1 {
 typedef struct CabbirdUnityEntityV1 {
     uint32_t struct_size;
     uint32_t flags;               /* CabbirdUnityEntityFlagsV1 */
-    uint64_t entity_id;           /* stable per entity for the session */
+    uint64_t entity_id;           /* managed data object's address, not an int32 gameplay id */
     uint32_t kind;                /* host-assigned category; 0 = unclassified */
     uint32_t label_size;          /* bytes, excluding any NUL */
     const char* label;            /* UTF-8, borrowed, may be null when label_size == 0 */
@@ -237,10 +237,10 @@ uint64_t entity_data;
  * frame boundary.  Pull makes the host's work proportional to what a plugin asks
  * for, and an ESP asks once per render pass.
  *
- * `generation` increments whenever the host's entity set changes shape (new
- * snapshot, scene transition, profile rebind).  A plugin caching per-entity work must
- * key it on (generation, entity_id): entity_id is stable, index only within one
- * generation.
+ * `generation` is a published-snapshot revision. Positions and camera updates
+ * advance it too; it is NOT the Player service's scene/lifecycle epoch. Indices
+ * belong to one revision. `entity_id` identifies the managed data address while
+ * that object lives; the address may be reused after destruction and is no GC root.
  *
  * Availability: UNAVAILABLE until the host has a validated profile binding for the
  * running build.  That is the NORMAL state on an unbound build, not an error; a
@@ -266,27 +266,15 @@ uint64_t entity_data;
  * genuinely wants the bytes can walk them in chunks with `dump_data` without ever
  * holding the whole thing.
  *
- * THREADING -- this is the part that is easy to get wrong.  Both entry points may be
- * called from EITHER domain, and both do the right thing:
+ * THREADING: `run` copies and queues the request from either Game or Render and
+ * returns PENDING; a concurrent request returns CONFLICT. The observed Game pump
+ * performs CollectTypeSystem and owns all IL2CPP access. This capture may occupy
+ * a game tick; without a Game pump it does not migrate to another thread.
  *
- *   * From the GAME domain (`on_update`), the call blocks and returns the finished
- *     dump.  That is the natural place: the game thread is already attached to the
- *     IL2CPP runtime, and a multi-second metadata walk does not stall a frame that a
- *     player is looking at.  It DOES stall the game loop, so a plugin should do it at
- *     a moment where that is acceptable.
- *
- *   * From the RENDER domain (`on_draw`), the call NEVER blocks and NEVER dumps
- *     inline.  It queues the request and returns `*result` with
- *     `CABBIRD_DUMP_V1_RESULT_PENDING`.  The walk runs on a worker thread that the
- *     host attaches to the IL2CPP domain first (`il2cpp_thread_attach`), which is the
- *     fix for the crash that made `include_methods` opt-in in the first place --
- *     "Fatal error in GC: Collecting from unknown thread".  Poll `state()` until it
- *     leaves PENDING.
- *
- * The second path is not a convenience.  A render callback is the only place a plugin
- * is guaranteed to be called every frame, and dumping from it directly would both
- * stall Present and call `il2cpp_class_get_methods` from a thread the runtime does not
- * know about.
+ * Worker receives only the copied native DumpSnapshot. It formats text, runs the
+ * read-only metadata blob scanner and writes files, without IL2CPP attachment or
+ * runtime object/metadata handles. `state`, `dump_data/size` and `metadata_data/size`
+ * read native state and byte buffers. Poll `state` until it leaves PENDING.
  * ------------------------------------------------------------------------- */
 
 #define CABBIRD_UNITY_DUMP_SERVICE_V1_ID "cabbird.unity.dump"
@@ -298,18 +286,12 @@ typedef enum CabbirdDumpFlagsV1 {
      * metadata read -- the cheap half, and on by default in the ini-based dumper. */
     CABBIRD_DUMP_V1_FIELDS = 1u << 0u,
     /* Walk `il2cpp_class_get_methods` and emit signatures plus method RVAs.
-     *
-     * OFF in the ini's default configuration and left to the caller here, because it
-     * forces lazy metadata initialisation and allocates managed memory across the
-     * whole image.  It is also the ONLY way to answer "can the host call a managed
-     * method, and at what address", which is the question the Entity Overlay binding is
-     * blocked on.  Pair it with `image_filter`. */
+     * Optional method enumeration can initialize class metadata and allocate.
+     * Pair it with `image_filter`; use cabbird.unity.metadata when only one
+     * known method's complete shape/address is needed. */
     CABBIRD_DUMP_V1_METHODS = 1u << 1u,
-    /* `Class::SetupProperties` / `SetupInterfaces`.  These WRITE to the class
-     * structure and can allocate.  Enabling both of these at once is what produced
-     * 0xC0000005 in GameAssembly.dll + 0x13E15C2 on an earlier run; they are exposed
-     * because the worker thread now attaches to the domain first, but they remain
-     * separately opt-in so that "which walk faulted" stays answerable. */
+    /* Property/interface enumeration can initialize runtime class metadata and
+     * allocate. Both are opt-in and collected only by the observed Game pump. */
     CABBIRD_DUMP_V1_PROPERTIES = 1u << 2u,
     CABBIRD_DUMP_V1_INTERFACES = 1u << 3u,
     /* Recover the process's PLAINTEXT IL2CPP metadata blob, and (when `metadata_path`
@@ -578,10 +560,8 @@ typedef enum CabbirdUnityPlayerFlagsV1 {
      * `position` is always the exact transform position; this flag describes the
      * extra field only. */
     CABBIRD_UNITY_PLAYER_V1_HAS_BOUNDS = 1u << 1u,
-    /* The host resolved the player by proximity to the active camera because
-     * `cabbird.unity.entities` does not yet identify the local player itself
-     * (its `LOCAL_PLAYER` flag is off; see unity_adapter.cpp).  Published
-     * because a heuristic that is invisible is one nobody can correct. */
+    /* If set, this reading used camera proximity to identify the player.
+     * An authoritative MainPlayer/controlling-entity binding leaves it unset. */
     CABBIRD_UNITY_PLAYER_V1_IDENTITY_PROXIMITY = 1u << 2u
 } CabbirdUnityPlayerFlagsV1;
 
@@ -597,8 +577,8 @@ typedef enum CabbirdUnityPlayerFlagsV1 {
 typedef struct CabbirdUnityPlayerSnapshotV1 {
     uint32_t struct_size;
     uint32_t flags;                 /* CabbirdUnityPlayerFlagsV1 */
-    uint64_t generation;            /* entity-source generation this reading came from */
-    uint64_t entity_id;             /* 0 when no player was found */
+    uint64_t generation;            /* adapter identity/scene lifecycle epoch, not a map ID or entity snapshot revision */
+    uint64_t entity_id;             /* managed data address; 0 when no player was found */
     char data_class[32];            /* live C# class of the player's data object, NUL-terminated */
     double position[3];
     double bounds_center[3];
@@ -695,7 +675,7 @@ typedef struct CabbirdUnityPlayerServiceV1 {
      *     capability named in the message;
      *   * so the supported way to move the player is `cabbird.unity.player-teleport` +
      *     `unity-player-teleport`, and this pair exists for plugins built against the older shape.
-     *     `plugins/player_teleport` uses the supported path; nothing in this tree calls these.
+     *     `plugins/PlayerTeleport` uses the supported path; nothing in this tree calls these.
      *
      * The host applies the same shape to `cabbird.core`, whose single table carries memory reads
      * and writes: there, the named pair is `memory-read` / `memory-write`.  These two services are
@@ -865,8 +845,8 @@ typedef struct CabbirdUnityTransformServiceV1 {
  * a single table forces them to be the same one.
  *
  * So the split here mirrors it exactly, and the two plugins in this tree landed on the same
- * line without being told: `player_coords` reads the snapshot and has no control that writes;
- * `player_teleport` drives the write.
+ * line without being told: `PlayerCoords` reads the snapshot and has no control that writes;
+ * `PlayerTeleport` drives the write.
  *
  * THE REQUEST AND RESULT TYPES ARE SHARED, DELIBERATELY
  *
@@ -950,19 +930,18 @@ typedef struct CabbirdUnityPlayerTeleportServiceV1 {
 #define CABBIRD_UNITY_ENTITIES_SERVICE_V1_VERSION 1u
 #define CABBIRD_UNITY_ENTITIES_SERVICE_V1_ID "cabbird.unity.entities"
 
-/* One entity, re-read off the live cache by its stable id.
+/* One entity, re-read off the live cache by its managed data address.
  *
  * WHY THIS EXISTS AS WELL AS `entity_at`: `entity_at` is addressed by INDEX, which is only
- * meaningful within one generation, so a consumer holding an id across a scene transition has no
- * way to ask about it.  The player service is exactly that consumer -- it resolves a player once
- * and must re-ask afterwards to find out whether the entity is still there rather than reading
- * through a pointer whose address may have been recycled.
+ * meaningful within one snapshot revision. Lookup checks membership in the current cache;
+ * it does not make an old address safe across a scene/lifecycle change or object destruction.
+ * Use the Player scene epoch to invalidate scene-bound references.
  */
 typedef struct CabbirdUnityEntitiesLookupV1 {
     uint32_t struct_size;
     uint32_t kind;                  /* CabbirdUnityEntityKindV1 */
     uint64_t entity_id;
-    uint64_t generation;            /* the generation this reading belongs to */
+    uint64_t generation;            /* entity snapshot revision, not Player scene epoch */
     /* The managed `BaseData` object's address -- the same value `entity_at` publishes as
      * `entity_data`, and therefore a starting point a consumer can use with
      * `cabbird.unity.transform`'s `resolve`, or re-walk itself through `cabbird.core`. */
@@ -979,14 +958,13 @@ typedef struct CabbirdUnityEntitiesServiceV1 {
     uint32_t struct_size;
     uint32_t service_version;
     void* user;
-    /* Increments whenever the set changes shape (new snapshot, scene transition, profile
-     * rebind).  A consumer caching per-entity work keys it on (generation, entity_id):
-     * entity_id is stable, an INDEX is only meaningful within one generation. */
+    /* Snapshot revision; also advances for refreshed positions/camera. An INDEX
+     * is meaningful only within one revision. Not a scene/lifecycle epoch. */
     uint64_t (CABBIRD_CALL *generation)(void* user);
-    /* The number of entities in the CURRENT generation.  Safe from the RENDER domain: it answers
+    /* The number of entities in the CURRENT revision. Safe from the RENDER domain: it answers
      * a count out of the published cache and touches no IL2CPP. */
     uint32_t (CABBIRD_CALL *entity_count)(void* user);
-    /* One entity by index, valid only for the generation it was read in.
+    /* One entity by index, valid only for the snapshot revision it was read in.
      *
      * `entity->label` is a UTF-8 view that is NOT NUL-terminated -- use `label_size` -- and it
      * stays valid only until the next `entity_at` call; copy it if it must outlive that.  This is
@@ -997,9 +975,9 @@ typedef struct CabbirdUnityEntitiesServiceV1 {
      * `struct_size`. */
     CabbirdStatusV1 (CABBIRD_CALL *entity_at)(
         void* user, uint32_t index, CabbirdUnityEntityV1* entity);
-    /* One entity by its stable id, re-read off the live cache.  No IL2CPP and no dereference of
-     * the target, so it is safe from any domain; NOT_FOUND for an id the current generation does
-     * not contain, which is how a caller tells "it is gone" from "the whole set was rebuilt". */
+    /* One entity by data address, re-read off the live cache. No IL2CPP or target
+     * dereference, so it is safe from any domain. NOT_FOUND means the current
+     * cache does not contain it; OK does not protect the object from reclamation. */
     CabbirdStatusV1 (CABBIRD_CALL *lookup)(
         void* user, uint64_t entity_id, CabbirdUnityEntitiesLookupV1* entity);
     /* The active camera's world position, as the game last reported it (Unity's
@@ -1014,7 +992,9 @@ typedef struct CabbirdUnityEntitiesServiceV1 {
     CabbirdStatusV1 (CABBIRD_CALL *camera_position)(void* user, double position[3]);
     /* Camera snapshot used by consumers that draw entities. */
     CabbirdStatusV1 (CABBIRD_CALL *camera)(void* user, CabbirdEspCameraV1* camera);
-    /* Enables/disables optional label population in entity_at results. */
+    /* want != 0 renews optional entity_at labels for 250 ms. Renew while
+     * consuming labels; want == 0 does not cancel another consumer's demand.
+     * Labels expire after the last renewal, including when a plugin stops. */
     CabbirdStatusV1 (CABBIRD_CALL *set_want_labels)(void* user, int want);
 } CabbirdUnityEntitiesServiceV1;
 

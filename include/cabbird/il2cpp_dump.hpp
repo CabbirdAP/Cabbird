@@ -195,31 +195,11 @@ struct DumpOptions {
     std::wstring metadata_path;
 
 
-    // OFF by default, and that default is load-bearing.
-    //
-    // `il2cpp_class_get_fields` is a pure metadata read.  These two are not:
-    // internally they run Class::SetupProperties / Class::SetupInterfaces, which
-    // WRITE to the class structure and can allocate.  Called from a thread that is
-    // not attached to the IL2CPP runtime, while the game is initialising the same
-    // class, they can dereference a half-built pointer.
-    //
-    // That is not a theory.  An in-game run with both enabled produced
-    // 0xC0000005 in GameAssembly.dll + 0x13E15C2 reading from address 0x135 --
-    // i.e. a null base plus the offset of Il2CppClass::instance_size/actualSize --
-    // on the probe thread, during the dump, while the fields-only path had
-    // completed cleanly on the same game.  They stay opt-in until they have been
-    // re-tested with DumpOptions::attach_thread set.
+    // These walks can lazily initialize class metadata. They remain opt-in and,
+    // like every other capture entry, run only on the observed attached Game
+    // thread. Attaching a Worker does not grant access to this collector.
     bool include_properties{false};
     bool include_interfaces{false};
-
-    // Attach the calling thread to the IL2CPP domain for the duration of the dump
-    // (il2cpp_thread_attach / il2cpp_thread_detach).
-    //
-    // Every il2cpp API that lazily initialises a class is documented as requiring
-    // an attached thread, because that is the only state in which the runtime's
-    // per-thread bookkeeping exists.  Our probe thread is one we created, so it
-    // starts unattached.  Set this before enabling any initialising walk.
-    bool attach_thread{true};
 
     // Progress reporting, called from the walker's OWN thread after each image and
     // about every `progress_class_interval` classes within an image.
@@ -296,11 +276,59 @@ struct DumpStats {
     std::uint64_t metadata_scan_ms{};
 };
 
-// Appends a dump.cs-style listing of the live type system to `out`.
-//
-// Requires the calling thread to already be attached and registered with the
-// runtime (see ThreadScope and the registration gate in the probe), because
-// every call below touches managed structures.
+// Native copies only. No managed object or metadata identity crosses into Worker.
+struct DumpFieldSnapshot {
+    std::string name, type;
+    std::uint32_t flags{};
+    std::size_t offset{};
+};
+struct DumpMethodSnapshot {
+    std::string name, result;
+    std::vector<std::string> parameters;
+    std::uint32_t flags{}, token{};
+    std::uintptr_t pointer{};
+    bool pointer_valid{}, token_valid{};
+};
+struct DumpPropertySnapshot {
+    std::string name, type;
+    bool getter{}, setter{};
+};
+struct DumpClassSnapshot {
+    std::string name, parent;
+    bool value_type{}, fields_truncated{}, methods_truncated{}, properties_truncated{};
+    std::vector<std::string> interfaces;
+    std::vector<DumpFieldSnapshot> fields;
+    std::vector<DumpMethodSnapshot> methods;
+    std::vector<DumpPropertySnapshot> properties;
+};
+struct DumpImageSnapshot {
+    std::string name;
+    std::size_t class_count{};
+    std::vector<DumpClassSnapshot> classes;
+};
+struct DumpSnapshot {
+    DumpStats stats;
+    std::vector<DumpImageSnapshot> images;
+    std::string unavailable_reason;
+};
+
+// Game-only cursor; its metadata identities never enter the Worker snapshot.
+struct DumpCaptureCursor {
+    std::vector<std::uintptr_t> assemblies;
+    std::size_t assembly_index{}, class_index{};
+    bool initialized{}, image_active{};
+};
+// Returns true when complete. Each Game tick captures at most class_budget
+// classes, keeping a full metadata walk out of a single game frame.
+bool CollectTypeSystemBatch(DumpSnapshot& snapshot, DumpCaptureCursor& cursor,
+                            const DumpOptions& options, std::size_t class_budget = 32);
+// Game domain only; copies every name/type/offset/address before returning.
+// It performs no file I/O and never recovers the raw metadata blob.
+DumpSnapshot CollectTypeSystem(const DumpOptions& options = {});
+// Worker-safe pure formatter; does not access IL2CPP or process memory.
+void FormatTypeSystem(std::string& out, const DumpSnapshot& snapshot,
+                      const DumpOptions& options = {});
+// Synchronous caller convenience. Production uses the separated functions.
 DumpStats DumpTypeSystem(std::string& out, const DumpOptions& options = {});
 
 }  // namespace cabbird::il2cpp

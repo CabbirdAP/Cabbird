@@ -1,10 +1,15 @@
 #include "cabbird/launcher/configuration.hpp"
+#include "cabbird/cabbird_ui_theme.hpp"
+#include "cabbird/i18n.hpp"
 
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
 #include <array>
 #include <cwctype>
+#include <charconv>
+#include <cmath>
+#include <cstdio>
 #include <fstream>
 #include <optional>
 #include <string_view>
@@ -18,6 +23,37 @@ constexpr std::uint64_t kMaximumConfigurationBytes = 64U * 1024U;
 constexpr std::wstring_view kGameExecutableName = L"AzurPromilia.exe";
 constexpr std::wstring_view kLauncherExecutableName = L"launcher.exe";
 constexpr std::wstring_view kLauncherExecutableNameGlobal = L"launcher.exe";
+
+std::string ValidLauncherTheme(const std::string_view name) {
+    const auto palette = ParseCabbirdUiPalette(name);
+    return ToString(palette) == name
+        ? std::string(name) : std::string("paper");
+}
+
+std::string HexColorText(const CabbirdUiColor color) {
+    const auto channel = [](const float value) {
+        return static_cast<unsigned>(std::lround(std::clamp(value, 0.0f, 1.0f) * 255.0f));
+    };
+    char text[8]{};
+    std::snprintf(text, sizeof(text), "#%02x%02x%02x",
+        channel(color.red), channel(color.green), channel(color.blue));
+    return text;
+}
+
+CabbirdUiColor ReadHexColor(const nlohmann::json& object, const char* key,
+    const CabbirdUiColor fallback) {
+    const auto item = object.find(key);
+    if (item == object.end() || !item->is_string()) return fallback;
+    std::string_view value = item->get_ref<const std::string&>();
+    if (value.size() == 7 && value.front() == '#') value.remove_prefix(1);
+    if (value.size() != 6) return fallback;
+    unsigned rgb{};
+    const auto parsed = std::from_chars(value.data(), value.data() + value.size(), rgb, 16);
+    if (parsed.ec != std::errc{} || parsed.ptr != value.data() + value.size()) return fallback;
+    return {static_cast<float>((rgb >> 16) & 255U) / 255.0f,
+        static_cast<float>((rgb >> 8) & 255U) / 255.0f,
+        static_cast<float>(rgb & 255U) / 255.0f, 1.0f};
+}
 
 std::wstring_view LauncherExecutableName(const AzurPromiliaClient client) noexcept {
     return client == AzurPromiliaClient::Global
@@ -390,6 +426,8 @@ LauncherConfigurationLoadResult LoadLauncherConfiguration(
         if (!document.is_object()) {
             throw std::invalid_argument("unsupported launcher configuration shape");
         }
+        if (const auto theme = document.find("theme"); theme != document.end() && theme->is_string())
+            result.configuration.theme = ValidLauncherTheme(theme->get_ref<const std::string&>());
         const int schema_version = document.value("schemaVersion", 0);
         if (schema_version == 1 && document.contains("proxy") &&
             document.at("proxy").is_object() && document.contains("attach") &&
@@ -416,6 +454,33 @@ LauncherConfigurationLoadResult LoadLauncherConfiguration(
                     ? AzurPromiliaClient::Global : AzurPromiliaClient::MainlandChina;
         } else {
             throw std::invalid_argument("unsupported launcher configuration shape");
+        }
+        if (const auto language = document.find("language");
+            language != document.end() && language->is_string()) {
+            const auto& value = language->get_ref<const std::string&>();
+            result.configuration.language = value.empty() ? std::string{} : std::string(
+                LanguagePreferenceName(ParseLanguagePreference(value).preference));
+        }
+        if (const auto artwork = document.find("artwork");
+            artwork != document.end() && artwork->is_object()) {
+            auto& target = result.configuration.artwork;
+            target.background = artwork->value("background", std::string{});
+            target.background_mode = std::clamp(artwork->value("backgroundMode", -1), -1, 3);
+            target.surface_opacity = std::clamp(artwork->value("surfaceOpacity", 0.0f), -1.0f, 1.0f);
+        }
+        if (const auto colors = document.find("customColors");
+            colors != document.end() && colors->is_object()) {
+            auto& target = result.configuration.custom_colors;
+            target.accent = ReadHexColor(*colors, "accent", target.accent);
+            target.text = ReadHexColor(*colors, "text", target.text);
+            target.window_background = ReadHexColor(*colors, "windowBackground", target.window_background);
+            target.child_background = ReadHexColor(*colors, "childBackground", target.child_background);
+            target.border = ReadHexColor(*colors, "border", target.border);
+        }
+        if (const auto view = document.find("view"); view != document.end() && view->is_object()) {
+            if (const auto limit = view->find("frameRateLimit");
+                limit != view->end() && limit->is_number_integer())
+                result.configuration.frame_rate_limit = LauncherFrameRatePreset(limit->get<double>());
         }
         result.loaded = true;
         result.message = "launcher configuration loaded";
@@ -457,6 +522,22 @@ LauncherConfigurationSaveResult SaveLauncherConfiguration(
         };
         const nlohmann::json document{
             {"schemaVersion", 2},
+            {"theme", ValidLauncherTheme(configuration.theme)},
+            {"language", configuration.language.empty() ? std::string{} : std::string(
+                LanguagePreferenceName(ParseLanguagePreference(configuration.language).preference))},
+            {"artwork", {
+                {"background", configuration.artwork.background},
+                {"backgroundMode", std::clamp(configuration.artwork.background_mode, -1, 3)},
+                {"surfaceOpacity", std::clamp(configuration.artwork.surface_opacity, -1.0f, 1.0f)},
+            }},
+            {"customColors", {
+                {"accent", HexColorText(configuration.custom_colors.accent)},
+                {"text", HexColorText(configuration.custom_colors.text)},
+                {"windowBackground", HexColorText(configuration.custom_colors.window_background)},
+                {"childBackground", HexColorText(configuration.custom_colors.child_background)},
+                {"border", HexColorText(configuration.custom_colors.border)},
+            }},
+            {"view", {{"frameRateLimit", LauncherFrameRatePreset(configuration.frame_rate_limit)}}},
             {"selectedClient", configuration.selected_client == AzurPromiliaClient::Global
                 ? "global" : "mainlandChina"},
             {"clients", {

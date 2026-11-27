@@ -1,0 +1,79 @@
+{
+  "schemaVersion": 2,
+  "id": "cabbird.story-tools",
+  "name": "Story Tools",
+  "author": "Cabbird",
+  "license": "AGPL-3.0-only",
+  "version": "1.0.0",
+  "description": "Native skip unlocking, automatic story skipping, dialogue auto playback and 1-9x story playback speed with verified game bindings and Game-domain restoration on stop.",
+  "entry": "plugin.dll",
+  "api": {
+    "major": 1,
+    "minMinor": 0,
+    "maxMinor": 0
+  },
+  "games": [
+    "ap"
+  ],
+  "builds": [
+    "ap-*"
+  ],
+  "loadPhase": "game-ready",
+  "services": [
+    {
+      "id": "cabbird.core",
+      "minVersion": 1
+    },
+    {
+      "id": "cabbird.ui",
+      "minVersion": 1
+    },
+    {
+      "id": "cabbird.window",
+      "minVersion": 1
+    },
+    {
+      "id": "cabbird.unity.metadata",
+      "minVersion": 1
+    },
+    {
+      "id": "cabbird.game-lifecycle",
+      "minVersion": 1
+    },
+    {
+      "id": "cabbird.interop.hook",
+      "minVersion": 1
+    },
+    {
+      "id": "cabbird.localization",
+      "minVersion": 1
+    },
+    {
+      "id": "cabbird.profile",
+      "minVersion": 1
+    },
+    {
+      "id": "cabbird.json",
+      "minVersion": 1
+    },
+    {
+      "id": "cabbird.config",
+      "minVersion": 1
+    },
+    {
+      "id": "cabbird.scheduler",
+      "minVersion": 1
+    }
+  ],
+  "capabilities": [
+    "ui",
+    "ui-window",
+    "unity-metadata",
+    "unity-il2cpp",
+    "interop-hook",
+    "memory-read",
+    "json",
+    "configuration",
+    "scheduler"
+  ]
+}

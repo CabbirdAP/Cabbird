@@ -1,0 +1,233 @@
+{
+  "schemaVersion": 1,
+  "game": "ap",
+  "module": "GameAssembly.dll",
+  "section": "il2cpp",
+  "contract": "story-tools-v2",
+  "layout": {
+    "sectionPaused": 280,
+    "sectionAudioPaused": 281,
+    "sectionDestroyed": 312,
+    "nativeSpeedMaximumExclusive": 10,
+    "nativeSpeedMaximumRva": 223264232,
+    "sectionInitialized": 564,
+    "pageBranchOpen": 696,
+    "pagePaused": 416
+  },
+  "symbols": [
+    {
+      "name": "skipPermission",
+      "candidates": [
+        {
+          "entry": "48 83 EC 28 80 3D 0C BC 54 0B 00 75 13 48 8D 0D 9C FF E5 0A E8 F7 AF 0F FB C6 05 F7 BB 54 0B 01 48 8B 0D 89 FF E5 0A F6 41 53 20 74 0B 48 8B 41 60 48 83 C4 28 48 FF E0 32 C0 48 83 C4 28 C3 CC",
+          "values": {
+            "rva": 100380272
+          }
+        }
+      ]
+    },
+    {
+      "name": "pageCanSkip",
+      "candidates": [
+        {
+          "entry": "40 53 48 83 EC 20 80 3D 8A 71 A0 0C 00 48 8B D9 75 13 48 8D 0D 2F 92 46 0C E8 F2 80 5C FC C6 05 72 71 A0 0C 01 48 8B 15 1C 92 46 0C F6 42 53 20 74 0F 48 8B 42 60 48 8B CB 48 83 C4 20 5B 48 FF",
+          "values": {
+            "rva": 78568816
+          }
+        }
+      ]
+    },
+    {
+      "name": "pageCanSkipToPermission",
+      "candidates": [
+        {
+          "entry": "48 83 EC 28 80 3D 0C BC 54 0B 00 75 13 48 8D 0D 9C FF E5 0A E8 F7 AF 0F FB C6 05 F7 BB 54 0B 01 48 8B 0D 89 FF E5 0A F6 41 53 20 74 0B 48 8B 41 60 48 83 C4 28 48 FF E0 32 C0 48 83 C4 28 C3 CC",
+          "values": {
+            "rva": 78568816
+          },
+          "callOffset": 67
+        }
+      ]
+    },
+    {
+      "name": "autoPlay",
+      "candidates": [
+        {
+          "entry": "40 53 48 83 EC 20 80 3D 69 05 55 0B 00 48 8B D9 75 1F 48 8D 0D 87 5B 0C 0B E8 22 F9 0F FB 48 8D 0D D3 21 E5 0A E8 16 F9 0F FB C6 05 45 05 55 0B 01 48 8B 15 C0 21 E5 0A F6 42 53 20 74 0F 48 8B",
+          "values": {
+            "rva": 100361536
+          }
+        }
+      ]
+    },
+    {
+      "name": "pageCheckAuto",
+      "candidates": [
+        {
+          "entry": "40 57 48 83 EC 30 80 3D DE 17 A1 0C 00 48 8B F9 75 37 48 8D 0D 8F 3C 2F 0C E8 72 27 5D FC 48 8D 0D 0B 04 45 0C E8 66 27 5D FC 48 8D 0D 57 9D 44 0C E8 5A 27 5D FC 48 8D 0D 03 68 49 0C E8 4E 27",
+          "values": {
+            "rva": 78526192
+          }
+        }
+      ]
+    },
+    {
+      "name": "pageCheckAutoToAutoPlay",
+      "candidates": [
+        {
+          "entry": "40 53 48 83 EC 20 80 3D 69 05 55 0B 00 48 8B D9 75 1F 48 8D 0D 87 5B 0C 0B E8 22 F9 0F FB 48 8D 0D D3 21 E5 0A E8 16 F9 0F FB C6 05 45 05 55 0B 01 48 8B 15 C0 21 E5 0A F6 42 53 20 74 0F 48 8B",
+          "values": {
+            "rva": 78526192
+          },
+          "callOffset": 202
+        }
+      ]
+    },
+    {
+      "name": "storySpeed",
+      "candidates": [
+        {
+          "entry": "48 89 54 24 10 57 48 83 EC 20 80 3D 4B 0E 55 0B 00 48 8B F9 75 5B 48 8D 0D 7B 43 EA 0A E8 FE 01 10 FB 48 8D 0D AF C5 01 0B E8 F2 01 10 FB 48 8D 0D 4B 64 0C 0B E8 E6 01 10 FB 48 8D 0D DF 02 E5",
+          "values": {
+            "rva": 100359264
+          }
+        }
+      ]
+    },
+    {
+      "name": "refreshPlaySpeed",
+      "candidates": [
+        {
+          "entry": "40 53 48 83 EC 30 80 3D C7 B9 51 0B 00 48 8B D9 75 13 48 8D 0D 4F C5 EF 0A E8 F2 AC 0C FB C6 05 AF B9 51 0B 01 48 8B 15 3C C5 EF 0A F6 42 53 20 74 0F 48 8B 42 60 48 8B CB 48 83 C4 30 5B 48 FF",
+          "values": {
+            "rva": 100577648
+          }
+        }
+      ]
+    },
+    {
+      "name": "refreshToStorySpeed",
+      "candidates": [
+        {
+          "entry": "48 89 54 24 10 57 48 83 EC 20 80 3D 4B 0E 55 0B 00 48 8B F9 75 5B 48 8D 0D 7B 43 EA 0A E8 FE 01 10 FB 48 8D 0D AF C5 01 0B E8 F2 01 10 FB 48 8D 0D 4B 64 0C 0B E8 E6 01 10 FB 48 8D 0D DF 02 E5",
+          "values": {
+            "rva": 100577648
+          },
+          "callOffset": 162
+        }
+      ]
+    },
+    {
+      "name": "storyManager",
+      "candidates": [
+        {
+          "entry": "48 83 EC 28 80 3D 78 64 28 0B 00 75 1F 48 8D 0D B4 DA D3 0A E8 D7 35 E3 FA 48 8D 0D 40 F4 C6 0A E8 CB 35 E3 FA C6 05 57 64 28 0B 01 48 8B 0D 95 DA D3 0A F6 41 53 20 74 0B 48 8B 41 60 48 83 C4",
+          "values": {
+            "rva": 103295120
+          }
+        }
+      ]
+    },
+    {
+      "name": "storySection",
+      "candidates": [
+        {
+          "entry": "40 53 48 83 EC 20 80 3D 4D B8 54 0B 00 48 8B D9 75 1F 48 8D 0D E7 36 E4 0A E8 32 AC 0F FB 48 8D 0D 23 18 E6 0A E8 26 AC 0F FB C6 05 29 B8 54 0B 01 48 8B 15 10 18 E6 0A F6 42 53 20 74 0F 48 8B",
+          "values": {
+            "rva": 100381232
+          }
+        }
+      ]
+    },
+    {
+      "name": "sectionSpeed",
+      "candidates": [
+        {
+          "entry": "40 53 48 83 EC 20 80 3D 63 78 51 0B 00 48 8B D9 75 13 48 8D 0D 17 68 F0 0A E8 A2 6B 0C FB C6 05 4B 78 51 0B 01 48 8B 15 04 68 F0 0A F6 42 53 20 74 0F 48 8B 42 60 48 8B CB 48 83 C4 20 5B 48 FF",
+          "values": {
+            "rva": 100594368
+          }
+        }
+      ]
+    },
+    {
+      "name": "setPlaySpeed",
+      "candidates": [
+        {
+          "entry": "48 89 5C 24 20 44 88 44 24 18 F3 0F 11 4C 24 10 48 89 4C 24 08 56 57 41 56 48 83 EC 70 0F 29 74 24 60 45 0F B6 F0 0F 28 F1 48 8B F1 80 3D 9B 97 51 0B 00 75 43 48 8D 0D 8C 1A F7 0A E8 CF 8A 0C",
+          "values": {
+            "rva": 100586352
+          }
+        }
+      ]
+    },
+    {
+      "name": "setAudioSpeed",
+      "candidates": [
+        {
+          "entry": "40 53 48 83 EC 30 80 3D D2 A3 51 0B 00 48 8B D9 0F 29 74 24 20 0F 28 F1 75 2B 48 8D 0D 7F 74 EB 0A E8 FA 96 0C FB 48 8D 0D 53 E8 EF 0A E8 EE 96 0C FB 48 8D 0D A7 5C F9 0A E8 E2 96 0C FB C6 05",
+          "values": {
+            "rva": 100583264
+          }
+        }
+      ]
+    },
+    {
+      "name": "refreshToSetPlaySpeed",
+      "candidates": [
+        {
+          "entry": "48 89 5C 24 20 44 88 44 24 18 F3 0F 11 4C 24 10 48 89 4C 24 08 56 57 41 56 48 83 EC 70 0F 29 74 24 60 45 0F B6 F0 0F 28 F1 48 8B F1 80 3D 9B 97 51 0B 00 75 43 48 8D 0D 8C 1A F7 0A E8 CF 8A 0C",
+          "values": {
+            "rva": 100577648
+          },
+          "callOffset": 202
+        }
+      ]
+    },
+    {
+      "name": "setPlaySpeedToAudio",
+      "candidates": [
+        {
+          "entry": "40 53 48 83 EC 30 80 3D D2 A3 51 0B 00 48 8B D9 0F 29 74 24 20 0F 28 F1 75 2B 48 8D 0D 7F 74 EB 0A E8 FA 96 0C FB 48 8D 0D 53 E8 EF 0A E8 EE 96 0C FB 48 8D 0D A7 5C F9 0A E8 E2 96 0C FB C6 05",
+          "values": {
+            "rva": 100586352
+          },
+          "callOffset": 615
+        }
+      ]
+    },
+    {
+      "name": "storyPage",
+      "candidates": [
+        {
+          "entry": "48 83 EC 28 80 3D 20 0C 55 0B 00 75 5B 48 8D 0D 44 41 EA 0A E8 C7 FF 0F FB 48 8D 0D 78 C6 EE 0A E8 BB FF 0F FB 48 8D 0D 0C 0C E5 0A E8 AF FF 0F FB 48 8D 0D 80 0F 0B 0B E8 A3 FF 0F FB 48 8D 0D",
+          "values": {
+            "rva": 100359840
+          }
+        }
+      ]
+    },
+    {
+      "name": "redirectSkip",
+      "candidates": [
+        {
+          "entry": "40 53 48 83 EC 20 80 3D 70 C0 54 0B 00 48 8B D9 75 13 48 8D 0D 6F F8 E5 0A E8 22 B4 0F FB C6 05 58 C0 54 0B 01 48 8B 15 5C F8 E5 0A F6 42 53 20 74 0F 48 8B 42 60 48 8B CB 48 83 C4 20 5B 48 FF",
+          "values": {
+            "rva": 100379200
+          }
+        }
+      ]
+    },
+    {
+      "name": "skipCurrentStory",
+      "candidates": [
+        {
+          "entry": "40 53 48 83 EC 20 80 3D 25 80 A0 0C 00 48 8B D9 75 13 48 8D 0D B7 67 46 0C E8 82 8F 5C FC C6 05 0D 80 A0 0C 01 48 8B 15 A4 67 46 0C 48 8B CB F6 42 53 20 74 0C 48 8B 42 60 48 83 C4 20 5B 48 FF",
+          "values": {
+            "rva": 78565088
+          }
+        }
+      ]
+    }
+  ]
+}

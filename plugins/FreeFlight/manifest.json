@@ -1,0 +1,30 @@
+{
+  "schemaVersion": 2,
+  "id": "cabbird.free-flight",
+  "name": "Free Flight",
+  "author": "Cabbird",
+  "license": "AGPL-3.0-only",
+  "version": "1.0.0",
+  "description": "Camera-relative controlled-player flight using the verified native movement controller. Disabled by default; enabled state and flight speed persist.",
+  "entry": "plugin.dll",
+  "api": {"major": 1, "minMinor": 0, "maxMinor": 0},
+  "games": ["ap"],
+  "builds": ["ap-*"],
+  "loadPhase": "game-ready",
+  "services": [
+    {"id": "cabbird.core", "minVersion": 1},
+    {"id": "cabbird.ui", "minVersion": 1},
+    {"id": "cabbird.window", "minVersion": 1},
+    {"id": "cabbird.input", "minVersion": 1},
+    {"id": "cabbird.unity.player-motion", "minVersion": 1},
+    {"id": "cabbird.json", "minVersion": 1},
+    {"id": "cabbird.unity.il2cpp", "minVersion": 1},
+    {"id": "cabbird.unity.metadata", "minVersion": 1},
+    {"id": "cabbird.unity.player", "minVersion": 1},
+    {"id": "cabbird.game-lifecycle", "minVersion": 1},
+    {"id": "cabbird.config", "minVersion": 1},
+    {"id": "cabbird.scheduler", "minVersion": 1},
+    {"id": "cabbird.localization", "minVersion": 1}
+  ],
+  "capabilities": ["ui", "ui-window", "input", "unity-player-motion", "json", "unity-il2cpp", "unity-metadata", "unity-player-snapshot", "configuration", "scheduler"]
+}

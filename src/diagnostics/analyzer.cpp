@@ -17,6 +17,7 @@
 #include <fstream>
 #include <iomanip>
 #include <limits>
+#include <nlohmann/json.hpp>
 #include <sstream>
 #include <stdexcept>
 #include <vector>
@@ -555,63 +556,50 @@ std::string Analyzer::HeapScanJson(
     return Ok(result);
 }
 
-std::string Analyzer::UnrealJson() const {
-    if (profile_status_) {
-        try {
-            return profile_status_();
-        } catch (...) {
-            return Error("profile diagnostics failed");
-        }
+std::string Analyzer::UnityProfileJson() const {
+    if (!profile_status_)
+        return Error("Unity profile snapshot is unavailable: no profile status provider is connected");
+    try {
+        return profile_status_();
+    } catch (...) {
+        return Error("Unity profile snapshot is unavailable: the profile status provider failed");
     }
-    std::string result = "{\"ok\":true,\"symbols\":[";
-    for (std::size_t symbol_index = 0; symbol_index < config_.symbols.size(); ++symbol_index) {
-        const auto& symbol = config_.symbols[symbol_index];
-        if (symbol_index != 0) result += ',';
-        result += "{\"name\":" + json::Quote(symbol.name);
-        const auto module = memory_services_.memory->FindModule(symbol.module);
-        if (!module) {
-            result += ",\"found\":false,\"error\":\"module not found\"}";
-            continue;
-        }
-        try {
-            const auto pattern = memory_services_.patterns->Parse(symbol.pattern);
-            const auto matches = memory_services_.patterns->ScanSection(
-                *module, symbol.section, pattern, config_.max_scan_results);
-            result += ",\"module\":" + json::Quote(module->name) +
-                      ",\"found\":" + (matches.empty() ? std::string("false") : std::string("true")) +
-                      ",\"matches\":[";
-            for (std::size_t index = 0; index < matches.size(); ++index) {
-                if (index != 0) result += ',';
-                const auto resolved = symbol.instruction_size == 0
-                    ? std::optional<std::uintptr_t>(matches[index] + symbol.addend)
-                    : memory_services_.memory->ResolveRipRelative(
-                          matches[index], symbol.rip_offset, symbol.instruction_size, symbol.addend);
-                result += "{\"instruction\":" + json::Hex(matches[index]);
-                if (resolved) result += ",\"address\":" + json::Hex(*resolved);
-                result += '}';
-            }
-            result += "]}";
-        } catch (const std::exception& exception) {
-            result += ",\"found\":false,\"error\":" + json::Quote(exception.what()) + "}";
-        }
+}
+
+std::string Analyzer::PluginsJson() const {
+    if (!runtime_status_) return Error("plugin diagnostics snapshot is unavailable: no runtime status provider is connected");
+    try {
+        const auto runtime = nlohmann::json::parse(runtime_status_());
+        const auto diagnostics = runtime.find("plugin_diagnostics");
+        if (diagnostics == runtime.end())
+            return Error("plugin diagnostics snapshot is unavailable: runtime status has no plugin_diagnostics");
+        return Ok("\"plugin_diagnostics\":" + diagnostics->dump());
+    } catch (...) {
+        return Error("plugin diagnostics snapshot is unavailable: runtime status could not be read as JSON");
     }
-    result += "]}";
-    return result;
 }
 
 std::string Analyzer::BuildSnapshot() const {
     const auto modules = ModulesJson();
-    const auto unreal = UnrealJson();
+    const auto profile = UnityProfileJson();
     return "{\"ok\":true,\"pid\":" + std::to_string(GetCurrentProcessId()) +
            ",\"modules\":" + modules.substr(std::string("{\"ok\":true,\"modules\":").size(), modules.size() - std::string("{\"ok\":true,\"modules\":").size() - 1) +
-           ",\"unreal\":" + unreal + "}";
+           ",\"profile\":" + profile + "}";
 }
 
 std::string Analyzer::Execute(std::string_view command_line) const {
     const auto [command, arguments] = Shift(command_line);
     if (command == "ping") return Ok("\"pid\":" + std::to_string(GetCurrentProcessId()));
     if (command == "help") {
-        return Ok("\"commands\":[\"ping\",\"status\",\"modules\",\"sections <module|.>\",\"regions <module|.>\",\"scan <module|.> <section> <pattern>\",\"heap-scan <ascii|utf16> <text> [limit<=4096]\",\"il2cpp-objects <namespace|-> <class> [field|-] [limit<=256]\",\"xrefs <module|.> <target>\",\"ue\",\"ue actors <filter|*> [limit] [cursor]\",\"ue objects <filter|*> [limit] [cursor]\",\"ue functions <filter|*> [limit] [cursor]\",\"ue fname <id>\",\"ue ftext <address>\",\"ue combat\",\"ue buffs\",\"read <address> <size<=1048576>\",\"write <address> <hex bytes>\",\"patch <address> <hex bytes>\",\"protect <address> <size> <r|rw|x|rx|rwx>\",\"alloc <size> [protection]\",\"free <address>\",\"chain <base> [offset ...]\",\"rip <instruction> <disp_offset> <instruction_size>\",\"ptr <address>\",\"f32 <address> [count]\",\"f64 <address> [count]\",\"snapshot [filename]\"]");
+        return nlohmann::json{{"ok", true}, {"commands", {
+            "ping", "help", "status", "plugins", "modules",
+            "sections <module|.>", "regions <module|.>", "unity", "profile",
+            "scan <module|.> <section> <pattern>", "heap-scan <ascii|utf16> <text> [limit<=4096]",
+            "il2cpp-objects <namespace|-> <class> [field|-] [limit<=256]", "xrefs <module|.> <target>",
+            "read <address> <size<=1048576>", "write <address> <hex bytes>", "patch <address> <hex bytes>",
+            "protect <address> <size> <r|rw|x|rx|rwx>", "alloc <size> [protection]", "free <address>",
+            "chain <base> [offset ...]", "rip <instruction> <disp_offset> <instruction_size>", "ptr <address>",
+            "f32 <address> [count]", "f64 <address> [count]", "snapshot [filename]"}}}.dump();
     }
     if (command == "status") {
         std::string runtime = "null";
@@ -633,14 +621,20 @@ std::string Analyzer::Execute(std::string_view command_line) const {
     if (command == "modules") return ModulesJson();
     if (command == "sections") return SectionsJson(WideUtf8(arguments));
     if (command == "regions") return RegionsJson(WideUtf8(arguments));
-    if (command == "ue") {
-        if (arguments.empty()) return UnrealJson();
-        if (!unity_reflection_query_) return Error("UE reflection queries are unavailable");
+    if (command == "profile") {
+        return arguments.empty() ? UnityProfileJson() : Error("usage: profile");
+    }
+    if (command == "unity") {
+        if (arguments.empty()) return UnityProfileJson();
+        if (!unity_reflection_query_) return Error("Unity reflection queries are unavailable: no query provider is connected");
         try {
             return unity_reflection_query_(arguments);
         } catch (...) {
-            return Error("UE reflection query failed");
+            return Error("Unity reflection query failed");
         }
+    }
+    if (command == "plugins") {
+        return arguments.empty() ? PluginsJson() : Error("usage: plugins");
     }
     if (command == "read") {
         const auto [address_text, size_text] = Shift(arguments);

@@ -1,38 +1,6 @@
-/* cabbird/service_graph.hpp -- dependency-ordered service startup and shutdown.
- *
- * Copied from the sibling Anomaly project (include/anomaly/service_graph.hpp) as part of
- * the UE -> Unity port.  Every field, enum value and method is kept: the graph is the piece
- * that decides the ORDER in which the runtime's services come up and go down, and that
- * order is not an implementation detail here -- it is the difference between a service
- * finding `GameAssembly.dll` already resolved and a service crashing on a null export.
- *
- * WHAT IT IS FOR, CONCRETELY: Cabbird's services have hard dependencies on each other --
- * the memory layer before the IL2CPP facade, the IL2CPP facade before the Game-domain
- * probe, the profiles before anything that reads a version-specific layout.  Before this
- * class, that order lived in the call sequence of one startup function.  Here it is data
- * (`required_dependencies`), it is checked before anything starts (`Build()` rejects a
- * missing or cyclic dependency), and it is reversible (`StopAll` runs in reverse order and
- * publishes a snapshot of whatever failed).
- *
- * THREE CONCEPTS WORTH READING TWICE:
- *
- *   * `ServiceState::Degraded` -- not an error.  Our target is a live shipping
- *     build whose layout is discovered at runtime, so "this service is up but running with
- *     a reduced capability set" is a normal outcome, and the graph must be able to express
- *     it without failing the whole startup.  The per-feature half of the same idea is
- *     reported by the Unity compatibility page, whose rows come from the profile document.
- *
- *   * `ServiceAffinity` -- which thread domain a service's start/stop runs on.  It is
- *     enforced through RuntimeDispatchers::Invoke, so a service that declares `Game`
- *     affinity is started by the game's own thread and not by the lifecycle thread.  That
- *     is the contract that keeps managed-object work off threads the GC does not know.
- *
- *   * `ServiceLifetime::PluginScoped` -- the service is created per plugin and torn down
- *     with it, which is what makes unloading a plugin actually release the things it used.
- *
- * `start` returns DWORD/Windows error codes, same as everything else in this runtime: the
- * value travels into ServiceSnapshot::error and from there into the diagnostics JSON, so a
- * failure is reported rather than swallowed.
+/* Dependency-ordered service startup, partial-start rollback and reverse teardown.
+ * Affinity executors enforce callback threads; an optional wait pump lets the owner
+ * service its domain while the asynchronous startup coordinator waits for it.
  */
 #pragma once
 
@@ -101,8 +69,8 @@ struct ServiceDescriptor {
     ServiceStartup startup{ServiceStartup::Blocking};
     ServiceAffinity affinity{ServiceAffinity::Lifecycle};
     std::vector<ServiceDependency> required_dependencies;
-    /* Optional dependencies do not order startup and do not fail it.  Their only effect is
-     * on the snapshot: `resolved` says whether the service happened to be there. */
+    /* Resolved optional dependencies order startup. Missing or failed optional
+     * dependencies degrade the service without failing its required dependents. */
     std::vector<ServiceDependency> optional_dependencies;
     std::function<DWORD(std::stop_token)> start;
     std::function<void()> stop;
@@ -142,7 +110,8 @@ struct ServiceSnapshot {
 };
 
 struct ServiceAffinityExecutors {
-    /* The executor owns the dispatch and waits for completion.  Implementations must
+    /* The executor owns the dispatch and must wait until a running callback completes,
+     * including after a timeout. Implementations must
      * return ERROR_NOT_READY when the requested domain is not available, rather than
      * running the work on the wrong thread. */
     std::function<DWORD(
@@ -172,6 +141,10 @@ struct ServiceGraphSnapshot {
 
 class ServiceGraph final {
 public:
+    // Called outside graph locks while waiting. The owner can pump its bound
+    // domain so startup/rollback callbacks do not wait for the thread awaiting them.
+    using WaitPump = std::function<void()>;
+
     ServiceGraph();
     ~ServiceGraph();
 
@@ -186,15 +159,19 @@ public:
      * ordering without dragging RuntimeDispatchers in. */
     void SetAffinityExecutors(ServiceAffinityExecutors executors) noexcept;
     [[nodiscard]] DWORD Build() noexcept;
-    [[nodiscard]] DWORD StartAll(std::stop_token stop_token = {}) noexcept;
+    [[nodiscard]] DWORD StartAll(
+        std::stop_token stop_token = {}, WaitPump wait_pump = {}) noexcept;
     [[nodiscard]] DWORD StartService(
-        std::string_view service_id, std::stop_token stop_token = {}) noexcept;
+        std::string_view service_id, std::stop_token stop_token = {},
+        WaitPump wait_pump = {}) noexcept;
     [[nodiscard]] DWORD WaitForAsync(std::stop_token stop_token = {}) noexcept;
     /* Cancels incomplete starts but RETAINS Ready services so the reverse-order StopAll
      * still has something to stop.  A startup that was aborted halfway is exactly when
      * skipping the teardown hurts most. */
     void CancelStartup() noexcept;
-    void StopAll() noexcept;
+    // Returns the first error from this teardown pass; earlier startup errors
+    // remain in Snapshot().error and do not turn a clean stop into a new failure.
+    DWORD StopAll(WaitPump wait_pump = {}) noexcept;
 
     [[nodiscard]] ServiceGraphSnapshot Snapshot() const;
 

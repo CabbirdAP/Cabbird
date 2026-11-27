@@ -148,30 +148,6 @@ struct InvocationCallbackState final {
 
 }  // namespace
 
-// ---------------------------------------------------------------------------
-// CABBIRD ADDITIONS -- the only two differences from Anomaly's
-// src/runtime/runtime_dispatchers.cpp.
-//
-// Both are declared in include/cabbird/runtime_dispatchers.hpp.  Neither replaces any
-// upstream code: they are pure predicates over the ExecutionDomain enum, so the ported
-// implementation is untouched and nothing in it calls them.
-//
-// IsPumpedDomain has real callers, and it encodes a fact the design depends on -- Lifecycle and
-// Worker own threads that this
-// class spawns, while Game and Render must borrow a thread the engine already owns (pumping from
-// a thread the engine does not know about is the Boehm "Collecting from unknown thread" crash).
-//
-// ExecutionDomainName currently has NO caller anywhere in the tree.  It was kept rather than
-// dropped so that the header declares nothing undefined -- a declared-but-undefined function is
-// a link-time landmine for whoever calls it first.  It is a candidate for deletion the next time
-// this header is touched for another reason.
-//
-// Both survived a previous version of this file that replaced Anomaly's
-// implementation wholesale: it carried its own PostState/GenerationIntent/ReconcileGeneration
-// leader machinery in place of upstream's, and renamed upstream's IsAccepting() to
-// AcceptsNewWork().  The implementation is upstream's again and IsAccepting() is back to its
-// upstream spelling; only these two additions are kept.
-// ---------------------------------------------------------------------------
 const char* ExecutionDomainName(ExecutionDomain domain) noexcept {
     switch (domain) {
         case ExecutionDomain::Lifecycle: return "Lifecycle";
@@ -350,7 +326,7 @@ public:
 
     DWORD Invoke(
         ExecutionDomain domain, Callback callback,
-        std::chrono::milliseconds timeout) {
+        std::chrono::milliseconds timeout, InvocationTimeoutPolicy timeout_policy) {
         if (!callback) return ERROR_INVALID_FUNCTION;
         ExternalActivity activity(*this);
         if (!activity) return ERROR_CANCELLED;
@@ -368,6 +344,7 @@ public:
             } catch (...) {
                 error = ERROR_UNHANDLED_EXCEPTION;
             }
+            callback = {};
             tracker->Complete(ticket, error);
             return error;
         }
@@ -412,8 +389,15 @@ public:
         if (bounded == std::chrono::milliseconds::max()) {
             result.wait();
         } else if (result.wait_for(bounded) != std::future_status::ready) {
-            if (Cancel(handle)) tracker->Complete(ticket, ERROR_CANCELLED);
-            return ERROR_TIMEOUT;
+            if (Cancel(handle)) {
+                tracker->Complete(ticket, ERROR_CANCELLED);
+                return ERROR_TIMEOUT;
+            }
+            if (timeout_policy == InvocationTimeoutPolicy::ReturnWhileRunning) {
+                return ERROR_TIMEOUT;
+            }
+            // Service state cannot be rolled back or destroyed while its callback runs.
+            result.wait();
         }
         return result.get();
     }
@@ -568,6 +552,12 @@ public:
         std::stop_callback propagate_stop(
             stop_token, [this] { lifecycle_stop_source_.request_stop(); });
         lifecycle_.Run(lifecycle_stop_source_.get_token());
+    }
+
+    std::size_t PumpLifecycle(std::size_t max_callbacks) noexcept {
+        ExternalActivity activity(*this);
+        if (!activity) return 0;
+        return lifecycle_.Pump(max_callbacks);
     }
 
     std::size_t PumpGame(std::size_t max_callbacks) noexcept {
@@ -834,8 +824,9 @@ DomainTaskHandle RuntimeDispatchers::Post(
 }
 
 DWORD RuntimeDispatchers::Invoke(
-    ExecutionDomain domain, Callback callback, std::chrono::milliseconds timeout) {
-    return impl_->Invoke(domain, std::move(callback), timeout);
+    ExecutionDomain domain, Callback callback, std::chrono::milliseconds timeout,
+    InvocationTimeoutPolicy timeout_policy) {
+    return impl_->Invoke(domain, std::move(callback), timeout, timeout_policy);
 }
 
 bool RuntimeDispatchers::DrainInvocations(std::chrono::milliseconds timeout) {
@@ -872,6 +863,10 @@ bool RuntimeDispatchers::Drain(
 
 void RuntimeDispatchers::RunLifecycle(std::stop_token stop_token) noexcept {
     impl_->RunLifecycle(stop_token);
+}
+
+std::size_t RuntimeDispatchers::PumpLifecycle(std::size_t max_callbacks) noexcept {
+    return impl_->PumpLifecycle(max_callbacks);
 }
 
 std::size_t RuntimeDispatchers::PumpGame(std::size_t max_callbacks) noexcept {

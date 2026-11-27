@@ -27,7 +27,10 @@ game-package\
       PlayerCoords\{plugin.dll,manifest.json}
       PlayerTeleport\{plugin.dll,manifest.json}
       FakeUID\{plugin.dll,manifest.json}
-      DamageReplay\{plugin.dll,manifest.json,locales\zh-CN.json}
+      DamageReplay\{plugin.dll,manifest.json,profile\compatibility.profile.json}
+      EntityTeleport\{plugin.dll,manifest.json}
+      MoveSpeed\{plugin.dll,manifest.json,profile\compatibility.profile.json}
+      StoryTools\{plugin.dll,manifest.json,profile\compatibility.profile.json}
 ```
 
 要点：
@@ -36,8 +39,10 @@ game-package\
 - 包内**不含** `cabbird_inject.exe`、`cabbird-cli.exe`、`cabbird-platform-preview.exe`——
   这三个只在构建树里，是开发工具（`cabbird-cli.exe` 属于 `Tools` 发布组件，
   见[从源码构建](../developer-guide/building.md)）。
-- 随包插件共 **7 个**（`Cabbird\plugins\` 下每目录一个 manifest），全部默认不启用；
+- 随包插件共 **12 个**（`Cabbird\plugins\` 下每目录一个 manifest），全部默认不启用；
   安装集由 `CMakeLists.txt` 的 `GameRuntime` 组件决定。
+- Unity Dump 同样随包分发，仅在开发者模式下显示。
+- 每个内建插件包都带 `locales\zh-CN.json`；需要兼容资料的插件还带 `profile\`。
 - 项目本体以 **AGPL-3.0-only** 发布（包内 `LICENSE`），各插件 manifest 也声明 `AGPL-3.0-only`；
   随包第三方组件的声明与许可文本在 `NOTICE` 与 `third_party/licenses/`。
 

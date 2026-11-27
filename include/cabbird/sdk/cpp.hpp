@@ -41,8 +41,17 @@ private: const CabbirdHostApiV1* host_{};
 class UiWindow final {
 public:
     UiWindow(const CabbirdUiServiceV1* ui, std::string_view title, int* open = nullptr, std::uint32_t flags = 0) noexcept
-        : ui_(ui), active_(ui != nullptr && ui->begin_window != nullptr && ui->begin_window(ui->user, StringView(title), open, flags) != 0) {}
-    ~UiWindow() { if (ui_ != nullptr && ui_->end_window != nullptr) ui_->end_window(ui_->user); }
+    {
+        constexpr std::size_t required_size = offsetof(CabbirdUiServiceV1, end_window) +
+            sizeof(decltype(CabbirdUiServiceV1::end_window));
+        if (ui == nullptr || ui->struct_size < required_size ||
+            ui->service_version < CABBIRD_UI_SERVICE_V1_VERSION ||
+            ui->begin_window == nullptr || ui->end_window == nullptr) return;
+        ui_ = ui;
+        active_ = ui_->begin_window(ui_->user, StringView(title), open, flags) != 0;
+    }
+    // Begin/End are paired even when Begin reports a collapsed or hidden window.
+    ~UiWindow() { if (ui_ != nullptr) ui_->end_window(ui_->user); }
     UiWindow(const UiWindow&) = delete; UiWindow& operator=(const UiWindow&) = delete;
     [[nodiscard]] explicit operator bool() const noexcept { return active_; }
 private: const CabbirdUiServiceV1* ui_{}; bool active_{};

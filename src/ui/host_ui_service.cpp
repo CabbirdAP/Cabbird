@@ -1,3 +1,4 @@
+#include "cabbird/liquid_glass.hpp"
 #include "cabbird/host_ui_service.hpp"
 #include "cabbird/cabbird_ui_theme.hpp"
 #include "cabbird/thread_local_value.hpp"
@@ -23,6 +24,7 @@ namespace cabbird {
 namespace {
 
 std::atomic_bool g_menus_collapsed{};
+std::atomic_bool g_all_hidden{};
 std::atomic_bool g_menu_state_pending{true};
 std::atomic_bool g_management_expansion_requested{};
 std::atomic_bool g_developer_mode{};
@@ -220,26 +222,25 @@ bool DrawPluginWindowChromeButton(
     }
 
     const auto& theme = CabbirdUiTheme();
-    const ImVec4 raised = ThemeColor(theme.button_hovered);
-    const ImVec4 active = ThemeColor(theme.button_active);
     const ImVec4 accent = ThemeColor(theme.accent);
     const ImVec4 transparent(0.0F, 0.0F, 0.0F, 0.0F);
-    const ImVec4 background = held ? active : hovered ? raised
-        : selected ? ThemeColorWithAlpha(theme.accent, 0.16F) : transparent;
-    const ImVec4 text = !enabled ? ThemeColor(theme.text_muted)
-        : selected ? accent : ThemeColor(theme.text_muted);
+    const ImVec4 background = selected ? ThemeColorWithAlpha(theme.accent, 0.16F) : transparent;
+    // Hover brightens the glyph while the local glass stays continuous.
+    const ImVec4 text = !enabled ? ThemeColorWithAlpha(theme.text_muted, 0.55F)
+        : selected ? accent
+        : hovered || held ? ThemeColor(theme.text) : ThemeColor(theme.text_muted);
     ImDrawList* const draw_list = window.DrawList;
-    draw_list->AddRectFilled(bounds.Min, bounds.Max, ToU32(background), 3.0F);
+    draw_list->AddRectFilled(bounds.Min, bounds.Max, ToU32(background), bounds.GetHeight() * 0.36F);
     const char* const glyph_text = PluginWindowChromeGlyphText(glyph);
     // Plugin content can select a CJK font, but these are host-owned icon glyphs.
     ImFont* const glyph_font = ImGui::GetIO().FontDefault;
     const float glyph_font_size = glyph_font != nullptr ? glyph_font->FontSize : ImGui::GetFontSize();
-    const ImVec2 glyph_size = glyph_font != nullptr
-        ? glyph_font->CalcTextSizeA(glyph_font_size, FLT_MAX, 0.0F, glyph_text)
-        : ImGui::CalcTextSize(glyph_text);
+    const ImVec2 ink_center =
+        glass::GlyphInkCenter(glyph_font, glyph_font_size, glyph_text);
+    const ImVec2 button_center = bounds.GetCenter();
     draw_list->AddText(glyph_font, glyph_font_size,
-        Offset(bounds.Min, (bounds.GetWidth() - glyph_size.x) * 0.5F,
-            (bounds.GetHeight() - glyph_size.y) * 0.5F - 1.0F),
+        ImVec2(std::round(button_center.x - ink_center.x),
+            std::round(button_center.y - ink_center.y)),
         ToU32(text), glyph_text);
     if (hovered && tooltip != nullptr) ImGui::SetTooltip("%s", tooltip);
     return pressed;
@@ -265,11 +266,14 @@ bool DrawPluginWindowChrome(
     ImDrawList* const draw_list = window.DrawList;
     const ImRect header(origin, Offset(origin, size.x, kPluginWindowHeaderHeight));
     const auto& theme = CabbirdUiTheme();
-    draw_list->AddRectFilled(header.Min, header.Max, ToU32(ThemeColor(theme.header_background)));
-    draw_list->AddLine(
-        Offset(origin, 0.0F, kPluginWindowHeaderHeight - 1.0F),
-        Offset(origin, size.x, kPluginWindowHeaderHeight - 1.0F),
-        ToU32(ThemeColor(theme.border)));
+    // The title uses the existing window material. Only separate it from an
+    // expanded body; a collapsed pill has no content edge to underline.
+    if (!IsPluginWindowCollapsed(state)) {
+        draw_list->AddLine(
+            Offset(origin, 14.0F, kPluginWindowHeaderHeight - 1.0F),
+            Offset(origin, size.x - 14.0F, kPluginWindowHeaderHeight - 1.0F),
+            ToU32(ThemeColorWithAlpha(theme.text, 0.10F)));
+    }
 
     const float close_x = size.x - kPluginWindowActionRightInset - kPluginWindowActionSize;
     const float pin_x = close_x - kPluginWindowActionGap - kPluginWindowActionSize;
@@ -420,6 +424,9 @@ void CABBIRD_CALL SetNextWindowSize(void*, float width, float height, std::uint3
 
 int CABBIRD_CALL BeginWindow(
     void*, CabbirdStringViewV1 title, int* open, std::uint32_t flags) {
+    const ImVec2 requested_size =
+        (GImGui->NextWindowData.HasFlags & ImGuiNextWindowDataFlags_HasSize) != 0
+        ? GImGui->NextWindowData.SizeVal : ImVec2(0.0F, 0.0F);
     const std::string id = Copy(title);
     std::string text = id;
     if (id.find("###") == std::string::npos) {
@@ -428,10 +435,24 @@ int CABBIRD_CALL BeginWindow(
     }
     const bool management_shell = IsManagementShellTitle(text);
     ImGuiWindowFlags window_flags = static_cast<ImGuiWindowFlags>(flags);
+    const bool glass_body = (window_flags & ImGuiWindowFlags_NoBackground) == 0;
+    if (glass_body && cabbird::glass::Active()) window_flags |= ImGuiWindowFlags_NoBackground;
     ImGuiWindow* const existing = ImGui::FindWindowByName(text.c_str());
     if (!management_shell) {
         window_flags |= ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoScrollbar |
             ImGuiWindowFlags_NoScrollWithMouse;
+        if (existing == nullptr) {
+            const auto* saved = ImGui::FindWindowSettingsByID(ImHashStr(text.c_str()));
+            const float collapsed_height =
+                (std::max)(kPluginWindowHeaderHeight, ImGui::GetStyle().WindowMinSize.y);
+            if (saved != nullptr && saved->Size.y > 0 && saved->Size.y <= collapsed_height) {
+                // Repair a saved custom header before Begin clamps it to the
+                // plugin's minimum height and hides the original collapsed size.
+                ImGui::SetNextWindowSize(ImVec2(saved->Size.x > collapsed_height
+                    ? static_cast<float>(saved->Size.x) : requested_size.x,
+                    requested_size.y), ImGuiCond_Always);
+            }
+        }
         if (existing != nullptr) {
             PluginWindowChromeState& chrome = g_plugin_window_chrome[existing->ID];
             const bool collapse_changed = SynchronizePluginWindowHostCollapse(chrome, *existing);
@@ -449,7 +470,7 @@ int CABBIRD_CALL BeginWindow(
     bool visible = open == nullptr || *open != 0;
     if (!management_shell) {
         ImGui::PushStyleColor(
-            ImGuiCol_WindowBg, ThemeColor(CabbirdUiTheme().child_background));
+            ImGuiCol_WindowBg, ThemeColor(CabbirdUiSurfaceColor()));
         ImGui::PushStyleVar(
             ImGuiStyleVar_WindowPadding, ImVec2(kPluginWindowBodyPadding, kPluginWindowBodyPadding));
     }
@@ -457,6 +478,18 @@ int CABBIRD_CALL BeginWindow(
     if (!management_shell) {
         ImGui::PopStyleVar();
         ImGui::PopStyleColor();
+    }
+    if (glass_body) {
+        cabbird::glass::SurfaceOptions body;
+        body.rounding = ImGui::GetStyle().WindowRounding;
+        body.scale = ImGui::GetIO().FontGlobalScale;
+        body.clip = false;
+        body.deep_backdrop = !management_shell;
+        body.face_blur = management_shell ? 1.0f : 2.0f;
+        // A deep face needs a soft shoulder so the bevel remains one pane.
+        if (!management_shell) body.rim_blur = 1.7F;
+        body.tint_strength = cabbird::glass::DarkAppearance() ? 0.62f : 0.52f;
+        cabbird::glass::RegisterWindowSurface(body);
     }
     g_host_ui_window_scopes.Get().emplace_back();
     if (open != nullptr) *open = visible ? 1 : 0;
@@ -473,6 +506,19 @@ int CABBIRD_CALL BeginWindow(
     const bool body_auto_fit_pending = chrome.body_auto_fit_frames_x > 0 ||
         chrome.body_auto_fit_frames_y > 0;
     const bool auto_fit_pending = PluginWindowHasPendingAutoFit(*window) || body_auto_fit_pending;
+    if (!IsPluginWindowCollapsed(chrome) && !auto_fit_pending &&
+        window->SizeFull.y <= kPluginWindowHeaderHeight) {
+        // Older settings may contain the custom collapsed size. FirstUseEver
+        // cannot repair it because ImGui has already accepted that saved size.
+        // Keep a usable width and remeasure only the lost axes when no explicit
+        // initial size was supplied by the plugin.
+        ImGui::SetWindowSize(window,
+            ImVec2(window->SizeFull.x > kPluginWindowHeaderHeight
+                    ? window->SizeFull.x : requested_size.x,
+                requested_size.y),
+            ImGuiCond_Always);
+        chrome.auto_fit_recovery = true;
+    }
     if (!IsPluginWindowCollapsed(chrome) && !auto_fit_pending &&
         window->SizeFull.y > kPluginWindowHeaderHeight) {
         static_cast<void>(CapturePluginWindowExpandedSize(chrome, *window));
@@ -505,9 +551,12 @@ int CABBIRD_CALL BeginWindow(
     if (body_auto_fit_y) body_flags |= ImGuiChildFlags_AutoResizeY;
     ImGui::PushStyleVar(
         ImGuiStyleVar_WindowPadding, ImVec2(0.0F, kPluginWindowBodyPadding));
+    // The root owns the floating window's entire material: glass while active,
+    // an opaque palette fill otherwise. Its scrolling child adds no second
+    // surface, including when the caller explicitly requests NoBackground.
     const bool body_visible = ImGui::BeginChild(
         "##cabbird-plugin-window-body", ImVec2(0.0F, 0.0F),
-        body_flags);
+        body_flags, ImGuiWindowFlags_NoBackground);
     ImGui::PopStyleVar();
     g_host_ui_window_scopes.Get().back().plugin_body_child_open = true;
     g_host_ui_window_scopes.Get().back().plugin_body_window = ImGui::GetCurrentWindow();
@@ -530,6 +579,24 @@ void CABBIRD_CALL EndWindow(void*) {
         g_host_ui_window_scopes.Get().pop_back();
     }
     if (plugin_body_child_open) ImGui::EndChild();
+    ImGuiWindow* const window = ImGui::GetCurrentWindow();
+    const auto chrome = g_plugin_window_chrome.find(window->ID);
+    if (chrome != g_plugin_window_chrome.end() &&
+        IsPluginWindowCollapsed(chrome->second) &&
+        (window->Flags & ImGuiWindowFlags_NoSavedSettings) == 0) {
+        // Native collapsed windows retain SizeFull. Our custom chrome instead
+        // shrinks SizeFull to the header, so snapshot the expanded dimensions
+        // and exclude that temporary geometry from ImGui's settings writer.
+        ImGuiWindowSettings* settings = ImGui::FindWindowSettingsByWindow(window);
+        if (settings == nullptr) {
+            settings = ImGui::CreateNewWindowSettings(window->Name);
+            window->SettingsOffset = GImGui->SettingsWindows.offset_from_ptr(settings);
+        }
+        settings->Pos = ImVec2ih(window->Pos);
+        settings->Size = ImVec2ih(chrome->second.expanded_size);
+        settings->Collapsed = false;
+        window->Flags |= ImGuiWindowFlags_NoSavedSettings;
+    }
     ImGui::End();
 }
 
@@ -538,17 +605,26 @@ void CABBIRD_CALL Text(void*, CabbirdStringViewV1 value) {
     ImGui::TextUnformatted(text.data(), text.data() + text.size());
 }
 
+ImVec2 PluginButtonSize(
+    const std::string& text, const float width, const float height) {
+    if (!(width > 0.0F)) return ImVec2(width, height);
+    const ImVec2 label_size = ImGui::CalcTextSize(text.c_str(), nullptr, true);
+    const float required = label_size.x + ImGui::GetStyle().FramePadding.x * 2.0F;
+    return ImVec2(width > required ? width : required, height);
+}
+
 int CABBIRD_CALL Button(
     void*, CabbirdStringViewV1 label, float width, float height) {
     const std::string text = Copy(label);
-    return ImGui::Button(text.c_str(), ImVec2(width, height)) ? 1 : 0;
+    return ImGui::Button(text.c_str(), PluginButtonSize(text, width, height)) ? 1 : 0;
 }
 
 int CABBIRD_CALL ButtonEnabled(
     void*, CabbirdStringViewV1 label, float width, float height, int enabled) {
     const std::string text = Copy(label);
     ImGui::BeginDisabled(enabled == 0);
-    const bool pressed = ImGui::Button(text.c_str(), ImVec2(width, height));
+    const bool pressed =
+        ImGui::Button(text.c_str(), PluginButtonSize(text, width, height));
     ImGui::EndDisabled();
     return enabled != 0 && pressed ? 1 : 0;
 }
@@ -621,7 +697,7 @@ ImGuiTabItemFlags ToImGuiTabItemFlags(const std::uint32_t flags) noexcept {
 int CABBIRD_CALL BeginTabBar(
     void*, CabbirdStringViewV1 id, const std::uint32_t flags) {
     const std::string text = Copy(id);
-    return ImGui::BeginTabBar(text.c_str(), ToImGuiTabBarFlags(flags)) ? 1 : 0;
+    return cabbird::glass::BeginTabBar(text.c_str(), ToImGuiTabBarFlags(flags)) ? 1 : 0;
 }
 
 int CABBIRD_CALL BeginTabItem(
@@ -644,13 +720,13 @@ int CABBIRD_CALL BeginTabItem(
 
 void CABBIRD_CALL EndTabItem(void*) { ImGui::EndTabItem(); }
 
-void CABBIRD_CALL EndTabBar(void*) { ImGui::EndTabBar(); }
+void CABBIRD_CALL EndTabBar(void*) { cabbird::glass::EndTabBar(); }
 
 int CABBIRD_CALL Checkbox(void*, CabbirdStringViewV1 label, int* value) {
     if (value == nullptr) return 0;
     const std::string text = Copy(label);
     bool checked = *value != 0;
-    const bool changed = ImGui::Checkbox(text.c_str(), &checked);
+    const bool changed = cabbird::glass::Switch(text.c_str(), &checked);
     *value = checked ? 1 : 0;
     return changed ? 1 : 0;
 }
@@ -660,7 +736,7 @@ int CABBIRD_CALL SliderFloat(
     if (value == nullptr || !std::isfinite(minimum) || !std::isfinite(maximum) ||
         minimum >= maximum) return 0;
     const std::string text = Copy(label);
-    return ImGui::SliderFloat(text.c_str(), value, minimum, maximum) ? 1 : 0;
+    return cabbird::glass::SliderFloat(text.c_str(), value, minimum, maximum) ? 1 : 0;
 }
 
 int CABBIRD_CALL InputUInt32(
@@ -697,7 +773,8 @@ int DigitInputFilter(ImGuiInputTextCallbackData* data) {
 int CABBIRD_CALL InputText(
     void*, CabbirdStringViewV1 label, char* buffer,
     std::size_t buffer_capacity, std::uint32_t flags) {
-    constexpr std::uint32_t kKnownFlags = CABBIRD_UI_TEXT_INPUT_V1_DIGITS;
+    constexpr std::uint32_t kKnownFlags =
+        CABBIRD_UI_TEXT_INPUT_V1_DIGITS | CABBIRD_UI_TEXT_INPUT_V1_PASSWORD;
     if (buffer == nullptr || buffer_capacity == 0 ||
         (flags & ~kKnownFlags) != 0 ||
         std::find(buffer, buffer + buffer_capacity, '\0') == buffer + buffer_capacity) {
@@ -709,6 +786,9 @@ int CABBIRD_CALL InputText(
     if ((flags & CABBIRD_UI_TEXT_INPUT_V1_DIGITS) != 0) {
         imgui_flags |= ImGuiInputTextFlags_CallbackCharFilter;
         callback = DigitInputFilter;
+    }
+    if ((flags & CABBIRD_UI_TEXT_INPUT_V1_PASSWORD) != 0) {
+        imgui_flags |= ImGuiInputTextFlags_Password;
     }
     return ImGui::InputText(
         text.c_str(), buffer, buffer_capacity, imgui_flags, callback) ? 1 : 0;
@@ -738,12 +818,18 @@ void CABBIRD_CALL EndChild(void*) { ImGui::EndChild(); }
 int CABBIRD_CALL BeginTable(
     void*, CabbirdStringViewV1 id, std::int32_t columns, std::uint32_t flags,
     float outer_width, float outer_height) {
-    constexpr std::uint32_t kKnownFlags = CABBIRD_UI_TABLE_V1_SIZING_FIXED_FIT;
-    if (columns <= 0 || (flags & ~kKnownFlags) != 0) return 0;
+    constexpr std::uint32_t kKnownFlags =
+        CABBIRD_UI_TABLE_V1_SIZING_FIXED_FIT |
+        CABBIRD_UI_TABLE_V1_SIZING_STRETCH_PROP;
+    if (columns <= 0 || (flags & ~kKnownFlags) != 0 ||
+        (flags & kKnownFlags) == kKnownFlags) return 0;
     const std::string text = Copy(id);
     ImGuiTableFlags imgui_flags = ImGuiTableFlags_None;
     if ((flags & CABBIRD_UI_TABLE_V1_SIZING_FIXED_FIT) != 0) {
         imgui_flags |= ImGuiTableFlags_SizingFixedFit;
+    }
+    if ((flags & CABBIRD_UI_TABLE_V1_SIZING_STRETCH_PROP) != 0) {
+        imgui_flags |= ImGuiTableFlags_SizingStretchProp;
     }
     return ImGui::BeginTable(
         text.c_str(), columns, imgui_flags,
@@ -784,12 +870,18 @@ void CABBIRD_CALL CloseCurrentPopup(void*) { ImGui::CloseCurrentPopup(); }
 
 int CABBIRD_CALL FilterMatch(
     void*, CabbirdStringViewV1 filter, CabbirdStringViewV1 value) {
-    const std::string needle = Copy(filter);
-    const std::string haystack = Copy(value);
+    std::string needle = Copy(filter);
+    const std::string_view haystack = value.data == nullptr
+        ? std::string_view{} : std::string_view(value.data, value.size);
     if (needle.empty()) return 1;
+    // Fold the query once; a catalog search compares it against every byte of
+    // each path. Keep the same locale-aware byte matching without copying paths.
+    for (char& byte : needle) {
+        byte = static_cast<char>(std::tolower(static_cast<unsigned char>(byte)));
+    }
     const auto equal_folded = [](const char left, const char right) {
         return std::tolower(static_cast<unsigned char>(left)) ==
-            std::tolower(static_cast<unsigned char>(right));
+            static_cast<unsigned char>(right);
     };
     const auto found = std::search(
         haystack.begin(), haystack.end(), needle.begin(), needle.end(), equal_folded);
@@ -1096,6 +1188,279 @@ int CABBIRD_CALL DrawEntityLabel(
     return 1;
 }
 
+void CABBIRD_CALL TextWrapped(void*, CabbirdStringViewV1 value) {
+    const std::string text = Copy(value);
+    ImGui::TextWrapped("%s", text.c_str());
+}
+
+int CABBIRD_CALL ButtonSelected(
+    void*, CabbirdStringViewV1 label, float width, float height,
+    int selected, int enabled) {
+    const std::string text = Copy(label);
+    const char* const visible_end = ImGui::FindRenderedTextEnd(text.c_str());
+    const auto& style = ImGui::GetStyle();
+    const float natural_width = ImGui::CalcTextSize(text.c_str(),visible_end).x + style.FramePadding.x*2;
+    const float resolved_width = ImGui::CalcItemSize(ImVec2(width,height),natural_width,ImGui::GetFrameHeight()).x;
+    const float wrap_width = (std::max)(1.0F,resolved_width-style.FramePadding.x*2);
+    std::string wrapped;
+    for (const char* cursor = text.c_str(); cursor < visible_end;) {
+        const char* end = ImGui::GetFont()->CalcWordWrapPositionA(
+            ImGui::GetFontSize()/ImGui::GetFont()->FontSize,cursor,visible_end,wrap_width);
+        if (end == cursor) {
+            unsigned int character{};
+            end += (std::max)(1,ImTextCharFromUtf8(&character,cursor,visible_end));
+        }
+        wrapped.append(cursor,end);
+        cursor = end;
+        while (cursor < visible_end && (*cursor == ' ' || *cursor == '\t')) ++cursor;
+        if (cursor < visible_end && *cursor == '\n') ++cursor;
+        if (cursor < visible_end) wrapped.push_back('\n');
+    }
+    // Preserve the original ID when wrapping or changing selection state.
+    wrapped += "###";
+    wrapped += text;
+    if (selected != 0) {
+        const auto& theme = CabbirdUiTheme();
+        ImGui::PushStyleColor(ImGuiCol_Button,ThemeColor(theme.accent));
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered,ThemeColor(theme.accent_hovered));
+        ImGui::PushStyleColor(ImGuiCol_ButtonActive,ThemeColor(theme.accent_active));
+        ImGui::PushStyleColor(ImGuiCol_Text,ThemeColor(theme.inverse_text));
+    }
+    ImGui::BeginDisabled(enabled == 0);
+    const bool pressed = ImGui::Button(wrapped.c_str(),ImVec2(resolved_width,height));
+    ImGui::EndDisabled();
+    if (selected != 0) ImGui::PopStyleColor(4);
+    return enabled != 0 && pressed ? 1 : 0;
+}
+
+int CABBIRD_CALL CheckboxSquare(void*, CabbirdStringViewV1 label, int* value) {
+    if (value == nullptr) return 0;
+    const std::string text = Copy(label);
+    bool checked = *value != 0;
+    const bool changed = ImGui::Checkbox(text.c_str(), &checked);
+    *value = checked ? 1 : 0;
+    return changed ? 1 : 0;
+}
+
+int CABBIRD_CALL SliderFloatEnabled(
+    void*, CabbirdStringViewV1 label, float* value,
+    float minimum, float maximum, int enabled) {
+    if (value == nullptr || !std::isfinite(minimum) || !std::isfinite(maximum) ||
+        minimum >= maximum) return 0;
+    const std::string text = Copy(label);
+    ImGui::BeginDisabled(enabled == 0);
+    const bool changed = glass::SliderFloat(text.c_str(), value, minimum, maximum);
+    ImGui::EndDisabled();
+    return enabled != 0 && changed ? 1 : 0;
+}
+
+void CABBIRD_CALL SetNextItemWidth(void*, float width) {
+    ImGui::SetNextItemWidth(width);
+}
+
+int CABBIRD_CALL BeginChildAutoFitY(
+    void*, CabbirdStringViewV1 id, float width, float max_height) {
+    const std::string text = Copy(id);
+    const float available_height = ImGui::GetContentRegionAvail().y;
+    float height_limit = std::isfinite(available_height)
+        ? (std::max)(1.0F, available_height) : 1.0F;
+    if (std::isfinite(max_height) && max_height > 0.0F) {
+        height_limit = (std::min)(height_limit, max_height);
+    }
+    ImGui::SetNextWindowSizeConstraints(
+        ImVec2(1.0F, 1.0F),
+        ImVec2((std::numeric_limits<float>::max)(), height_limit));
+    return ImGui::BeginChild(
+        text.c_str(), ImVec2(width, 0.0F),
+        ImGuiChildFlags_Borders | ImGuiChildFlags_AutoResizeY) ? 1 : 0;
+}
+
+// Overlay calls draw on the foreground list of the main viewport in viewport-local pixels.
+ImVec2 OverlayPoint(const float x, const float y) noexcept {
+    const ImVec2 origin = ImGui::GetMainViewport()->Pos;
+    return ImVec2(origin.x + x, origin.y + y);
+}
+
+ImVec4 OverlayColor(const std::uint32_t rgba) noexcept {
+    return ImVec4(static_cast<float>(rgba & 0xffU) / 255.0F,
+        static_cast<float>((rgba >> 8U) & 0xffU) / 255.0F,
+        static_cast<float>((rgba >> 16U) & 0xffU) / 255.0F,
+        static_cast<float>((rgba >> 24U) & 0xffU) / 255.0F);
+}
+
+void CABBIRD_CALL OverlayViewportSize(void*, float* width, float* height) {
+    const ImVec2 size = ImGui::GetMainViewport()->Size;
+    if (width != nullptr) *width = size.x;
+    if (height != nullptr) *height = size.y;
+}
+
+constexpr std::size_t kGlassStyleMinimumSize =
+    offsetof(CabbirdUiGlassStyleV1, scale) + sizeof(CabbirdUiGlassStyleV1::scale);
+
+// Reads a plugin glass style. Returns false for a style the host cannot use.
+bool OverlayGlassOptions(const CabbirdUiGlassStyleV1* style, glass::SurfaceOptions& options,
+    float& opacity) noexcept {
+    if (style == nullptr || style->struct_size < kGlassStyleMinimumSize ||
+        style->variant > CABBIRD_UI_GLASS_V1_THUMB) {
+        return false;
+    }
+    options.variant = static_cast<glass::Variant>(style->variant);
+    options.rounding = (std::max)(0.0F, style->rounding);
+    options.scale = style->scale > 0.0F ? style->scale : 1.0F;
+    options.shadow = (style->flags & CABBIRD_UI_GLASS_V1_NO_SHADOW) == 0;
+    options.clip = false;
+    if ((style->tint_rgba >> 24U) != 0) options.tint = OverlayColor(style->tint_rgba);
+    options.rim = (style->flags & CABBIRD_UI_GLASS_V1_NO_RIM) == 0;
+    options.edge_feather = 1.5F;
+    if (style->struct_size >= offsetof(CabbirdUiGlassStyleV1, refraction_scale) +
+            sizeof(style->refraction_scale) &&
+        std::isfinite(style->refraction_scale) && style->refraction_scale > 0.0F) {
+        options.refraction_scale = (std::min)(style->refraction_scale, 4.0F);
+    }
+    opacity = 1.0F;
+    if (style->struct_size >= offsetof(CabbirdUiGlassStyleV1, opacity) + sizeof(style->opacity) &&
+        std::isfinite(style->opacity)) {
+        opacity = std::clamp(style->opacity, 0.0F, 1.0F);
+    }
+    return opacity > 0.0F;
+}
+
+// The surface refracts what the frame holds at this point, earlier overlay calls included.
+// The thumb only needs the sharp copy. Opacity rides on the style alpha the material reads.
+template <typename DrawFn>
+int DrawOverlayGlass(const glass::SurfaceOptions& options, const float opacity, DrawFn draw) {
+    ImDrawList* const list = ImGui::GetForegroundDrawList();
+    glass::CaptureBackdrop(list, options.variant != glass::Variant::Thumb);
+    float& alpha = ImGui::GetStyle().Alpha;
+    const float saved = alpha;
+    alpha *= opacity;
+    draw(list);
+    alpha = saved;
+    return glass::Active() ? 1 : 0;
+}
+
+int CABBIRD_CALL OverlayGlass(void*, float x, float y, float width, float height,
+    const CabbirdUiGlassStyleV1* style) {
+    glass::SurfaceOptions options;
+    float opacity{};
+    if (!OverlayGlassOptions(style, options, opacity)) return 0;
+    return DrawOverlayGlass(options, opacity, [&](ImDrawList* list) {
+        glass::DrawSurface(list, OverlayPoint(x, y), OverlayPoint(x + width, y + height), options);
+    });
+}
+
+int CABBIRD_CALL OverlayGlassRingSector(void*, float center_x, float center_y,
+    float inner_radius, float outer_radius, float angle_start, float angle_end,
+    const CabbirdUiGlassStyleV1* style) {
+    glass::SurfaceOptions options;
+    float opacity{};
+    if (!OverlayGlassOptions(style, options, opacity) || !std::isfinite(center_x) ||
+        !std::isfinite(center_y) || !std::isfinite(angle_start) || !std::isfinite(angle_end)) {
+        return 0;
+    }
+    return DrawOverlayGlass(options, opacity, [&](ImDrawList* list) {
+        glass::DrawSectorSurface(list, OverlayPoint(center_x, center_y), inner_radius,
+            outer_radius, angle_start, angle_end, options);
+    });
+}
+
+void CABBIRD_CALL OverlayRectFilled(void*, float x, float y, float width, float height,
+    std::uint32_t color, float rounding) {
+    ImGui::GetForegroundDrawList()->AddRectFilled(
+        OverlayPoint(x, y), OverlayPoint(x + width, y + height), color, rounding);
+}
+
+void CABBIRD_CALL OverlayLine(void*, float x0, float y0, float x1, float y1,
+    std::uint32_t color, float thickness) {
+    ImGui::GetForegroundDrawList()->AddLine(
+        OverlayPoint(x0, y0), OverlayPoint(x1, y1), color, thickness);
+}
+
+void CABBIRD_CALL OverlayCircle(void*, float center_x, float center_y, float radius,
+    std::uint32_t color, float thickness) {
+    ImGui::GetForegroundDrawList()->AddCircle(
+        OverlayPoint(center_x, center_y), radius, color, 0, thickness);
+}
+
+void CABBIRD_CALL OverlayRingSector(void*, float center_x, float center_y,
+    float inner_radius, float outer_radius, float angle_start, float angle_end,
+    std::uint32_t color) {
+    if (!(outer_radius > inner_radius) || !(inner_radius >= 0.0F) ||
+        !(angle_end > angle_start)) {
+        return;
+    }
+    ImDrawList* const list = ImGui::GetForegroundDrawList();
+    const ImVec2 center = OverlayPoint(center_x, center_y);
+    const int segments = (std::max)(
+        4, static_cast<int>((angle_end - angle_start) * outer_radius / 6.0F));
+    list->PathArcTo(center, outer_radius, angle_start, angle_end, segments);
+    list->PathArcTo(center, inner_radius, angle_end, angle_start, segments);
+    list->PathFillConcave(color);
+}
+
+void CABBIRD_CALL OverlayMeasureText(
+    void*, CabbirdStringViewV1 value, float font_size, float* width, float* height) {
+    ImVec2 size{};
+    if (value.data != nullptr && value.size != 0) {
+        ImFont* const font = ImGui::GetFont();
+        const float pixels = font_size > 0.0F ? font_size : ImGui::GetFontSize();
+        size = font->CalcTextSizeA(pixels, FLT_MAX, 0.0F, value.data, value.data + value.size);
+    }
+    if (width != nullptr) *width = size.x;
+    if (height != nullptr) *height = size.y;
+}
+
+void CABBIRD_CALL OverlayText(void*, float x, float y, CabbirdStringViewV1 value,
+    std::uint32_t color, float font_size) {
+    if (value.data == nullptr || value.size == 0) return;
+    ImGui::GetForegroundDrawList()->AddText(ImGui::GetFont(),
+        font_size > 0.0F ? font_size : ImGui::GetFontSize(), OverlayPoint(x, y), color,
+        value.data, value.data + value.size);
+}
+
+int CABBIRD_CALL DrawScreenPrimitives(
+    void*, const CabbirdUiScreenPrimitiveV1* primitives, const std::size_t count) {
+    constexpr std::size_t kMaximumPrimitives = 1U << 20U;
+    if (primitives == nullptr || count == 0 || count > kMaximumPrimitives)
+        return 0;
+    ImDrawList* draw_list = ImGui::GetBackgroundDrawList();
+    for (std::size_t index{}; index != count; ++index) {
+        const auto& primitive = primitives[index];
+        if (primitive.struct_size < sizeof(primitive) ||
+            !std::isfinite(primitive.x) || !std::isfinite(primitive.y) ||
+            !std::isfinite(primitive.width) || !std::isfinite(primitive.height) ||
+            !std::isfinite(primitive.thickness))
+            return 0;
+        const ImVec2 first(primitive.x, primitive.y);
+        if (primitive.kind == CABBIRD_UI_SCREEN_PRIMITIVE_V1_LINE) {
+            draw_list->AddLine(
+                first, ImVec2(primitive.width, primitive.height),
+                primitive.color_rgba,
+                primitive.thickness > 0.0F ? primitive.thickness : 1.0F);
+        } else if (primitive.kind == CABBIRD_UI_SCREEN_PRIMITIVE_V1_FILLED_RECT) {
+            draw_list->AddRectFilled(
+                first, ImVec2(first.x + primitive.width, first.y + primitive.height),
+                primitive.color_rgba);
+        } else if (primitive.kind == CABBIRD_UI_SCREEN_PRIMITIVE_V1_OUTLINE_RECT) {
+            draw_list->AddRect(
+                first, ImVec2(first.x + primitive.width, first.y + primitive.height),
+                primitive.color_rgba, 0.0F, 0,
+                primitive.thickness > 0.0F ? primitive.thickness : 1.0F);
+        } else if (primitive.kind == CABBIRD_UI_SCREEN_PRIMITIVE_V1_FILLED_CIRCLE) {
+            if (!(primitive.width > 0.0F)) return 0;
+            draw_list->AddCircleFilled(first, primitive.width, primitive.color_rgba);
+        } else if (primitive.kind == CABBIRD_UI_SCREEN_PRIMITIVE_V1_OUTLINE_CIRCLE) {
+            if (!(primitive.width > 0.0F)) return 0;
+            draw_list->AddCircle(
+                first, primitive.width, primitive.color_rgba, 0,
+                primitive.thickness > 0.0F ? primitive.thickness : 1.0F);
+        } else {
+            return 0;
+        }
+    }
+    return 1;
+}
+
 const CabbirdUiServiceV1 kUiService{
     sizeof(CabbirdUiServiceV1), CABBIRD_UI_SERVICE_V1_VERSION, nullptr,
     SetNextWindowSize, BeginWindow, EndWindow, Text, Button, DrawEntityBbox,
@@ -1105,7 +1470,11 @@ const CabbirdUiServiceV1 kUiService{
     CloseCurrentPopup, FilterMatch, FrameState,
     SetNextWindowSizeConstraints, GetWindowSize, InputUInt32, InputDouble,
     DeveloperModeEnabled, InputText, ButtonEnabled, SameLine, SetCursorPosX, TextLink,
-    BeginTabBar, BeginTabItem, EndTabItem, EndTabBar};
+    BeginTabBar, BeginTabItem, EndTabItem, EndTabBar,
+    TextWrapped, BeginChildAutoFitY, SliderFloatEnabled, SetNextItemWidth,
+    OverlayViewportSize, OverlayGlass, OverlayRectFilled, OverlayLine, OverlayCircle,
+    OverlayRingSector, OverlayMeasureText, OverlayText, OverlayGlassRingSector,
+    DrawScreenPrimitives, CheckboxSquare, ButtonSelected};
 
 }  // namespace
 
@@ -1119,6 +1488,10 @@ void SetHostUiMenusCollapsed(bool collapsed) noexcept {
 }
 
 bool HostUiMenusCollapsed() noexcept { return g_menus_collapsed.load(); }
+
+void SetHostUiAllHidden(bool hidden) noexcept { g_all_hidden.store(hidden); }
+
+bool HostUiAllHidden() noexcept { return g_all_hidden.load(); }
 
 void RequestHostUiManagementExpansion() noexcept {
     g_management_expansion_requested.store(true);
@@ -1135,7 +1508,7 @@ bool HostUiMenusCaptureMouse() noexcept {
     // when the game hides the cursor it never lands on an ImGui window, so
     // capture stays false, NoMouse is set, ImGui ignores the mouse, and
     // WantCaptureMouse can never become true again.
-    return !g_menus_collapsed.load();
+    return !g_all_hidden.load() && !g_menus_collapsed.load();
 }
 
 void SetHostUiInputCapturePolicy(const PlatformInputCapturePolicy policy) noexcept {
@@ -1169,7 +1542,7 @@ void SetHostUiCurrentWindowLocked(const bool locked) noexcept {
 }
 
 void PrepareHostUiFrame() noexcept {
-    g_apply_menu_state.Set(g_menu_state_pending.exchange(false));
+    g_apply_menu_state.Set(!g_all_hidden.load() && g_menu_state_pending.exchange(false));
     g_frame_menus_collapsed.Set(g_menus_collapsed.load());
 }
 

@@ -22,6 +22,20 @@ std::vector<std::uintptr_t> PatternService::ScanSection(
     return memory_->ScanSection(module, section_name, pattern, limit);
 }
 
+std::vector<std::uintptr_t> PatternService::ScanSection(
+    const cabbird::mem::SectionInfo& section,
+    const cabbird::mem::Pattern& pattern,
+    std::size_t limit) const {
+    return memory_->ScanSection(section, pattern, limit);
+}
+
+std::vector<std::vector<std::uintptr_t>> PatternService::ScanSectionBatch(
+    const cabbird::mem::SectionInfo& section,
+    std::span<const cabbird::mem::Pattern> patterns,
+    std::size_t limit) const {
+    return memory_->ScanSectionBatch(section, patterns, limit);
+}
+
 std::shared_ptr<const ModuleMemoryService> PatternService::Memory() const noexcept {
     return memory_;
 }

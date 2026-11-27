@@ -78,13 +78,21 @@ if (-not $projectVersion) { throw 'CMAKE_PROJECT_VERSION is missing from CMakeCa
 if ($projectVersion -ne $versionCore) {
     throw "release version $Version does not match configured project version $projectVersion"
 }
-$buildType = Read-CMakeCacheValue 'CMAKE_BUILD_TYPE'
-if ($buildType -and $buildType -ne $Configuration) {
-    throw "single-config build type $buildType does not match requested configuration $Configuration"
+$configuredRelease = Read-CMakeCacheValue 'CABBIRD_RELEASE_VERSION'
+if (-not $configuredRelease -or ($configuredRelease -creplace '^v', '') -cne $Version) {
+    throw "release version $Version does not match configured release version $configuredRelease"
 }
 $configurationTypes = Read-CMakeCacheValue 'CMAKE_CONFIGURATION_TYPES'
-if ($configurationTypes -and $Configuration -notin @($configurationTypes -split ';')) {
-    throw "configuration $Configuration is not available in this build tree"
+if ($configurationTypes) {
+    # Visual Studio ignores CMAKE_BUILD_TYPE even if a dependency populated it.
+    if ($Configuration -notin @($configurationTypes -split ';')) {
+        throw "configuration $Configuration is not available in this build tree"
+    }
+} else {
+    $buildType = Read-CMakeCacheValue 'CMAKE_BUILD_TYPE'
+    if ($buildType -and $buildType -ne $Configuration) {
+        throw "single-config build type $buildType does not match requested configuration $Configuration"
+    }
 }
 
 $cmake = 'cmake'

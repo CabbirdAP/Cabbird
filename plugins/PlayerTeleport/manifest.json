@@ -1,0 +1,85 @@
+{
+  "schemaVersion": 2,
+  "id": "cabbird.player-teleport",
+  "name": "Player Teleport",
+  "author": "Cabbird",
+  "license": "AGPL-3.0-only",
+  "version": "1.0.0",
+  "description": "Teleport the controlled player or host-classified role entities using Game-domain intents and later position verification. Coordinate, rotation, list and window settings persist across restarts.",
+  "entry": "plugin.dll",
+  "api": {
+    "major": 1,
+    "minMinor": 0,
+    "maxMinor": 0
+  },
+  "games": [
+    "ap"
+  ],
+  "builds": [
+    "ap-*"
+  ],
+  "loadPhase": "game-ready",
+  "services": [
+    {
+      "id": "cabbird.core",
+      "minVersion": 1
+    },
+    {
+      "id": "cabbird.ui",
+      "minVersion": 1
+    },
+    {
+      "id": "cabbird.unity.player",
+      "minVersion": 1,
+      "optional": true
+    },
+    {
+      "id": "cabbird.unity.player-teleport",
+      "minVersion": 1,
+      "optional": true
+    },
+    {
+      "id": "cabbird.unity.entities",
+      "minVersion": 1,
+      "optional": true
+    },
+    {
+      "id": "cabbird.unity.transform",
+      "minVersion": 1,
+      "optional": true
+    },
+    {
+      "id": "cabbird.localization",
+      "minVersion": 1
+    },
+    {
+      "id": "cabbird.config",
+      "minVersion": 1
+    },
+    {
+      "id": "cabbird.scheduler",
+      "minVersion": 1
+    },
+    {
+      "id": "cabbird.unity.il2cpp",
+      "minVersion": 1,
+      "optional": true
+    },
+    {
+      "id": "cabbird.unity.metadata",
+      "minVersion": 1,
+      "optional": true
+    }
+  ],
+  "capabilities": [
+    "ui",
+    "unity-player-snapshot",
+    "unity-player-teleport",
+    "unity-entities",
+    "unity-transform",
+    "configuration",
+    "scheduler",
+    "unity-il2cpp",
+    "unity-metadata"
+  ]
+}

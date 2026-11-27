@@ -4,7 +4,7 @@
 | --- | --- | --- |
 | `hello_ui` | C11 | ABI v1 生命周期、作用域 Window/Font/Texture/Input 查询、generation handle，以及一个宿主自有窗口 |
 | `tick_counter` | C++20 | 游戏更新回调与轻量 C++ SDK wrapper |
-| `reliable_config` | C++20 | 通过 Config ABI 的宿主自有 JSON 设置；UI 改动把状态标记为 dirty，`on_stop` 时提交 |
+| `reliable_config` | C++20 | 宿主 JSON schema、后台调度保存、停止时补存与重载恢复 |
 | `unity_entity_inspector` | C++20 | 真实的 Unity/IL2CPP 插件：读取宿主的实体源（`cabbird.unity.entities`）与本地玩家快照，并自报两个可选 Unity 服务的可用性 |
 
 上游的两个引擎交互示例（Session 事件浏览、战斗演示）**未移植**：它们依赖上游的
@@ -24,7 +24,7 @@ cmake -S . -B build `
 cmake --build build --config RelWithDebInfo
 ```
 
-四个可加载包写入 `build/packages` 下。每个包包含 `plugin.dll` 与对应的 `manifest.json`。
+四个可加载包写入 `build/packages` 下。每个包包含 `plugin.dll`、`manifest.json` 及 `locales/zh-CN.json`；C++ 示例使用 SDK Localizer，C 示例直接使用同一公开本地化服务。
 
 `unity_entity_inspector` 只声明宿主真实发布的服务：必需的 `cabbird.ui`，以及两个
 `optional: true` 的 `cabbird.unity.entities` / `cabbird.unity.player`。可选服务缺失时窗口

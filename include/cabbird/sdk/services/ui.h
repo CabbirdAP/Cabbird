@@ -1,23 +1,4 @@
-/* cabbird/sdk/services/ui.h -- the stable C facade over the host UI.
- *
- * Migrated from anomaly/sdk/services/ui.h.  Function order, flags and semantics are
- * kept identical to upstream so the two service tables can be diffed side by side
- * and so the visual result is the same: plugins never exchange C++ UI types and can
- * never restyle anything.  Every control below is drawn by the host with the host's
- * theme, which is what keeps plugin UIs looking like the host UI.
- *
- * Draw callbacks are valid only during the current on_draw callback unless a
- * function is documented otherwise.
- *
- * UNITY-SPECIFIC NOTE: the ESP/box functions were written against a UE5 world-space
- * camera.  They are engine-agnostic in shape -- a camera (position + rotation + fov)
- * and an axis-aligned box in world space -- so the Unity side supplies Unity's
- * Camera transform instead.  Unity is left-handed with Y up and -Z forward; the
- * convention is stated here rather than assumed, because getting it wrong silently
- * mirrors every box on screen.
- */
 #pragma once
-
 #include "cabbird/sdk/base.h"
 
 #define CABBIRD_UI_SERVICE_V1_ID "cabbird.ui"
@@ -35,20 +16,6 @@ typedef enum CabbirdEspBoxFlagsV1 {
     CABBIRD_ESP_BOX_V1_OUTLINE = 1u << 0u
 } CabbirdEspBoxFlagsV1;
 
-/* Unity convention: right-handed is NOT used here.  `position` is
- * Transform.position, `rotation` is euler angles in degrees (Transform.eulerAngles),
- * and forward is +Z.  `horizontal_fov_degrees` is Camera.fieldOfView for the
- * horizontal axis as the game computes it.
- *
- * SIGN WARNING -- read this before porting an ESP from a UE title.  In Unity a POSITIVE
- * rotation[0] (eulerAngles.x) pitches the camera DOWN, because Unity is left-handed and a
- * positive rotation about +X carries forward (+Z) toward -Y.  UE5's positive pitch means
- * the opposite.  Supplying UE-style angles here therefore produces a vertically mirrored
- * overlay that looks like a projection bug, and the sign is the whole cause.  The host's
- * projection is written for Unity's convention; a UE-style angle is a bug, not a variant.
- *
- * rotation[1] (eulerAngles.y) is yaw and behaves as expected: +90 turns forward from +Z
- * to +X.  rotation[2] is roll and does not affect which way is forward. */
 typedef struct CabbirdEspCameraV1 {
     uint32_t struct_size;
     uint32_t flags;
@@ -74,6 +41,30 @@ typedef struct CabbirdEspBoxStyleV1 {
     float outline_thickness;
 } CabbirdEspBoxStyleV1;
 
+typedef enum CabbirdUiScreenPrimitiveKindV1 {
+    CABBIRD_UI_SCREEN_PRIMITIVE_V1_LINE = 1,
+    CABBIRD_UI_SCREEN_PRIMITIVE_V1_FILLED_RECT = 2,
+    CABBIRD_UI_SCREEN_PRIMITIVE_V1_OUTLINE_RECT = 3,
+    CABBIRD_UI_SCREEN_PRIMITIVE_V1_FILLED_CIRCLE = 4,
+    CABBIRD_UI_SCREEN_PRIMITIVE_V1_OUTLINE_CIRCLE = 5
+} CabbirdUiScreenPrimitiveKindV1;
+
+// Batched screen-space game-overlay primitive. It is drawn behind host plugin
+// windows, matching the old AHUD overlay ordering. For LINE, x/y and
+// width/height are the two endpoints. For RECT, x/y is the top-left and
+// width/height is the size. For CIRCLE, x/y is the centre and width is the
+// radius. thickness applies to lines and outlined shapes.
+typedef struct CabbirdUiScreenPrimitiveV1 {
+    uint32_t struct_size;
+    uint32_t kind;
+    uint32_t color_rgba;
+    float x;
+    float y;
+    float width;
+    float height;
+    float thickness;
+} CabbirdUiScreenPrimitiveV1;
+
 typedef enum CabbirdUiFrameStateV1 {
     CABBIRD_UI_FRAME_V1_NONE = 0,
     CABBIRD_UI_FRAME_V1_ITEM_HOVERED = 1u << 0u,
@@ -86,13 +77,22 @@ typedef enum CabbirdUiFrameStateV1 {
 
 typedef enum CabbirdUiTextInputFlagsV1 {
     CABBIRD_UI_TEXT_INPUT_V1_NONE = 0,
-    CABBIRD_UI_TEXT_INPUT_V1_DIGITS = 1u << 0u
+    CABBIRD_UI_TEXT_INPUT_V1_DIGITS = 1u << 0u,
+    // Mask secret fields without changing the contents of the input buffer.
+    CABBIRD_UI_TEXT_INPUT_V1_PASSWORD = 1u << 1u
 } CabbirdUiTextInputFlagsV1;
 
 typedef enum CabbirdUiTableFlagsV1 {
     CABBIRD_UI_TABLE_V1_NONE = 0,
-    CABBIRD_UI_TABLE_V1_SIZING_FIXED_FIT = 1u << 0u
+    CABBIRD_UI_TABLE_V1_SIZING_FIXED_FIT = 1u << 0u,
+    CABBIRD_UI_TABLE_V1_SIZING_STRETCH_PROP = 1u << 1u
 } CabbirdUiTableFlagsV1;
+
+// Child flags retain the native flag values accepted by begin_child.
+typedef enum CabbirdUiChildFlagsV1 {
+    CABBIRD_UI_CHILD_V1_NONE = 0,
+    CABBIRD_UI_CHILD_V1_AUTO_RESIZE_Y = 1u << 5u
+} CabbirdUiChildFlagsV1;
 
 typedef enum CabbirdUiTabBarFlagsV1 {
     CABBIRD_UI_TAB_BAR_V1_NONE = 0,
@@ -113,6 +113,41 @@ typedef enum CabbirdUiTabItemFlagsV1 {
     CABBIRD_UI_TAB_ITEM_V1_NO_TOOLTIP = 1u << 4u
 } CabbirdUiTabItemFlagsV1;
 
+typedef enum CabbirdUiGlassVariantV1 {
+    // Floating panels, toasts and menus: blurred, lightly tinted, refracting rim.
+    CABBIRD_UI_GLASS_V1_REGULAR = 0,
+    // Highly translucent and sharp.
+    CABBIRD_UI_GLASS_V1_CLEAR = 1,
+    // Thick frosted material without a lens.
+    CABBIRD_UI_GLASS_V1_MATERIAL = 2,
+    // Unblurred magnifying droplet for a selection; draw it before the label it carries.
+    CABBIRD_UI_GLASS_V1_THUMB = 3
+} CabbirdUiGlassVariantV1;
+
+typedef enum CabbirdUiGlassFlagsV1 {
+    CABBIRD_UI_GLASS_V1_NONE = 0,
+    CABBIRD_UI_GLASS_V1_NO_SHADOW = 1u << 0u,
+    // Drops the specular rim line and the contact hairline, leaving an edge drawn by
+    // refraction and shading alone.
+    CABBIRD_UI_GLASS_V1_NO_RIM = 1u << 1u
+} CabbirdUiGlassFlagsV1;
+
+// struct_size must be set. A tint_rgba alpha of zero keeps the variant's own tint.
+// Fields past `scale` are optional and read only when struct_size covers them.
+typedef struct CabbirdUiGlassStyleV1 {
+    uint32_t struct_size;
+    uint32_t flags;      // CabbirdUiGlassFlagsV1
+    uint32_t variant;    // CabbirdUiGlassVariantV1
+    uint32_t tint_rgba;
+    float rounding;
+    float scale;         // <= 0 uses 1
+    float opacity;       // 0..1 fades the whole surface; absent means 1
+    float refraction_scale;  // multiplies how far the edge bends the backdrop; <= 0 or absent means 1
+} CabbirdUiGlassStyleV1;
+
+// Stable C facade over the host UI implementation. Plugins never exchange C++ UI types.
+// Window and widget calls are valid only during on_draw. draw_screen_primitives
+// is also valid during on_overlay.
 typedef struct CabbirdUiServiceV1 {
     uint32_t struct_size;
     uint32_t service_version;
@@ -173,10 +208,10 @@ typedef struct CabbirdUiServiceV1 {
     int (CABBIRD_CALL *input_double)(
         void* user, CabbirdStringViewV1 label, double* value,
         double step, double step_fast);
-    /* Valid during on_draw and on_update. */
+    // Valid during on_draw and on_update.
     int (CABBIRD_CALL *developer_mode_enabled)(void* user);
-    /* The buffer is plugin-owned, must have capacity for a trailing null, and is
-     * accessed only during the current on_draw callback. */
+    // The buffer is plugin-owned, must have capacity for a trailing null, and is
+    // accessed only during the current on_draw callback.
     int (CABBIRD_CALL *input_text)(
         void* user, CabbirdStringViewV1 label, char* buffer,
         size_t buffer_capacity, uint32_t flags);
@@ -186,12 +221,12 @@ typedef struct CabbirdUiServiceV1 {
     void (CABBIRD_CALL *same_line)(
         void* user, float offset_from_start_x, float spacing);
     void (CABBIRD_CALL *set_cursor_pos_x)(void* user, float local_x);
-    /* Displays a text link and queues a host-owned browser launch when it is
-     * left-clicked. The URL must use the http:// or https:// scheme. */
+    // Displays a text link and queues a host-owned browser launch when it is
+    // left-clicked. The URL must use the http:// or https:// scheme.
     int (CABBIRD_CALL *text_link)(
         void* user, CabbirdStringViewV1 label, CabbirdStringViewV1 url);
-    /* Tab containers are scoped like begin_table/begin_menu. The matching
-     * end function is required only when the begin function returns non-zero. */
+    // Tab containers are scoped like begin_table/begin_menu. The matching
+    // end function is required only when the begin function returns non-zero.
     int (CABBIRD_CALL *begin_tab_bar)(
         void* user, CabbirdStringViewV1 id, uint32_t flags);
     int (CABBIRD_CALL *begin_tab_item)(
@@ -199,14 +234,66 @@ typedef struct CabbirdUiServiceV1 {
         uint32_t flags, int enabled);
     void (CABBIRD_CALL *end_tab_item)(void* user);
     void (CABBIRD_CALL *end_tab_bar)(void* user);
-    /* Populates an ImGui-style combo.  Added by Cabbird: UE5 plugin UIs mostly used
-     * free-text fields for enum selection, but the Unity target's gameplay values
-     * (graphics tier, language, scene ids) are enumerated and a combo is the
-     * control users expect.  Appended at the end so the upstream prefix stays
-     * byte-identical. */
-    int (CABBIRD_CALL *combo)(
-        void* user, CabbirdStringViewV1 label, int* current_index,
-        const CabbirdStringViewV1* items, int32_t item_count);
+    // Uses the current Cabbird UI font and wraps text against the available content width.
+    void (CABBIRD_CALL *text_wrapped)(void* user, CabbirdStringViewV1 text);
+    // Fits the child height to its content, capped by the remaining parent area (or max_height).
+    // A max_height of zero uses the parent's available content height.
+    int (CABBIRD_CALL *begin_child_auto_fit_y)(
+        void* user, CabbirdStringViewV1 id, float width, float max_height);
+    // Optional append-only API: renders the same slider but disables interaction when enabled == 0.
+    int (CABBIRD_CALL *slider_float_enabled)(
+        void* user, CabbirdStringViewV1 label, float* value,
+        float minimum, float maximum, int enabled);
+    // Width for the next input/slider only; negative values reserve space at the right edge.
+    // A width of -1 fills the remaining content width, leaving one pixel.
+    void (CABBIRD_CALL *set_next_item_width)(void* user, float width);
+    // Optional append-only overlay API. Overlay calls draw on the foreground of the main
+    // viewport, above every window, in viewport pixels with the origin at its top left.
+    // They are valid only during on_draw and need no window. Angles are radians, 0 points
+    // right and positive angles turn clockwise (screen Y grows downward).
+    void (CABBIRD_CALL *overlay_viewport_size)(void* user, float* width, float* height);
+    // Draws the host liquid glass material and returns 1, or draws the host's solid fallback
+    // and returns 0 when the glass renderer is unavailable or Reduce Transparency is on.
+    // A rounding of half the shorter side makes a disc or capsule.
+    int (CABBIRD_CALL *overlay_glass)(
+        void* user, float x, float y, float width, float height,
+        const CabbirdUiGlassStyleV1* style);
+    void (CABBIRD_CALL *overlay_rect_filled)(
+        void* user, float x, float y, float width, float height,
+        uint32_t color_rgba, float rounding);
+    void (CABBIRD_CALL *overlay_line)(
+        void* user, float x0, float y0, float x1, float y1,
+        uint32_t color_rgba, float thickness);
+    void (CABBIRD_CALL *overlay_circle)(
+        void* user, float center_x, float center_y, float radius,
+        uint32_t color_rgba, float thickness);
+    // Fills the band between inner_radius and outer_radius from angle_start to angle_end.
+    void (CABBIRD_CALL *overlay_ring_sector)(
+        void* user, float center_x, float center_y, float inner_radius, float outer_radius,
+        float angle_start, float angle_end, uint32_t color_rgba);
+    // A font_size of zero uses the current Cabbird UI font size.
+    void (CABBIRD_CALL *overlay_measure_text)(
+        void* user, CabbirdStringViewV1 text, float font_size, float* width, float* height);
+    void (CABBIRD_CALL *overlay_text)(
+        void* user, float x, float y, CabbirdStringViewV1 text,
+        uint32_t color_rgba, float font_size);
+    // Liquid glass shaped as a ring sector; returns like overlay_glass. The span
+    // angle_end - angle_start must be greater than 0 and less than pi. style->rounding
+    // rounds the four corners and is capped at half the band thickness.
+    int (CABBIRD_CALL *overlay_glass_ring_sector)(
+        void* user, float center_x, float center_y, float inner_radius, float outer_radius,
+        float angle_start, float angle_end, const CabbirdUiGlassStyleV1* style);
+    // Appends a batch below host plugin windows. Valid only during on_draw.
+    int (CABBIRD_CALL *draw_screen_primitives)(
+        void* user, const CabbirdUiScreenPrimitiveV1* primitives,
+        size_t count);
+    // Optional on_draw widget. Draws a square check box and returns 1 when value changes.
+    int (CABBIRD_CALL *checkbox_square)(void* user, CabbirdStringViewV1 label, int* value);
+    // Optional on_draw button. Selection uses the host accent and contrasting
+    // text; labels wrap within the resolved width. Zero height fits the label.
+    int (CABBIRD_CALL *button_selected)(
+        void* user, CabbirdStringViewV1 label, float width, float height,
+        int selected, int enabled);
 } CabbirdUiServiceV1;
 
 #ifdef __cplusplus

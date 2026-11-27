@@ -1,0 +1,98 @@
+{
+  "schemaVersion": 2,
+  "id": "cabbird.collectibles",
+  "name": "Collectibles",
+  "author": "Cabbird",
+  "license": "AGPL-3.0-only",
+  "version": "1.0.0",
+  "description": "Scans collectible locations on the prepared map, teleports and invokes supported native collection interactions. Confirms collection only after a matching native server reward response.",
+  "entry": "plugin.dll",
+  "api": {
+    "major": 1,
+    "minMinor": 0,
+    "maxMinor": 0
+  },
+  "games": [
+    "ap"
+  ],
+  "builds": [
+    "ap-*"
+  ],
+  "loadPhase": "game-ready",
+  "services": [
+    {
+      "id": "cabbird.core",
+      "minVersion": 1
+    },
+    {
+      "id": "cabbird.ui",
+      "minVersion": 1
+    },
+    {
+      "id": "cabbird.window",
+      "minVersion": 1
+    },
+    {
+      "id": "cabbird.config",
+      "minVersion": 1
+    },
+    {
+      "id": "cabbird.scheduler",
+      "minVersion": 1
+    },
+    {
+      "id": "cabbird.profile",
+      "minVersion": 1
+    },
+    {
+      "id": "cabbird.json",
+      "minVersion": 1
+    },
+    {
+      "id": "cabbird.unity.il2cpp",
+      "minVersion": 1
+    },
+    {
+      "id": "cabbird.unity.metadata",
+      "minVersion": 1
+    },
+    {
+      "id": "cabbird.unity.player",
+      "minVersion": 1
+    },
+    {
+      "id": "cabbird.unity.player-teleport",
+      "minVersion": 1
+    },
+    {
+      "id": "cabbird.localization",
+      "minVersion": 1
+    },
+    {
+      "id": "cabbird.game-lifecycle",
+      "minVersion": 1
+    },
+    {
+      "id": "cabbird.unity.player-motion",
+      "minVersion": 1
+    },
+    {
+      "id": "cabbird.interop.hook",
+      "minVersion": 1
+    }
+  ],
+  "capabilities": [
+    "ui",
+    "ui-window",
+    "configuration",
+    "scheduler",
+    "memory-read",
+    "json",
+    "unity-il2cpp",
+    "unity-metadata",
+    "unity-player-snapshot",
+    "unity-player-teleport",
+    "unity-player-motion",
+    "interop-hook"
+  ]
+}

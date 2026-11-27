@@ -30,24 +30,13 @@ class PluginManager;
 // supports for incomplete types at the point of declaration.
 class DispatchTickHook;
 
-// How often each snapshot is allowed to re-read the game, in game ticks.  1 = every tick.
-//
-// THE ENTITY DIVISOR IS THE FRAME-RATE CONTROL.  The entity walk costs ~213 ms of the game
-// thread per tick, unthrottled, and it is the single most expensive thing this process does to
-// the game -- so it runs once every `entity_tick_interval` ticks.  What that divisor does and
-// does not age is stated at the gate in `RefreshUnityEntityEsp`: the camera and the projected
-// box corners are refreshed EVERY tick, and only the entity set and the entity world positions
-// are sampled at the divisor.  A box therefore never lags the camera; only a moving entity's
-// position can be up to `entity_tick_interval - 1` ticks old.
-//
-// The other two are carried from the sibling project's options and have no consumer here yet:
-// the player snapshot is a handful of field reads on the same tick as the walk, and this port's
-// entity walk already covers what upstream split into an "actor" cadence.  Kept as declared data
-// rather than deleted so the shape matches upstream's; nothing reads them.
+// Demand-driven sampling intervals in game ticks; 1 samples every active tick.
+// Entity cadence controls set/class/label bookkeeping. The camera, direct positions
+// and projected boxes remain current on each active tick. Player cadence is independent,
+// and the first newly requested player snapshot is always sampled immediately.
 struct UnitySnapshotSamplingOptions {
     std::uint32_t player_tick_interval{1};
     std::uint32_t entity_tick_interval{1};
-    std::uint32_t actor_tick_interval{60};
     // Whether the entity walk may call `UnityEngine.Transform::get_position`'s compiled body
     // directly instead of going through `il2cpp_runtime_invoke`.
     //
@@ -61,6 +50,7 @@ struct UnitySnapshotSamplingOptions {
 class UnityAdapter final {
 public:
     using TickCallback = std::function<void(double)>;
+    using GameDispatcherPump = std::function<std::size_t()>;
 
     /* The only constructor, and it takes exactly what a frame clock needs: the per-build
      * address profile and the plugin manager the frames drive.
@@ -147,6 +137,9 @@ public:
     bool Stop(
         std::chrono::milliseconds timeout = std::chrono::seconds(5)) noexcept;
     void SetTickCallback(TickCallback callback);
+    // Runtime-owned Game dispatcher admission; independent of UI callbacks and
+    // retained until the profile/adapter stops, including plugin Game cleanup.
+    void SetGameDispatcherPump(GameDispatcherPump pump);
     // Removes the callback immediately, then waits for already-entered game
     // ticks. A finite timeout returns false while the callback is still in
     // flight; the callback has nevertheless been detached and will not be

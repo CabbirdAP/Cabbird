@@ -72,14 +72,18 @@ public:
         std::string signature;
         std::uint64_t rva{};
         std::vector<unsigned char> prologue;
+        int parameter_count{};
+        std::string return_type;
+        std::vector<std::string> parameter_types;
+        bool is_static{};
     };
 
     // Parses the profile document.  Does not touch the game; resolution is per call.
     [[nodiscard]] static UnityBuildProfile LoadFromFile(
         const std::filesystem::path& path, std::string* error);
 
-    // The profile to use: the newest entry, chosen by `id`, or the only one present.  A
-    // separate entry point so the selection rule is testable without a running game.
+    // Select an explicit build id from the document. With no preference, the first
+    // listed profile is the package default. Entries retain their declared priority.
     [[nodiscard]] static UnityBuildProfile Select(
         const std::filesystem::path& path, std::string_view preferred_id, std::string* error);
 
@@ -92,7 +96,11 @@ public:
 
     // Resolve one named method.  `key` is the profile's method key, e.g.
     // "unity.playerloop.dispatch".
+    // Offline prepared RVA + executable entry-byte validation only. This can
+    // bootstrap the frame clock without invoking managed APIs on Lifecycle.
     [[nodiscard]] UnityResolvedMethod Resolve(std::string_view key) const;
+    // Active Game domain only: match the complete metadata method shape first.
+    [[nodiscard]] UnityResolvedMethod ResolveInGame(std::string_view key) const;
 
     // Names of every method this profile knows, for diagnostics.
     [[nodiscard]] std::vector<std::string> MethodKeys() const;
@@ -115,6 +123,10 @@ private:
         std::string signature;
         std::uint64_t rva{};
         std::vector<unsigned char> prologue;
+        int parameter_count{};
+        std::string return_type;
+        std::vector<std::string> parameter_types;
+        bool is_static{};
     };
 
     bool valid_{};

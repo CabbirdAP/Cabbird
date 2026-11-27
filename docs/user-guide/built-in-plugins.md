@@ -1,120 +1,200 @@
 # 内建插件
 
-随运行包提供的插件都在 `plugins/` 下，每个是一目录一 manifest。
-**默认全部关闭**，启用状态在 `Cabbird\config\plugin-enablement.json`（热加载）。
+运行包提供十二个独立插件包，发行版本统一为 `1.0.0`，默认全部停用。先在插件管理器中加载插件；窗口内另有“启用”开关的功能，还需打开该开关。
+关闭窗口不会停用插件，停止或卸载请使用插件管理器。
 
-| 插件 | 插件 id | 版本 | 需要宿主提供 | 一句话 |
-|---|---|---|---|---|
-| [Entity Overlay](#entity-overlay) | `cabbird.entity-overlay` | 0.1.31 | `cabbird.ui`（必需） | 消费实体快照，画框和标签 |
-| [IL2CPP Dump](#il2cpp-dump) | `cabbird.unity-dump` | 0.1.0 | `cabbird.ui`（必需） | 按需把活体类型系统写进文件 |
-| [Player Coordinates](#player-coordinates) | `cabbird.player-coords` | 0.1.0 | `cabbird.ui`（必需） | 只读玩家坐标 |
-| [Player Teleport](#player-teleport) | `cabbird.player-teleport` | 0.3.0 | `cabbird.ui`（必需） | 把玩家或指定角色移到坐标 |
-| [FakeUID](#fakeuid) | `cabbird.fake-uid` | 0.1.0 | `cabbird.ui`、`cabbird.scheduler` | 只改本地 HUD 的 UID 文本 |
-| [Damage Replay](#damage-replay) | `cabbird.damage-replay` | 0.3.0 | `cabbird.ui`、`cabbird.interop.hook` | 把游戏自己的伤害入口再调用 N 次 |
-| [Entity Teleport](#entity-teleport) | `cabbird.entity-teleport` | 0.1.0 | `cabbird.ui` | 把**任意**实体搬到玩家身边/坐标 |
+| 插件 | 插件 ID | 功能 |
+| --- | --- | --- |
+| Entity Overlay | `cabbird.entity-overlay` | 实体框、标签、分类与距离筛选 |
+| IL2CPP Dump | `cabbird.unity-dump` | 按需导出 IL2CPP 类型资料与明文 metadata |
+| Player Coordinates | `cabbird.player-coords` | 读取玩家坐标、持续或手动刷新 |
+| Player Teleport | `cabbird.player-teleport` | 移动当前受控玩家或列表中的其他角色 |
+| FakeUID | `cabbird.fake-uid` | 替换本地 UID 水印文本 |
+| Damage Multiplier（倍攻） | `cabbird.damage-replay` | 重放当前受控玩家发起的伤害 |
+| Entity Teleport | `cabbird.entity-teleport` | 筛选实体、指定坐标或带到玩家身边 |
+| Move Speed | `cabbird.move-speed` | 角色及坐骑移动倍率、飞行坐骑升降倍率 |
+| Story Tools | `cabbird.story-tools` | 剧情跳过、自动播放与播放速度 |
+| Free Flight | `cabbird.free-flight` | 镜头方向自由移动、升降与悬停 |
+| God Mode | `cabbird.god-mode` | 当前受控英雄的游戏原生无敌效果 |
+| Collectibles | `cabbird.collectibles` | 扫描当前大地图，逐个传送并交互收集 |
 
-「需要宿主提供」这一列来自各插件的 `manifest.json`。标注为可选的服务缺失时，
-插件**照常加载**并把该项显示为 unavailable，而不是从列表里消失——这是有意的降级设计。
+## 设置保存
 
-> [!IMPORTANT]
-> 本页描述的窗口与行为来自插件自己的 `manifest.json`、`plugin.cpp` 与 `locales/`。
-> 游戏内效果受当前游戏 build 与 Profile 绑定状态影响：功能不可用时窗口会显示原因，
-> 这属于**预期降级**。
+插件管理器的加载开关保存在 `Cabbird/config/plugin-enablement.json`。
+各插件自己的设置保存在 `Cabbird/config/plugins/<插件 ID>/`，文件如下：
 
----
+| 插件 | 配置文件 |
+| --- | --- |
+| Entity Overlay | `config-entity-overlay-settings.json` |
+| IL2CPP Dump | `config-unity-dump-settings.json` |
+| Player Coordinates | `config-player-coordinates-settings.json` |
+| Player Teleport | `config-player-teleport-settings.json` |
+| FakeUID | `config-fake-uid-settings-v1.json` |
+| Damage Multiplier（倍攻） | `config-damage-replay-settings.json` |
+| Entity Teleport | `config-entity-teleport-settings.json` |
+| Move Speed | `config-movement-settings.json` |
+| Story Tools | `config-settings.json` |
+| Free Flight | `config-free-flight-settings.json` |
+| Collectibles | `config-settings.json` |
+
+下列各节列出的设置在加载插件时恢复，编辑后由后台 Worker 保存，停止时补存尚未落盘的改动。
+旧格式不自动迁移；与当前配置格式不符时使用默认值，修改后按新格式保存。
+例如 Move Speed 的完整路径为
+`Cabbird/config/plugins/cabbird.move-speed/config-movement-settings.json`。
+Player Coordinates、Story Tools、FakeUID、IL2CPP Dump、Move Speed、Free Flight 和 Collectibles 使用宿主管理的窗口，其位置、尺寸与开合状态另存于
+`Cabbird/state/ui-window-state.json`。
+当前实体、列表选择、运行计数和排队中的游戏操作不保存，也不会在下次加载时重复执行。
+插件窗口只展示功能控件与业务数据。诊断说明和运行统计不显示在窗口底部；实际失败按事件或状态变化写入日志，正常等待和持续运行不刷日志。
 
 ## Entity Overlay
 
-- 消费 `cabbird.unity.entities` 的实体快照，通过 `cabbird.unity.overlay` 画包围盒与标签。
-- 两个服务都是 `optional`：overlay 后端未发布时它加载、显示 `overlay: unavailable` 并**什么都不画**；
-  entities 后端在未绑定 Profile 的 build 上是 `UNAVAILABLE`。
-- 窗口里有 `players` 过滤开关和按类别的颜色编辑。
-- 加载时用 `bcrypt` 对自己映射进来的映像做哈希（构建期链接 `bcrypt`），
-  这样「我换掉的那个文件就是正在跑的代码」是可核对的，而不是假设。
+显示宿主实体快照中的框和标签，可分别筛选未分类、玩家、怪物、NPC 和世界实体。
+距离以相机为参照，最大距离为 0 时不设上限；相机或实体快照不可用时不绘制无效位置。
+
+保存项：绘制开关、框与标签开关、隐藏无名实体、显示本地玩家、五类实体筛选、距离上下限、
+线宽、标签字号、各类框颜色、文字颜色及窗口尺寸。
 
 ## IL2CPP Dump
 
-- 让使用者**按需**跑一次活体类型系统遍历：哪个 image、哪些 walk、文件落在哪里。
-- 遍历本身在宿主侧（`cabbird.unity.dump`），插件只持有请求与输出位置，因此可以热重载。
-- 可选 walk 包括方法（含签名与 RVA）、属性、接口；**这些 walk 会强制懒类初始化**，
-  与纯字段读取不同，历史上曾触发过访问违例，所以默认关闭、建议逐个打开。
-- 产出格式与文件位置见插件窗口与宿主日志。
+随运行包分发，仅在开发者模式下显示。
+
+选择导出字段、方法或恢复明文 metadata，点击“立即导出”；“仅导出元数据”可单独请求后者。
+程序集筛选留空时包含所有已加载程序集。宿主在 Game 线程采集类型资料，后台 Worker 格式化并写入文件，
+导出失败或结果不完整的原因写入宿主日志，窗口只保留导出选项与操作。
+
+默认输出为 `C:\AzurPromilia-dump.cs` 和 `C:\global-metadata.decrypted.dat`。
+保存项：字段与方法开关、metadata 恢复开关、程序集筛选、两个输出路径及窗口尺寸。
 
 ## Player Coordinates
 
-- 从 `cabbird.unity.player` 读本地玩家世界坐标并记录读数。
-- **按构造只读**：manifest 里没有写 capability；读不到时显示 `--`，不会显示 `(0,0,0)`。
-- 窗口里显示 `entity id` / `generation` 与最近读数。
+显示当前受控玩家的世界坐标，并区分实际位置与包围盒中心。可持续刷新，也可暂停后手动读取；
+玩家或场景失效后会清除旧读数，不会将原点显示为有效坐标。
+
+插件配置仅保存持续刷新开关。窗口的尺寸、位置和开合由宿主持久化；
+点击窗口右上角的关闭按钮可隐藏窗口，在插件管理页可重新打开。
 
 ## Player Teleport
 
-- 把本地玩家移到输入的坐标；另外为**每一个保留的非当前角色实体**提供一个槽位。
-- 本地玩家写走 `cabbird.unity.player-teleport`；隐藏角色写走 `cabbird.unity.transform`，
-  两者都**只在游戏线程**执行。
-- 保留角色列表是**按需扫描**（或可选的 5 秒节奏），而不是每秒四次——每次扫描都会让宿主的
-  实体遍历在游戏线程上活着。
-- 判决不是二元的：写请求被接受只表示「已排队」，窗口区分 `OK` / `REVERTED`（调用生效但被
-  游戏自己的移动状态机放回原处）/ `REFUSED`。
+输入世界坐标或相对偏移，可同时指定欧拉角。当前受控玩家使用专用玩家传送服务；
+其他角色从角色列表选择，列表按玩家类别识别，不靠名称猜测。列表默认按需刷新，可开启每五秒跟踪。
 
-**说明**：判决不是二元的，窗口区分 `OK` / `REVERTED` / `REFUSED`，以实际显示为准。
+保存项：相对模式、位置、是否设置旋转、欧拉角、角色跟踪、分页与每页数量及窗口尺寸。
+请求携带坐标和身份，由 Game 线程重新确认当前玩家、场景和目标；相对偏移基于执行时的实际位置。
+结果经后续帧复测，区分位置保持、被游戏移回、身份失效取消和拒绝，提交请求本身不表示传送成功。
 
 ## FakeUID
 
-- 只替换本地 HUD 的 UID 文本，**不改账号数据或网络请求**。
-- `Original UID` 从游戏的水印控件读回；`Display UID` 输入替换文本后 `Apply`；
-  `Hide UID prefix` 只隐藏同一个文本控件里的前缀；`Revert to original` 还原。
-- 支持 1–256 个 Unicode 字符的单行输入；拒绝控制字符与 `<`、`>`（避免 TMP 富文本标签）。
-- 该游戏运行时**没有**可用的 `Assembly-CSharp.dll`，所以它在全部已加载 image 里按完整命名空间
-  与类名查找 `Lens.Gameplay.UI.Watermark.ModuleNetworkInfoView`，通过运行时解析字段，
-  不使用 dump 里的固定偏移。
-- 所有 Unity 调用都在 `on_update` 的 `with_runtime` 回调内；`on_stop` 不调用 UI setter，
-  所以停用只保证停止修改，不保证立刻恢复屏幕上已画出的内容——需要立刻恢复就先 `Revert`。
+修改本地水印的 TextMeshPro 文本，不更改账号 UID 或网络数据。显示 UID 接受 1–256 个单行字符，
+不能包含控制字符或 `<`、`>`。输入文字、选择是否隐藏前缀，
+点击“应用”启用；“还原原始值”关闭替换。仅接管与当前游戏身份匹配的 UID 水印，
+游戏线程更新文字后会读回检查。启用期间编辑有效文本或前缀选项会即时应用。
 
-**说明**：UID 的读回与替换都依赖游戏当前 build 的控件路径，换 build 后可能需要重新确认。
+保存项：替换启用状态、显示 UID、隐藏前缀及窗口尺寸。有效输入和窗口尺寸变化会后台保存。
+停止插件时通过 Game 线程恢复仍由插件替换的水印文字，再释放对象引用。
 
-## Damage Replay
+## 倍攻（Damage Multiplier）
 
-- **再调用一次游戏自己的伤害入口 N 次**，不是倍率：不自己造伤害数字，也不缩放游戏算出来的值。
-  目标固定为 `AliveElementSystem.OnExecuteDamageElement`（本机 build RVA `0x59E4510`）——
-  它是驱动一次命中整条伤害管线的 void 外层入口，所以可以安全地再跑一遍。
-- 必需服务是 `cabbird.ui` 与 `cabbird.interop.hook`：一个以 hook 为目的的插件在没有 hook 服务的
-  宿主上没有可提供的东西，所以那种宿主应当**阻塞**它，而不是加载一个全是死控件的窗口。
-- **方向过滤**：该入口对世界里每个伤害元素都会跑（玩家、怪、宠物、持续伤害）。插件读元素上的
-  `p_sourcePlayerEntityID`（`+0x54`，非 0 = 玩家发起），只重放玩家发起的伤害；传入伤害原样放行一次
-  并计入 `refused`。读不到就按「非玩家」处理——少一次重放，好过被怪打死。
-- 窗口里只有四样东西：启用 checkbox、重放次数（1..1024，默认 10）、三个计数器
-  （调用 / 重放 / 已拒绝传入）、状态行。次数改了**下一次命中就生效**，不用关掉再打开开关。
-- 持久化用 `cabbird.storage` 的相对路径 `damage-replay.txt`（内容只有 `replay_count=<整数>`），
-  且只在插件停止时写一次。
+通过游戏完整伤害流程重放当前受控玩家的普通伤害，不修改原始伤害数值。
+界面只有启用和每次命中的总调用次数（1–1024，默认 10）；1 只保留原调用。
+持续伤害等未校验元素类型、外来来源和玩家自身受到的伤害只执行原调用。
 
-**已知限制**（摘自插件自身文档）：计数器是**调用计数器**，能证明 hook 在跑、传入伤害被拦下，
-**不能**证明伤害真的打出去了——伤害元素不携带受击者指针，所以插件看不到目标 HP，唯一证据是血条；
-目标 RVA 与当前游戏 build 绑定，游戏更新后需要重新确认。
+原伤害调用恰好一次。每份额外伤害都使用游戏对象池租借、游戏复制方法生成的新 uniqueId 与独立池身份，
+并保留当前碰撞、暴击随机值和攻击者位置输入；每次消费前先准备下一份，最多同时持有两份未消费副本。
+不会重用已经执行结束的元素，也不通过直接改 HP 或只制造飘字实现效果。受控玩家、接收者或副本生命周期变化时停止额外调用，
+已提交副本由游戏正常元素列表负责回收。兼容资料和元数据任一失配即停止绑定，元数据就绪后自动重试。
 
-> [!NOTE]
-> 这个插件的窗口标题保持英文 `Damage Replay`（它是窗口身份，宿主按标题持久化可见性），
-> 窗口内文字走本地化。当前身份：`manifest.json` 的 `cabbird.damage-replay` /
-> `CMakeLists.txt` 的 `cabbird_damage_replay` 目标。
+启用与次数仍通过 `damage-replay-settings` schema 1 保存为 `enabled`/`replayCount`，Worker 落盘、停止补写、加载恢复。
+关闭窗口不关闭功能，可从管理页重新打开。窗口不显示说明、状态和统计；正常等待安静，真实故障分类去重写日志。
+停止会撤销 Hook、排空回调并释放 RuntimeType 的 GC handle。原生回归不代表当前游戏或服务器已经接受额外伤害。
 
 ## Entity Teleport
 
-- 把**任意**实体搬到本地玩家处、放到输入的坐标、或从当前位置做偏移；它是
-  `cabbird.unity.entities`（哪个实体、它的数据地址）与 `cabbird.unity.transform`
-  （解析并读写 Transform）的组合。
-- 写发生在宿主游戏线程，几个 tick 后重新读位置：**游戏撤销掉的移动会报 `REVERTED`，不报成功**。
-- 与 Player Teleport 一样，**没有**「全部传送」按钮：一次游戏线程上的 80 个 transform 批量写
-  不是这个插件想提供的东西。
+按类别、名称和距玩家距离筛选实体，可将选中实体移动到指定坐标，或把选中／最近实体带到玩家身边。
+进入有效场景后自动首刷列表，之后可手动刷新或开启每秒跟踪；最大距离为 0 时不设上限。
+落点高度是带到玩家身边时的垂直偏移。受控玩家使用 Player Teleport，不能通过通用实体操作写入。
 
-> [!NOTE]
-> 它是随包提供的第 7 个插件，和其余插件一样**默认不启用**。
-> 构建与安装由 `CMakeLists.txt` 的 `cabbird_add_plugin(cabbird_entity_teleport ...)` 与
-> `GameRuntime` 安装规则统一处理；`plugins/entity_teleport/build.cmd` 只是转发到根 `build.cmd`
-> 的薄包装。
+保存项：类别筛选、搜索开关与文字、相对模式、目标坐标、落点高度、距离上限、跟踪开关、
+分页与每页数量及窗口尺寸。
+执行时重新查找目标，核对游戏实体、数据对象、实例标识、玩家与场景；角色通过游戏自身的世界位置方法同步移动控制器，普通实体通过游戏数据对象的位置方法移动。
+相对偏移取目标当时的实际位置，带到身边取玩家当时的位置。包围盒中心只用于列表距离判断。
+目标消失、对象复用或场景变化会取消请求，后续帧只复测位置，不反复写入。
+界面保留筛选、坐标和实体列表；实际传送失败写入日志，不显示诊断状态或统计。
 
----
+## Move Speed
 
-## 写自己的插件
+调整已验证的移动输入。普通跳跃的水平距离随倍率变化，垂直曲线与重力保持原有规则；
+普通飞行及 HookFly 坐骑的水平移动、上升、下降和飞行冲刺均随倍率调整。
+支持普通奔跑、冲刺、地面坐骑、普通曲线跳跃/二段跳/快速跳、原地跳的水平控制与普通空中移动。
+独立的 Glide 滑翔、FlightTravel 技能、游泳、坐骑 CoolRunning 特殊跳跃和技能位移不在覆盖范围。
 
-见[插件开发](../developer-guide/plugin-development.md)；公开接口见 [API 参考](../api-reference/README.md)；
-可直接抄的完整例子在 [`examples/`](../../examples/README.md)（`hello_ui`、`tick_counter`、
-`reliable_config`、`unity_entity_inspector`）。
+窗口只提供启用、仅受控实体和移动速度倍率。功能默认关闭，倍率默认 2，范围 0.1–20；
+仅受控实体默认开启，取消限制后可作用于使用这些路径的其他实体。三项设置均持久化，窗口状态由宿主保存。
+关闭窗口不关闭功能，可从插件管理页重新打开。
+
+玩家或世界尚未就绪时自动等待，元数据暂未就绪时自动重试，无需手动绑定。
+兼容校验失败时对应路径保留原样，必要原因写入宿主日志。
+飞行保留游戏自身的碰撞、飞行限制和制动；不会把倍率反复写入上一帧物理速度。
+普通下落保留已继承的水平速度，入口速度上限仍生效；高倍率不保证整个腾空过程的距离严格成比例。
+关闭后新移动输入恢复原值，已有飞行/下落速度和 World 目标速度继续按游戏自身规则收敛。
+插件不修改全局时间、初始化时的移动属性缓存，也不整体放大技能、冲量或普通跳跃的垂直速度。
+
+## Story Tools
+
+使用游戏自身的跳过动作和自动对话播放。解锁跳过、自动播放与“自动跳过剧情”分别控制，
+自动跳过默认关闭；开启后按游戏原生跳过权限处理当前剧情，权限包含“解锁跳过”的选择，
+分支选择、回顾和暂停时不自动跳过。
+自动播放不自动选择分支。
+
+剧情速度有独立开关，默认关闭；开启后使用绝对播放速度，范围 1–9 倍，默认 3 倍。
+原生 setter 同步更新时间轴、轨道和音频。关闭或停止时在 Game 线程恢复游戏配置的速度，
+回顾暂停和音频暂停状态保持不变。
+
+保存项：功能启用、解锁跳过、自动播放、自动跳过、速度开关与播放速度。
+元数据稍后就绪时自动重试绑定；真实入口或形状不符时停止对应功能，失败原因写入宿主日志。
+
+## Free Flight
+
+按镜头方向使用 `W/A/S/D` 水平移动，`Space` 上升，`Ctrl` 下降，无输入且无外力时悬停。
+启用状态和飞行速度由宿主持久化，默认关闭；失去游戏焦点或界面捕获键盘时停止方向输入。
+游戏原有的碰撞、击退和外力仍然生效。
+移动仍由原生控制器处理碰撞、积分和刚体同步。
+通过框架共享移动服务接管速度；收集物定点保持期间暂让出控制，收集结束后继续生效。
+
+## God Mode
+
+通过插件管理器的开关控制，为当前受控英雄应用游戏自身的无敌元素，默认关闭。
+没有独立窗口或第二个启用开关；开关状态保存在宿主的 `plugin-enablement.json`。
+角色或场景尚未就绪时自动等待；角色切换后重新绑定。
+停用时只移除本插件添加的效果，保留游戏已经拥有的同类效果。
+
+## Collectibles
+
+先扫描当前已准备的大地图，再开始逐个传送和交互。扫描读取地图静态配置，包含未加载区域的目标；
+不包含其他地图或临时动态掉落物。本次收集数只接受同一目标的原生完成响应，且响应必须包含正数奖励；
+交互请求被接受或本地状态变为完成都不代表拾取成功。宝箱的世界物体完成状态不等于奖励已领取，
+扫描和执行都会保留这些箱子并尝试交互；只有对应目标的完成奖励响应才确认本次领取。
+其他收集物仅在服务器明确完成时跳过；地图初始完成标记不作为领取依据，服务器状态缺失时仍保留目标。
+只收宝箱时也会按精确 Map ID 补入已加载的动态箱和子箱；重复目标合并，已有实例的箱体使用真实位置。
+执行前检查游戏的创建条件与当前箱体实例；明确不会生成且没有实例的点直接标为“当前未生成，奖励未确认”，
+不传送、不等待交互。服务器状态缺失或仍可能加载的目标保留等待，已有实例仍尝试交互。
+采集物按游戏官方采集目录的生成器与类别归类，列表显示游戏中的类别名称；普通场景物不会因为
+底层类型是 `Item` 或 `BreakableItem` 就进入收集路线。扫描结果分页显示类别、名称、Map ID、世界坐标、完成状态和路线结果。
+停止或失败会保留扫描表、已完成计数与当前位置，可点“继续”重试当前目标。
+同地图换角色会释放旧角色的移动请求并重新绑定；切换地图后保留旧表供查看，但必须重新扫描才能执行。
+加载插件不会自动开始传送或拾取。
+
+传送调用框架的角色传送 API，未加载目标使用配置坐标，已有精确实例时刷新为箱体的真实世界坐标，不附加固定高度偏移。
+传送确认后通知游戏原生 AOI 刷新目标区域，等待交互对象加载再调用原生拾取。
+共享移动服务从传送前保持至交互结束，抑制重叠脱离与安全位置回退；完成、失败、停止或场景变化后释放。
+普通开箱动作复用游戏带版本检查的即时回调；已有交互动画运行时先等待。
+谜题箱优先使用普通开箱动作；否则在当前目标的运行图中查找已连接的未领奖分支或唯一配置完成节点。
+图发现分帧推进，不调用“已经领奖”的表现分支；缺少对应配置时记录原因，最终仍须确认对应目标的完成奖励响应。
+采集目录未准备时，仅用已加载对象的明确原生拾取动作补充分类，并在结果中标明其来源；该补充范围限于已加载区域。
+
+保存项：宝箱与收集物筛选、传送后等待时间、结果页码。扫描清单和任务进度仅存在于当前会话。
+
+## 插件包更新
+
+文案随包放在 `locales/`，缺少本地化时显示英文回退。需要游戏兼容资料的插件另有 `profile/`；
+用户设置保存在上面的配置目录，不写回 Profile。
+更新时替换完整插件包并重载，让 DLL、manifest、本地化与兼容资料保持一致。

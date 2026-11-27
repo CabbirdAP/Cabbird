@@ -4,12 +4,15 @@
 #include "cabbird/host_ui_service.hpp"
 #include "cabbird/adapter_service_registry.hpp"
 #include "cabbird/platform_ui_model.hpp"
-#include "cabbird/menu_hotkey_press_latch.hpp"
+#include "cabbird/platform_ui_layout.hpp"
 #include "cabbird/platform_ui_input_policy.hpp"
 #include "cabbird/cabbird_ui_theme.hpp"
+#include "cabbird/liquid_glass.hpp"
 #include "cabbird/plugin_scope.hpp"
 #include "cabbird/ui_resource_decoder.hpp"
 #include "cabbird/ui_resource_registry.hpp"
+#include "cabbird/ui_resource_render_backend.hpp"
+#include "cabbird/reliable_storage.hpp"
 #include "cabbird/unity_adapter.hpp"
 #include "cabbird/plugin_manager.hpp"
 
@@ -17,6 +20,8 @@
 #include <d3d11.h>
 #include <dwmapi.h>
 #include <shellapi.h>
+#include <commdlg.h>
+#include <wrl/client.h>
 
 #include <imgui.h>
 #include <imgui_internal.h>
@@ -29,17 +34,21 @@
 #include <atomic>
 #include <charconv>
 #include <chrono>
+#include <condition_variable>
 #include <cctype>
+#include <cfloat>
 #include <cmath>
 #include <cstdio>
 #include <deque>
 #include <fstream>
+#include <iterator>
 #include <limits>
 #include <memory>
 #include <map>
 #include <mutex>
 #include <optional>
 #include <sstream>
+#include <span>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -68,11 +77,11 @@ struct HostWindow {
     IDXGISwapChain* swap_chain{};
     ID3D11RenderTargetView* render_target{};
     ID3D11ShaderResourceView* header_logo{};
-    std::shared_ptr<std::string> imgui_ini_path;
     // Whether the compositor honoured the swap chain's alpha. Placement depends
     // on it: a window that failed to become transparent must stay a small panel
     // rather than an opaque sheet over the whole game.
     bool alpha_composited{};
+    bool all_hidden_region{};
     // The panel rectangles the window region was last built from. Rebuilding it
     // every frame would be wasted work; this is what says when it changed.
     std::vector<std::array<LONG, 4>> region_panels;
@@ -81,6 +90,9 @@ struct HostWindow {
     std::shared_ptr<PluginManager> plugin_owner;
     bool visible{};
     unsigned toggle_key{VK_INSERT};
+    unsigned hide_all_key{VK_DELETE};
+    cabbird::PlatformMenuHotkey menu_hotkey;
+    cabbird::PlatformMenuHotkey hide_all_hotkey;
     bool attached{};
 };
 
@@ -172,6 +184,22 @@ HWND FindProcessWindow() {
 // Drags survive this because the backend takes the mouse capture on button
 // down, and a captured window keeps receiving input regardless of its region.
 void UpdateHostWindowRegion(HostWindow& host) {
+    if (cabbird::HostUiAllHidden()) {
+        if (!host.all_hidden_region) {
+            HRGN region = CreateRectRgn(0, 0, 0, 0);
+            if (region != nullptr) {
+                if (SetWindowRgn(host.window, region, TRUE) != 0) host.all_hidden_region = true;
+                else DeleteObject(region);
+            }
+        }
+        return;
+    }
+    if (host.all_hidden_region) {
+        SetWindowRgn(host.window, nullptr, TRUE);
+        host.all_hidden_region = false;
+        host.region_panels.clear();
+    }
+
     if (!host.attached) return;
     const ImGuiContext* context = ImGui::GetCurrentContext();
     if (context == nullptr) return;
@@ -251,7 +279,16 @@ bool CreateRenderTarget(HostWindow& host) {
 }
 
 LRESULT WINAPI WindowProc(HWND window, UINT message, WPARAM wparam, LPARAM lparam) {
-    if (ImGui_ImplWin32_WndProcHandler(window, message, wparam, lparam)) return TRUE;
+    if (g_window != nullptr) {
+        if (message == WM_KEYDOWN || message == WM_SYSKEYDOWN) {
+            g_window->menu_hotkey.RecordKeyDown(static_cast<unsigned>(wparam), (lparam & 0x40000000L) != 0);
+            g_window->hide_all_hotkey.RecordKeyDown(static_cast<unsigned>(wparam), (lparam & 0x40000000L) != 0);
+        } else if (message == WM_KILLFOCUS || (message == WM_ACTIVATEAPP && wparam == FALSE)) {
+            g_window->menu_hotkey.Reset();
+            g_window->hide_all_hotkey.Reset();
+        }
+    }
+    if (!cabbird::HostUiAllHidden() && ImGui_ImplWin32_WndProcHandler(window, message, wparam, lparam)) return TRUE;
     switch (message) {
     case WM_SIZE:
         if (g_window != nullptr && g_window->device != nullptr && wparam != SIZE_MINIMIZED) {
@@ -277,7 +314,9 @@ LRESULT WINAPI WindowProc(HWND window, UINT message, WPARAM wparam, LPARAM lpara
         if ((wparam & 0xfff0) == SC_KEYMENU) return 0;
         break;
     case WM_CLOSE:
-        if (g_window != nullptr) {
+        if (g_window != nullptr && !g_window->attached) {
+            PostQuitMessage(0);
+        } else if (g_window != nullptr) {
             g_window->visible = false;
             ShowWindow(window, SW_HIDE);
         }
@@ -485,6 +524,8 @@ enum class ShellGlyph : std::size_t {
     Info,
     Copy,
     Activity,
+    Star,
+    StarFilled,
     Count,
 };
 
@@ -514,6 +555,8 @@ enum class ShellGlyph : std::size_t {
         values[static_cast<std::size_t>(ShellGlyph::Info)] = EncodeUtf8(0xe946);
         values[static_cast<std::size_t>(ShellGlyph::Copy)] = EncodeUtf8(0xe8c8);
         values[static_cast<std::size_t>(ShellGlyph::Activity)] = EncodeUtf8(0xe9d9);
+        values[static_cast<std::size_t>(ShellGlyph::Star)] = EncodeUtf8(0xe734);
+        values[static_cast<std::size_t>(ShellGlyph::StarFilled)] = EncodeUtf8(0xe735);
         return values;
     }();
     return glyphs[static_cast<std::size_t>(glyph)].c_str();
@@ -527,11 +570,10 @@ constexpr float kPlatformHeaderHeight = 52.0f;
 constexpr float kPlatformHeaderLogoSize = 30.0f;
 constexpr float kPlatformHeaderActionColumnWidth = 110.0f;
 constexpr float kPlatformToastHeight = 38.0f;
-constexpr float kPlatformToastBottomMargin = 14.0f;
+constexpr float kPlatformTabBarReserve = 82.0f;
 constexpr float kPlatformGloballyCollapsedWidth = 132.0f;
 constexpr float kPlatformInitialShellWidth = 1180.0f;
 constexpr float kPlatformInitialShellHeight = 700.0f;
-constexpr float kPlatformStandardShellWidth = 900.0f;
 constexpr float kPlatformStandardShellHeight = 600.0f;
 constexpr float kPlatformMinimumShellWidth = 760.0f;
 constexpr float kPlatformMinimumShellHeight = 500.0f;
@@ -566,6 +608,104 @@ struct ContactInformation final {
     } catch (...) {
         return std::nullopt;
     }
+}
+
+void LoadStandaloneImGuiSettings(const std::filesystem::path& root) noexcept {
+    ImGui::GetIO().IniFilename = nullptr;
+    try {
+        std::ifstream input(root / L"cabbird-imgui.ini", std::ios::binary);
+        const std::string settings{std::istreambuf_iterator<char>(input), {}};
+        if (!settings.empty()) ImGui::LoadIniSettingsFromMemory(settings.data(), settings.size());
+    } catch (...) { }
+}
+
+void SaveStandaloneImGuiSettings(const std::filesystem::path& root) noexcept {
+    // RunPlatform owns this context on its UI worker. Keep filesystem work
+    // outside NewFrame/Draw, as in the embedded host's memory-only frame path.
+    ImGui::GetIO().WantSaveIniSettings = false;
+    try {
+        std::size_t size{};
+        const char* const settings = ImGui::SaveIniSettingsToMemory(&size);
+        std::ofstream output(root / L"cabbird-imgui.ini", std::ios::binary | std::ios::trunc);
+        output.write(settings, static_cast<std::streamsize>(size));
+    } catch (...) { }
+}
+
+struct ThemeImagePicker final {
+    std::stop_token stop;
+    std::atomic<HWND> dialog{};
+};
+
+UINT_PTR CALLBACK ThemeImagePickerHook(HWND hook, UINT message, WPARAM, LPARAM parameter) {
+    if (message == WM_INITDIALOG) {
+        const auto* request = reinterpret_cast<const OPENFILENAMEW*>(parameter);
+        auto* state = reinterpret_cast<ThemeImagePicker*>(request->lCustData);
+        SetWindowLongPtrW(hook, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(state));
+        state->dialog.store(GetParent(hook), std::memory_order_release);
+        if (state->stop.stop_requested()) PostMessageW(GetParent(hook), WM_CLOSE, 0, 0);
+    } else if (message == WM_DESTROY) {
+        if (auto* state = reinterpret_cast<ThemeImagePicker*>(GetWindowLongPtrW(hook, GWLP_USERDATA))) {
+            state->dialog.store(nullptr, std::memory_order_release);
+        }
+    }
+    return 0;
+}
+
+std::filesystem::path ChooseThemeImage(std::stop_token stop, std::string& error) {
+    ThemeImagePicker state{stop};
+    std::stop_callback cancel(stop, [&state] {
+        if (const HWND dialog = state.dialog.load(std::memory_order_acquire))
+            PostMessageW(dialog, WM_CLOSE, 0, 0);
+    });
+    std::array<wchar_t, 32768> path{};
+    OPENFILENAMEW request{};
+    request.lStructSize = sizeof(request);
+    const HWND owner = GetForegroundWindow();
+    DWORD owner_process{};
+    if (owner != nullptr && GetWindowThreadProcessId(owner, &owner_process) != 0 &&
+        owner_process == GetCurrentProcessId()) request.hwndOwner = owner;
+    request.lpstrFile = path.data();
+    request.nMaxFile = static_cast<DWORD>(path.size());
+    request.lpstrFilter = L"Images\0*.png;*.jpg;*.jpeg;*.bmp;*.gif\0All files\0*.*\0";
+    request.Flags = OFN_EXPLORER | OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST |
+        OFN_NOCHANGEDIR | OFN_ENABLEHOOK;
+    request.lpfnHook = ThemeImagePickerHook;
+    request.lCustData = reinterpret_cast<LPARAM>(&state);
+    if (stop.stop_requested()) return {};
+    if (GetOpenFileNameW(&request)) return path.data();
+    if (CommDlgExtendedError() != 0) error = "the image picker could not be opened";
+    return {};
+}
+
+bool ImportThemeImage(const std::filesystem::path& root, const std::filesystem::path& source,
+    std::string& relative, std::string& error) {
+    auto read = cabbird::ReadUiResourceBytes(source, cabbird::kDefaultUiResourceEncodedByteLimit);
+    if (!read || !cabbird::DecodeUiImageRgba8(read.bytes)) {
+        error = "the selected image could not be decoded";
+        return false;
+    }
+    std::error_code code;
+    const auto local = std::filesystem::relative(source, root, code);
+    std::filesystem::path checked;
+    if (!code && cabbird::ResolvePlatformUiLayoutPath(root, local.generic_string(), checked)) {
+        relative = local.generic_string();
+        return true;
+    }
+    std::uint64_t digest = 1469598103934665603ULL;
+    for (const auto byte : read.bytes) { digest ^= byte; digest *= 1099511628211ULL; }
+    char name[32]{};
+    std::snprintf(name, sizeof(name), "background-%016llx", static_cast<unsigned long long>(digest));
+    const auto directory = root / L"assets" / L"custom";
+    std::filesystem::create_directories(directory, code);
+    const auto target = directory / (std::string(name) + source.extension().string());
+    if (code) { error = "the background directory could not be created"; return false; }
+    relative = "assets/custom/" + target.filename().generic_string();
+    cabbird::ReliableStorage storage(root.native());
+    if (!storage.WriteAtomic(std::filesystem::path(relative).native(), std::as_bytes(std::span(read.bytes)))) {
+        error = "the background image could not be stored";
+        return false;
+    }
+    return true;
 }
 
 [[nodiscard]] std::vector<std::uint8_t> LoadEmbeddedLogoBytes() noexcept {
@@ -683,8 +823,7 @@ public:
           management_window_scope_(std::make_shared<cabbird::PluginScope>(
               std::make_shared<cabbird::ResourceLedger>(),
               std::string(kPlatformUiWindowOwner), kPlatformUiWindowGeneration)),
-          diagnostics_(std::move(diagnostics)),
-          contact_(LoadContactInformation(diagnostics_.runtime_root / L"CONTACT")) {
+          diagnostics_(std::move(diagnostics)) {
         if (diagnostics_.translator == nullptr) {
             diagnostics_.translator =
                 cabbird::ParseHostCatalog(cabbird::Locale::EnUs).translator;
@@ -693,6 +832,10 @@ public:
         // Keep route, tab and selection outside the renderer-owned ImGui
         // context so a device rebuild does not reset the management surface.
         model_.State() = std::move(state);
+        model_.State().favorite_plugin_ids = plugins_.FavoritePlugins();
+        if (model_.State().route == Route::UnityCompatibility) {
+            model_.State().route = Route::Diagnostics;
+        }
         SyncInputBuffers();
         cabbird::UiTextureRequest logo_request;
         logo_request.encoded_bytes = LoadEmbeddedLogoBytes();
@@ -707,10 +850,42 @@ public:
         }
         const std::filesystem::path directory = plugins_.Directory();
         const cabbird::Locale locale = diagnostics_.translator->locale();
-        catalog_worker_ = std::jthread([this, directory, locale](std::stop_token stop_token) {
+        const auto contact_path = diagnostics_.runtime_root / L"CONTACT";
+        catalog_worker_ = std::jthread([this, directory, locale, contact_path](std::stop_token stop_token) {
+            const auto contact = LoadContactInformation(contact_path);
+            struct ChangeNotification final {
+                HANDLE contents{INVALID_HANDLE_VALUE};
+                HANDLE parent{INVALID_HANDLE_VALUE};
+                ~ChangeNotification() { Close(contents); Close(parent); }
+                static void Close(HANDLE& handle) noexcept {
+                    if (handle != INVALID_HANDLE_VALUE) FindCloseChangeNotification(handle);
+                    handle = INVALID_HANDLE_VALUE;
+                }
+                void Reset() noexcept { Close(contents); Close(parent); }
+            } change;
+            struct StopEvent final {
+                HANDLE handle{CreateEventW(nullptr, TRUE, FALSE, nullptr)};
+                ~StopEvent() { if (handle != nullptr) CloseHandle(handle); }
+            } stop;
+            std::stop_callback wake(stop_token, [&stop] {
+                if (stop.handle != nullptr) SetEvent(stop.handle);
+            });
             while (!stop_token.stop_requested()) {
+                // Watch the parent too: notifications on a directory do not
+                // report replacement of that directory itself. Arm before scanning.
+                if (change.parent == INVALID_HANDLE_VALUE) {
+                    change.parent = FindFirstChangeNotificationW(directory.parent_path().c_str(), FALSE,
+                        FILE_NOTIFY_CHANGE_DIR_NAME | FILE_NOTIFY_CHANGE_ATTRIBUTES);
+                }
+                if (change.contents == INVALID_HANDLE_VALUE) {
+                    change.contents = FindFirstChangeNotificationW(directory.c_str(), TRUE,
+                        FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_DIR_NAME |
+                        FILE_NOTIFY_CHANGE_SIZE | FILE_NOTIFY_CHANGE_LAST_WRITE |
+                        FILE_NOTIFY_CHANGE_CREATION | FILE_NOTIFY_CHANGE_ATTRIBUTES);
+                }
                 try {
                     auto next = std::make_shared<CatalogCache>();
+                    next->contact = contact;
                     next->catalog = cabbird::DiscoverPluginCatalog(directory);
                     next->dependencies = cabbird::ResolvePluginDependencies(*next->catalog);
                     for (const auto& entry : next->catalog->Entries()) {
@@ -738,6 +913,24 @@ public:
                     // Keep the last good catalog visible when a package is being
                     // replaced or a manifest is temporarily unreadable.
                 }
+                if (change.parent != INVALID_HANDLE_VALUE && stop.handle != nullptr) {
+                    const HANDLE handles[]{stop.handle, change.parent, change.contents};
+                    const DWORD count = change.contents == INVALID_HANDLE_VALUE ? 2 : 3;
+                    const DWORD reason = WaitForMultipleObjects(count, handles, FALSE, INFINITE);
+                    if (reason == WAIT_OBJECT_0 || stop_token.stop_requested()) break;
+                    if (reason == WAIT_OBJECT_0 + 1) {
+                        if (!FindNextChangeNotification(change.parent)) ChangeNotification::Close(change.parent);
+                        ChangeNotification::Close(change.contents);
+                        continue;
+                    }
+                    if (reason == WAIT_OBJECT_0 + 2) {
+                        if (!FindNextChangeNotification(change.contents)) ChangeNotification::Close(change.contents);
+                        continue;
+                    }
+                    change.Reset();
+                }
+                // If notifications fail, retry off Render without leaving a
+                // permanently stale cache or spinning on a failed wait handle.
                 for (int tick = 0; tick != 10 && !stop_token.stop_requested(); ++tick) {
                     std::this_thread::sleep_for(std::chrono::milliseconds(100));
                 }
@@ -751,18 +944,20 @@ public:
                 if (!window->open) cabbird::SetHostUiMenusCollapsed(true);
                 if (window->width > 0.0F && window->height > 0.0F) {
                     management_shell_expanded_size_ = {window->width, window->height};
-                    if (window->width < kPlatformInitialShellWidth ||
-                        window->height < kPlatformStandardShellHeight) {
+                    if (window->width < kPlatformMinimumShellWidth ||
+                        window->height < kPlatformMinimumShellHeight) {
                         management_shell_expanded_size_ = {
                             kPlatformInitialShellWidth, kPlatformInitialShellHeight};
                     }
                 }
             }
         }
+        StartThemeWorker();
     }
 
     ~PlatformUi() {
         catalog_worker_.request_stop();
+        theme_worker_.request_stop();
         RevokeManagementWindow();
     }
 
@@ -812,6 +1007,7 @@ public:
             closing_ = true;
         }
         catalog_worker_.request_stop();
+        theme_worker_.request_stop();
         RevokeManagementWindow();
     }
 
@@ -864,6 +1060,7 @@ public:
         // its last lifecycle callback is being drained. The owner itself is
         // retained by the global handoff below until this method succeeds.
         catalog_worker_.request_stop();
+        theme_worker_.request_stop();
         if (diagnostics_.lifecycle_drain) {
             const bool drained = diagnostics_.lifecycle_drain(remaining());
             if (!drained) {
@@ -916,8 +1113,13 @@ public:
         const auto window = plugins_.UiResources().WindowState(
             management_window_scope_, management_window_);
         RecordPerformance(PlatformUiPerformanceStage::WindowState, phase_started);
-        if (!window || !window->open) return;
+        if (!window || !window->open) {
+            settings_hotkey_capture_ = false;
+            return;
+        }
+        settings_hotkey_capture_drawn_ = false;
         RefreshSnapshot(measure);
+        ApplySettingsPreview();
         phase_started = measure ? std::chrono::steady_clock::now()
                                 : std::chrono::steady_clock::time_point{};
         UpdateStatusToast();
@@ -933,7 +1135,8 @@ public:
         const bool ui_scale_changed = std::abs(ui_scale - management_shell_ui_scale_) > 0.0001f;
         // Keep a consistent margin around the responsive product surface and
         // scale both the viewport bounds and the persisted logical size.
-        const float shell_margin = Scaled(kPlatformShellViewportMargin);
+        const bool fill_viewport = diagnostics_.standalone_window;
+        const float shell_margin = fill_viewport ? 0.0f : Scaled(kPlatformShellViewportMargin);
         // The bounds have to answer to the viewport, not only to the DPI scale.
         // A 1180x700 surface at 125% asks for 1475x875, which overflows a
         // 1280x720 client area, and the overflow is silently clipped -- the
@@ -942,27 +1145,24 @@ public:
             std::max(io.DisplaySize.x - shell_margin * 2.0f, 1.0f);
         const float available_height =
             std::max(io.DisplaySize.y - shell_margin * 2.0f, 1.0f);
-        const float maximum_shell_width =
-            std::min(Scaled(kPlatformMaximumShellWidth), available_width);
-        const float maximum_shell_height =
-            std::min(Scaled(kPlatformMaximumShellHeight), available_height);
+        const float maximum_shell_width = fill_viewport ? available_width
+            : std::min(Scaled(kPlatformMaximumShellWidth), available_width);
+        const float maximum_shell_height = fill_viewport ? available_height
+            : std::min(Scaled(kPlatformMaximumShellHeight), available_height);
         // Kept below the maxima above: a viewport smaller than the minimum
         // would otherwise hand std::clamp an inverted range.
         const float minimum_shell_width =
             std::min(Scaled(kPlatformMinimumShellWidth), maximum_shell_width);
         const float minimum_shell_height =
             std::min(Scaled(kPlatformMinimumShellHeight), maximum_shell_height);
-        // CABBIRD ADDITION -- let the shell follow the viewport.  See the note on
-        // management_shell_viewport_ for why this diverges from Anomaly.  Re-derived only when the
-        // viewport actually changes (or when nothing has been stored yet), so a manual resize
-        // still sticks while the host window stays put; the clamp below still applies the maxima.
+        // The embedded shell keeps its logical initial or saved size. Viewport
+        // changes only clamp that size; a standalone host owns its whole client.
         const ImVec2 viewport_logical{
             available_width / ui_scale, available_height / ui_scale};
         const bool viewport_changed =
             std::abs(viewport_logical.x - management_shell_viewport_.x) > 0.5f ||
             std::abs(viewport_logical.y - management_shell_viewport_.y) > 0.5f;
-        if (viewport_changed || management_shell_expanded_size_.x <= 0.0f ||
-            management_shell_expanded_size_.y <= 0.0f) {
+        if (fill_viewport) {
             management_shell_expanded_size_ = viewport_logical;
         }
         management_shell_viewport_ = viewport_logical;
@@ -985,7 +1185,7 @@ public:
             ? std::min(Scaled(kPlatformHeaderHeight), maximum_shell_height) : expanded_size.y;
         ImGui::SetNextWindowPos(
             ImVec2(shell_margin, shell_margin),
-            ImGuiCond_FirstUseEver);
+            fill_viewport ? ImGuiCond_Always : ImGuiCond_FirstUseEver);
         if (globally_collapsed) {
             ui->set_next_window_size_constraints(
                 ui->user, shell_width, shell_height, shell_width, shell_height);
@@ -999,9 +1199,10 @@ public:
                 static_cast<std::uint32_t>(ImGuiCond_Always));
         } else {
             ui->set_next_window_size_constraints(
-                ui->user, minimum_shell_width, minimum_shell_height,
+                ui->user, fill_viewport ? expanded_size.x : minimum_shell_width,
+                fill_viewport ? expanded_size.y : minimum_shell_height,
                 maximum_shell_width, maximum_shell_height);
-            if (management_shell_apply_initial_size_ || restoring_from_collapse ||
+            if (fill_viewport || viewport_changed || management_shell_apply_initial_size_ || restoring_from_collapse ||
                 ui_scale_changed) {
                 ui->set_next_window_size(
                     ui->user, expanded_size.x, expanded_size.y,
@@ -1020,15 +1221,26 @@ public:
             ui->user, {title.data(), title.size()}, nullptr,
             ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoCollapse |
                 ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoScrollbar |
-                ImGuiWindowFlags_NoScrollWithMouse) != 0;
+                ImGuiWindowFlags_NoScrollWithMouse | ImGuiWindowFlags_NoBackground |
+                (fill_viewport ? ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoResize : 0)) != 0;
         ImGui::PopStyleVar();
         if (visible) {
             const ImVec2 management_window_origin = ImGui::GetWindowPos();
             const ImVec2 management_window_size = ImGui::GetWindowSize();
+            // The canvas belongs to the host, not the game's backbuffer. The
+            // local glass controls may refract this surface, but never reveal
+            // raw gameplay underneath an otherwise opaque management window.
+            ImGui::GetWindowDrawList()->AddRectFilled(management_window_origin,
+                Offset(management_window_origin, management_window_size.x, management_window_size.y),
+                ImGui::GetColorU32(ThemeColor(cabbird::CabbirdUiSurfaceColor())),
+                ImGui::GetStyle().WindowRounding);
+            DrawThemeImages(management_window_origin, management_window_size, false);
+            if (!ManagementShellCollapsed()) DrawThemeImages(management_window_origin, management_window_size, true);
             management_shell_locked_ = cabbird::HostUiCurrentWindowLocked();
             UpdateLayout();
             HandleShellShortcuts();
             const bool shell_was_collapsed = ManagementShellCollapsed();
+            cabbird::glass::CaptureBackdrop(ImGui::GetWindowDrawList());
             RecordPerformance(PlatformUiPerformanceStage::FrameSetup, phase_started);
             phase_started = measure ? std::chrono::steady_clock::now()
                                     : std::chrono::steady_clock::time_point{};
@@ -1064,15 +1276,20 @@ public:
                 if (!width_was_clamped) management_shell_expanded_size_.x = width / ui_scale;
                 if (!height_was_clamped) management_shell_expanded_size_.y = height / ui_scale;
             }
-            static_cast<void>(plugins_.UiResources().SetWindowSize(
-                management_window_scope_, management_window_,
-                management_shell_expanded_size_.x, management_shell_expanded_size_.y));
+            if (!fill_viewport) {
+                static_cast<void>(plugins_.UiResources().SetWindowSize(
+                    management_window_scope_, management_window_,
+                    management_shell_expanded_size_.x, management_shell_expanded_size_.y));
+            }
         }
         if (!globally_collapsed) management_shell_apply_initial_size_ = false;
         management_shell_was_collapsed_ = shell_collapsed;
         management_shell_ui_scale_ = ui_scale;
         ui->end_window(ui->user);
         ImGui::PopStyleVar();
+        if (!settings_hotkey_capture_drawn_ || ManagementShellCollapsed()) {
+            settings_hotkey_capture_ = false;
+        }
         RecordPerformance(PlatformUiPerformanceStage::WindowPersist, phase_started);
 
         // Mutations are flushed by FlushPlatformUiActions after the render
@@ -1082,6 +1299,7 @@ public:
 
     void PrepareResources() noexcept {
         std::scoped_lock submission_lock(submission_mutex_);
+        std::scoped_lock operation_lock(operation_mutex_);
         std::shared_ptr<cabbird::PluginScope> scope;
         cabbird::UiResourceHandle texture;
         {
@@ -1091,9 +1309,246 @@ public:
             texture = logo_texture_;
         }
         plugins_.PrepareUiTexture(scope, texture);
+        ApplyThemeResources();
+        const auto prepare = [&](const ThemeImage& image) {
+            if (image.handle) plugins_.PrepareUiTexture(scope, image.handle);
+        };
+        prepare(theme_background_);
+        for (const auto& sticker : theme_stickers_) prepare(sticker);
+        const bool wallpaper = theme_background_.Valid() &&
+            theme_layout_.background.mode != cabbird::PlatformUiBackgroundMode::Disabled &&
+            theme_layout_.background.opacity > 0.0f;
+        const float surface_alpha = wallpaper ? theme_layout_.surface_opacity : 1.0f;
+        if (std::abs(cabbird::GetCabbirdUiSurfaceAlpha() - surface_alpha) > 0.0001f) {
+            cabbird::SetCabbirdUiSurfaceAlpha(surface_alpha);
+            ApplyCabbirdUiStyle();
+        }
     }
 
 private:
+    struct ThemeImage final {
+        cabbird::UiResourceHandle handle;
+        Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> standalone;
+        float width{};
+        float height{};
+        [[nodiscard]] bool Valid() const noexcept { return static_cast<bool>(handle) || standalone != nullptr; }
+    };
+
+    void StartThemeWorker() {
+        theme_requested_palette_ = cabbird::GetCabbirdUiPalette();
+        const auto root = diagnostics_.runtime_root;
+        theme_worker_ = std::jthread([this, root](std::stop_token stop) {
+            std::filesystem::path previous_path;
+            std::filesystem::file_time_type previous_stamp{}, previous_shared_stamp{};
+            std::uint64_t revision{};
+            for (;;) {
+                cabbird::CabbirdUiPalette palette;
+                std::optional<int> mode;
+                std::optional<float> opacity;
+                bool pick{};
+                bool reload{};
+                {
+                    std::unique_lock lock(theme_mutex_);
+                    theme_changed_.wait_for(lock, stop, std::chrono::seconds(1), [this] {
+                        return theme_reload_ || theme_mode_request_ || theme_opacity_request_ || theme_pick_request_;
+                    });
+                    palette = theme_requested_palette_;
+                    reload = std::exchange(theme_reload_, false);
+                    mode = std::exchange(theme_mode_request_, std::nullopt);
+                    opacity = std::exchange(theme_opacity_request_, std::nullopt);
+                    pick = std::exchange(theme_pick_request_, false) && !stop.stop_requested();
+                    theme_picker_running_ = pick;
+                    // Submission is closed before stop is requested. Drain the
+                    // already queued settings without opening another picker.
+                    if (stop.stop_requested() && !mode && !opacity) break;
+                }
+                try {
+                    const auto shared = root / std::filesystem::path(cabbird::kPlatformUiLayoutRelativePath);
+                    std::string failure;
+                    if (mode || opacity || pick) {
+                        cabbird::PlatformUiLayoutDocument layout;
+                        if (auto read = cabbird::ReadUiResourceBytes(shared, cabbird::kPlatformUiLayoutMaximumBytes)) {
+                            auto parsed = cabbird::ParsePlatformUiLayout(std::string_view(
+                                reinterpret_cast<const char*>(read.bytes.data()), read.bytes.size()));
+                            if (parsed.ok) layout = std::move(parsed.layout);
+                            else failure = std::move(parsed.message);
+                        }
+                        bool changed = false;
+                        if (failure.empty() && pick && !stop.stop_requested()) {
+                            const auto chosen = ChooseThemeImage(stop, failure);
+                            if (!chosen.empty() && !stop.stop_requested()) {
+                                std::string relative;
+                                if (ImportThemeImage(root, chosen, relative, failure)) {
+                                    layout.background.path = std::move(relative);
+                                    layout.background.mode = cabbird::PlatformUiBackgroundMode::Crop;
+                                    layout.surface_opacity = cabbird::kPlatformUiLayoutSurfaceOpacityDefault;
+                                    changed = true;
+                                }
+                            }
+                        }
+                        if (failure.empty() && mode) {
+                            layout.background.mode = static_cast<cabbird::PlatformUiBackgroundMode>(*mode);
+                            changed = true;
+                        }
+                        if (failure.empty() && opacity) { layout.surface_opacity = *opacity; changed = true; }
+                        if (changed)
+                            static_cast<void>(cabbird::WritePlatformUiLayout(shared, layout, failure));
+                        reload = reload || changed || !failure.empty();
+                    }
+                    if (stop.stop_requested()) {
+                        std::scoped_lock lock(theme_mutex_);
+                        theme_picker_running_ = false;
+                        continue;
+                    }
+                    const auto path = cabbird::ResolvePlatformUiLayoutFile(root, cabbird::ToString(palette));
+                    std::error_code error;
+                    const auto stamp = std::filesystem::last_write_time(path, error);
+                    error.clear();
+                    const auto shared_stamp = std::filesystem::last_write_time(shared, error);
+                    if (reload || path != previous_path || stamp != previous_stamp || shared_stamp != previous_shared_stamp) {
+                        auto prepared = std::make_shared<cabbird::PlatformUiLayoutSnapshot>(
+                            cabbird::PreparePlatformUiLayout(root, path, ++revision));
+                        if (!failure.empty()) prepared->message = std::move(failure);
+                        std::scoped_lock lock(theme_mutex_);
+                        theme_published_ = std::move(prepared);
+                        previous_path = path;
+                        previous_stamp = stamp;
+                        previous_shared_stamp = shared_stamp;
+                    }
+                } catch (...) {
+                    auto failure = std::make_shared<cabbird::PlatformUiLayoutSnapshot>();
+                    failure->revision = ++revision;
+                    failure->message = "the interface background could not be prepared";
+                    std::scoped_lock lock(theme_mutex_);
+                    theme_published_ = std::move(failure);
+                }
+                { std::scoped_lock lock(theme_mutex_); theme_picker_running_ = false; }
+            }
+        });
+    }
+
+    void ReleaseThemeResources() noexcept {
+        const auto release = [this](const ThemeImage& image) {
+            if (image.handle) static_cast<void>(plugins_.UiResources().Release(management_window_scope_, image.handle));
+        };
+        release(theme_background_);
+        for (const auto& sticker : theme_stickers_) release(sticker);
+        theme_background_ = {};
+        theme_stickers_.clear();
+    }
+
+    ThemeImage ResolveThemeImage(const cabbird::UiRgba8Image& image) {
+        ThemeImage result;
+        if (image.width == 0 || image.height == 0 || image.pixels.empty()) return result;
+        result.width = static_cast<float>(image.width);
+        result.height = static_cast<float>(image.height);
+        if (g_window != nullptr && g_window->device != nullptr) {
+            D3D11_TEXTURE2D_DESC description{};
+            description.Width = image.width; description.Height = image.height;
+            description.MipLevels = description.ArraySize = 1;
+            description.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+            description.SampleDesc.Count = 1;
+            description.Usage = D3D11_USAGE_DEFAULT;
+            description.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+            const D3D11_SUBRESOURCE_DATA pixels{image.pixels.data(), image.width * 4U, 0};
+            Microsoft::WRL::ComPtr<ID3D11Texture2D> texture;
+            if (SUCCEEDED(g_window->device->CreateTexture2D(&description, &pixels, &texture)))
+                static_cast<void>(g_window->device->CreateShaderResourceView(texture.Get(), nullptr, &result.standalone));
+        } else {
+            cabbird::UiTextureRequest request;
+            request.format = cabbird::UiTextureFormat::Rgba8;
+            request.width = image.width; request.height = image.height;
+            request.encoded_bytes = image.pixels;
+            result.handle = plugins_.UiResources().RequestTexture(management_window_scope_, std::move(request));
+            if (result.handle) static_cast<void>(plugins_.QueueUiTextureLoad(management_window_scope_, result.handle));
+        }
+        return result;
+    }
+
+    void ApplyThemeResources() noexcept {
+        try {
+            std::shared_ptr<const cabbird::PlatformUiLayoutSnapshot> prepared;
+            { std::scoped_lock lock(theme_mutex_); prepared = std::exchange(theme_published_, nullptr); }
+            if (!prepared) return;
+            ReleaseThemeResources();
+            theme_layout_ = prepared->layout;
+            theme_layout_available_ = prepared->available;
+            theme_layout_message_ = prepared->message;
+            theme_background_ = ResolveThemeImage(prepared->background);
+            theme_stickers_.reserve(prepared->stickers.size());
+            for (const auto& sticker : prepared->stickers) theme_stickers_.push_back(ResolveThemeImage(sticker));
+        } catch (...) { theme_layout_message_ = "the interface background could not be uploaded"; }
+    }
+
+    void EmitThemeImage(const ThemeImage& image, const cabbird::UiTextureDrawRequest& request,
+        ImDrawList* const list) {
+        if (image.handle) {
+            static_cast<void>(plugins_.DrawUiTextureEx(management_window_scope_, image.handle, request));
+        } else if (image.standalone != nullptr) {
+            const auto texture = reinterpret_cast<ImTextureID>(image.standalone.Get());
+            if (request.rotation_degrees == 0.0f) {
+                list->AddImageRounded(texture, {request.x, request.y},
+                    {request.x + request.width, request.y + request.height},
+                    {request.uv0_x, request.uv0_y}, {request.uv1_x, request.uv1_y},
+                    request.tint_rgba, request.rounding);
+            } else {
+                const cabbird::PlatformUiStickerPlacement placement{request.x, request.y,
+                    request.width, request.height, request.rotation_degrees, request.uv0_x,
+                    request.uv0_y, request.uv1_x, request.uv1_y, 1.0f};
+                const auto quad = cabbird::ComputePlatformUiImageQuad(placement);
+                list->AddImageQuad(texture, {quad.x[0], quad.y[0]}, {quad.x[1], quad.y[1]},
+                    {quad.x[2], quad.y[2]}, {quad.x[3], quad.y[3]}, {quad.u[0], quad.v[0]},
+                    {quad.u[1], quad.v[1]}, {quad.u[2], quad.v[2]}, {quad.u[3], quad.v[3]}, request.tint_rgba);
+            }
+        }
+    }
+
+    void DrawThemeImages(const ImVec2 origin, const ImVec2 size, const bool front) {
+        if (!theme_layout_available_) return;
+        ImDrawList* const list = front ? ImGui::GetForegroundDrawList() : ImGui::GetWindowDrawList();
+        const auto tint = [](const cabbird::CabbirdUiColor& color, const float opacity) {
+            return ImGui::GetColorU32(ImVec4(color.red, color.green, color.blue, color.alpha * opacity));
+        };
+        list->PushClipRect(origin, Offset(origin, size.x, size.y), true);
+        const bool wallpaper = theme_background_.Valid() &&
+            theme_layout_.background.mode != cabbird::PlatformUiBackgroundMode::Disabled;
+        if (!front && wallpaper) {
+            const auto placement = cabbird::ComputePlatformUiBackgroundPlacement(theme_layout_.background.mode,
+                theme_background_.width, theme_background_.height, origin.x, origin.y, size.x, size.y);
+            cabbird::UiTextureDrawRequest request;
+            request.x = placement.x; request.y = placement.y;
+            request.width = placement.width; request.height = placement.height;
+            request.uv0_x = placement.uv0_x; request.uv0_y = placement.uv0_y;
+            request.uv1_x = placement.uv1_x; request.uv1_y = placement.uv1_y;
+            request.tint_rgba = tint(theme_layout_.background.tint, theme_layout_.background.opacity);
+            if (theme_layout_.background.mode != cabbird::PlatformUiBackgroundMode::Center)
+                request.rounding = ImGui::GetStyle().WindowRounding;
+            EmitThemeImage(theme_background_, request, list);
+            auto veil = cabbird::CabbirdUiSurfaceColor();
+            list->AddRectFilled(origin, Offset(origin, size.x, size.y),
+                tint(veil, theme_layout_.surface_opacity), ImGui::GetStyle().WindowRounding);
+        }
+        list->PopClipRect();
+        if (ManagementShellCollapsed()) return;
+        for (std::size_t index = 0; index < theme_layout_.stickers.size() && index < theme_stickers_.size(); ++index) {
+            const auto& sticker = theme_layout_.stickers[index];
+            if ((sticker.layer == cabbird::PlatformUiStickerLayer::Front) != front || !theme_stickers_[index].Valid()) continue;
+            const auto placement = cabbird::ComputePlatformUiStickerPlacement(sticker,
+                theme_stickers_[index].width, theme_stickers_[index].height, size.x, size.y);
+            if (!placement.Visible()) continue;
+            cabbird::UiTextureDrawRequest request;
+            request.x = origin.x + placement.x; request.y = origin.y + placement.y;
+            request.width = placement.width; request.height = placement.height;
+            request.rotation_degrees = placement.rotation;
+            request.uv0_x = placement.uv0_x; request.uv0_y = placement.uv0_y;
+            request.uv1_x = placement.uv1_x; request.uv1_y = placement.uv1_y;
+            request.tint_rgba = tint(sticker.tint, sticker.opacity); request.on_top = front;
+            list->PushClipRectFullScreen();
+            EmitThemeImage(theme_stickers_[index], request, list);
+            list->PopClipRect();
+        }
+    }
+
     using Route = cabbird::PlatformUiRoute;
     using Tab = cabbird::PlatformUiPluginTab;
     using Filter = cabbird::PlatformUiPluginFilter;
@@ -1191,6 +1646,7 @@ private:
     };
 
     struct CatalogCache final {
+        std::optional<ContactInformation> contact;
         std::optional<cabbird::PluginCatalogSnapshot> catalog;
         std::optional<cabbird::PluginDependencyPlan> dependencies;
         cabbird::PluginDisplayNameMap display_names;
@@ -1267,6 +1723,7 @@ private:
         case Filter::Running: return Text(cabbird::MessageId::PluginsFilterRunning);
         case Filter::Disabled: return Text(cabbird::MessageId::PluginsFilterDisabled);
         case Filter::Issues: return Text(cabbird::MessageId::PluginsFilterIssues);
+        case Filter::Favorites: return Text(cabbird::MessageId::PluginsFilterFavorites);
         }
         return Text(cabbird::MessageId::CommonUnknown);
     }
@@ -1530,25 +1987,20 @@ private:
         }
     }
 
-    void RefreshCatalog() {
-        std::shared_ptr<const CatalogCache> cached;
-        {
-            std::scoped_lock lock(catalog_mutex_);
-            cached = catalog_cache_;
-        }
-        if (!cached || !cached->catalog || !cached->dependencies) return;
-        catalog_ = cached->catalog;
-        dependencies_ = cached->dependencies;
-        plugin_display_names_ = cached->display_names;
-        plugin_descriptions_ = cached->descriptions;
-        catalog_ready_ = true;
+    std::shared_ptr<const CatalogCache> CatalogSnapshot() const {
+        std::scoped_lock lock(catalog_mutex_);
+        return catalog_cache_;
     }
 
     void RefreshSnapshot(const bool measure) {
+        const auto now = std::chrono::steady_clock::now();
+        if (now < next_snapshot_refresh_ && model_.PendingOperations().empty()) return;
+        next_snapshot_refresh_ = now + std::chrono::milliseconds(100);
         const auto refresh_started = measure ? std::chrono::steady_clock::now()
                                              : std::chrono::steady_clock::time_point{};
         auto phase_started = refresh_started;
-        RefreshCatalog();
+        const auto catalog = CatalogSnapshot();
+        contact_ = catalog ? catalog->contact : std::nullopt;
         RecordPerformance(PlatformUiPerformanceStage::RefreshCatalog, phase_started);
         phase_started = measure ? std::chrono::steady_clock::now()
                                 : std::chrono::steady_clock::time_point{};
@@ -1563,12 +2015,12 @@ private:
         phase_started = measure ? std::chrono::steady_clock::now()
                                 : std::chrono::steady_clock::time_point{};
         cabbird::PlatformUiSnapshot snapshot;
-        if (catalog_ready_) {
+        if (catalog && catalog->catalog && catalog->dependencies) {
             snapshot = cabbird::BuildPlatformUiSnapshot(
-                ++revision_, runtime_plugins, *catalog_, *dependencies_,
-                enablement, plugin_display_names_, plugin_descriptions_);
+                0, runtime_plugins, *catalog->catalog, *catalog->dependencies,
+                enablement, catalog->display_names, catalog->descriptions);
         } else {
-            snapshot = cabbird::BuildPlatformUiSnapshot(++revision_, runtime_plugins);
+            snapshot = cabbird::BuildPlatformUiSnapshot(0, runtime_plugins);
         }
         RecordPerformance(PlatformUiPerformanceStage::BuildSnapshot, phase_started);
         snapshot.diagnostics.runtime_version = diagnostics_.runtime_version;
@@ -1614,8 +2066,8 @@ private:
                                 : std::chrono::steady_clock::time_point{};
         snapshot.operation_results = model_.Snapshot().operation_results;
         snapshot.operation_plans = model_.Snapshot().operation_plans;
-        ResolveAwaitingBatch(snapshot);
         model_.Publish(std::move(snapshot));
+        ResolveAwaitingBatch(model_.Snapshot());
         RecordPerformance(PlatformUiPerformanceStage::ModelPublish, phase_started);
         phase_started = measure ? std::chrono::steady_clock::now()
                                 : std::chrono::steady_clock::time_point{};
@@ -1629,7 +2081,15 @@ private:
             *settings_draft_ != settings_snapshot_.values;
     }
 
+    [[nodiscard]] float SettingsScrollClearance() const noexcept {
+        const bool draft_bar_visible = SettingsDirty() || settings_save_pending_ ||
+            !settings_apply_error_.empty();
+        return FloatingBarClearance() + (draft_bar_visible
+            ? Scaled(36.0f + (kTabBarInset + 2.0f) * 2.0f + 10.0f) : 0.0f);
+    }
+
     static Route RouteFromKey(const std::string_view route) noexcept {
+        if (route == "unity_compatibility") return Route::Diagnostics;
         if (route == "diagnostics") return Route::Diagnostics;
         if (route == "settings") return Route::Settings;
         return Route::Plugins;
@@ -1709,12 +2169,13 @@ private:
                 model_.State().route = RouteFromKey(published.last_route);
             }
         }
-        ApplySettingsPreview();
     }
 
     void ApplySettingsPreview() {
         if (!settings_draft_) return;
         const auto& values = *settings_draft_;
+        cabbird::glass::SetReduceMotion(values.interface_reduced_motion);
+        cabbird::glass::SetReduceTransparency(values.interface_reduced_transparency);
         const bool custom_colors_changed =
             cabbird::GetCabbirdUiCustomColors() != values.interface_custom_colors;
         if (custom_colors_changed) {
@@ -1724,6 +2185,12 @@ private:
             cabbird::GetCabbirdUiPalette() != values.interface_palette;
         if (palette_changed) {
             cabbird::SetCabbirdUiPalette(values.interface_palette);
+            {
+                std::scoped_lock lock(theme_mutex_);
+                theme_requested_palette_ = values.interface_palette;
+                theme_reload_ = true;
+            }
+            theme_changed_.notify_all();
         }
         if (palette_changed ||
             (values.interface_palette == cabbird::CabbirdUiPalette::Custom &&
@@ -1733,8 +2200,10 @@ private:
         SetDeveloperMode(values.advanced_developer_mode);
         cabbird::SetHostUiInputCapturePolicy(values.input_capture_policy);
         ImGuiIO& io = ImGui::GetIO();
-        static_cast<void>(ApplyCabbirdUiFontScale(
-            static_cast<float>(values.interface_scale_percent) / 100.0f));
+        const float requested_scale = static_cast<float>(values.interface_scale_percent) / 100.0f;
+        if (std::abs(io.FontGlobalScale - requested_scale) > 0.0001f) {
+            static_cast<void>(ApplyCabbirdUiFontScale(requested_scale));
+        }
         if (values.input_gamepad_navigation) io.ConfigFlags |= ImGuiConfigFlags_NavEnableGamepad;
         else io.ConfigFlags &= ~ImGuiConfigFlags_NavEnableGamepad;
     }
@@ -1944,11 +2413,10 @@ private:
 
     [[nodiscard]] LayoutMode ComputeLayoutMode() const noexcept {
         const ImVec2 size = ImGui::GetWindowSize();
-        if (size.x >= Scaled(1180.0f) && size.y >= Scaled(720.0f)) {
+        if (size.x >= Scaled(980.0f) && size.y >= Scaled(600.0f)) {
             return LayoutMode::Wide;
         }
-        if (size.x >= Scaled(kPlatformStandardShellWidth) &&
-            size.y >= Scaled(kPlatformStandardShellHeight)) {
+        if (size.x >= Scaled(720.0f) && size.y >= Scaled(480.0f)) {
             return LayoutMode::Standard;
         }
         return LayoutMode::Compact;
@@ -1973,15 +2441,6 @@ private:
         return management_shell_collapsed_ || ManagementShellGloballyCollapsed();
     }
 
-    [[nodiscard]] bool NavigationCollapsed() const noexcept {
-        return IsCompact() || navigation_collapsed_;
-    }
-
-    [[nodiscard]] float NavigationWidth() const noexcept {
-        if (NavigationCollapsed()) return Scaled(56.0f);
-        return Scaled(layout_mode_ == LayoutMode::Wide ? 184.0f : 164.0f);
-    }
-
     [[nodiscard]] float PluginListWidth(const float available) const noexcept {
         const float default_width = Scaled(layout_mode_ == LayoutMode::Wide ? 360.0f : 320.0f);
         const float requested = plugin_list_width_ > 0.0f
@@ -2000,23 +2459,158 @@ private:
         ImGui::SetTooltip("%s", text);
     }
 
+    static void DrawGlass(ImDrawList* const list, const ImVec2 min, const ImVec2 max,
+        const cabbird::glass::Variant variant, const float rounding,
+        const bool shadow = true, const bool clip = true) noexcept {
+        cabbird::glass::SurfaceOptions options;
+        options.variant = variant;
+        options.rounding = Scaled(rounding);
+        options.scale = PlatformUiScale();
+        options.shadow = shadow;
+        options.clip = clip;
+        cabbird::glass::DrawSurface(list, min, max, options);
+    }
+
+    static ImVec4 InkColor(const float alpha) noexcept {
+        return ThemeColorWithAlpha(cabbird::CabbirdUiTheme().text, alpha);
+    }
+
+    // The accent darkened toward the text colour until it reads as ink on the
+    // light glass; the raw accent of light palettes is too pale for a label.
+    static ImVec4 AccentInk() noexcept {
+        const auto& theme = cabbird::CabbirdUiTheme();
+        const float mix = cabbird::glass::DarkAppearance() ? 0.0f : 0.45f;
+        return ImVec4(theme.accent.red + (theme.text.red - theme.accent.red) * mix,
+            theme.accent.green + (theme.text.green - theme.accent.green) * mix,
+            theme.accent.blue + (theme.text.blue - theme.accent.blue) * mix, 1.0f);
+    }
+
+    static constexpr ImVec4 kClear{0.0f, 0.0f, 0.0f, 0.0f};
+
+    static ImFont* FontForScale(const float scale) noexcept {
+        ImFont* font = CabbirdUiFontForScale(scale);
+        return font != nullptr ? font : ImGui::GetFont();
+    }
+
+    static constexpr float kTabBarItemHeight = 54.0f;
+    static constexpr float kTabBarInset = 5.0f;
+    static constexpr float kTabBarBottomMargin = 22.0f;
+    static constexpr float kTabBarItemPadding = 20.0f;
+    static constexpr float kTabBarRounding = 0.36f;
+
+    static float CapsuleRounding(const ImVec2 size) noexcept {
+        return (size.y > 0.0f ? size.y : ImGui::GetFrameHeight()) * kTabBarRounding;
+    }
+
+    // Vertical padding that makes a text field or combo 36 px tall, the height
+    // of the segmented controls it sits beside.
+    static float FieldPaddingY() noexcept {
+        return std::max(0.0f, std::round((Scaled(36.0f) - ImGui::GetFontSize()) * 0.5f));
+    }
+
+    // Where the leading glyph of the text field just submitted is drawn.
+    static ImVec2 FieldGlyphPosition() noexcept {
+        return Offset(ImGui::GetItemRectMin(), Scaled(11.0f),
+            (ImGui::GetItemRectSize().y - ImGui::GetTextLineHeight()) * 0.5f + Scaled(1.0f));
+    }
+
+    // How much of the route's bottom edge the floating tab bar covers, with a
+    // small gap: content that must stay reachable ends above this.
+    [[nodiscard]] static float FloatingBarClearance() noexcept {
+        return Scaled(kTabBarItemHeight + kTabBarInset * 2.0f + 8.0f);
+    }
+
+    [[nodiscard]] static ImVec2 ShellScrollTableSize() noexcept {
+        // A nested scrolling table owns its scroll range. Padding appended to
+        // its parent cannot move its final row out from under the floating bar.
+        const ImGuiWindow* const root = ImGui::GetCurrentWindow()->RootWindow;
+        const float visible_bottom = root->Pos.y + root->Size.y -
+            Scaled(kTabBarBottomMargin + kTabBarItemHeight + kTabBarInset * 2.0f + 8.0f);
+        return {0.0f, std::max(1.0f, std::min(ImGui::GetContentRegionAvail().y,
+            visible_bottom - ImGui::GetCursorScreenPos().y))};
+    }
+
+    // A selectable whose highlight is a rounded, animated capsule drawn under
+    // its label instead of ImGui's square header fill.
+    // A selectable with no fill at all: hover and selection only change the
+    // ink of its label. Callers lay a glass lens over the selected one.
+    bool CapsuleSelectable(const char* label, const bool selected, const ImVec2 size) const {
+        const auto& theme = cabbird::CabbirdUiTheme();
+        const ImVec2 cursor = ImGui::GetCursorScreenPos();
+        const ImVec2 resolved = ImGui::CalcItemSize(size,
+            ImGui::GetContentRegionAvail().x, ImGui::GetTextLineHeight());
+        const bool pointer_over = ImGui::IsWindowHovered() &&
+            ImGui::IsMouseHoveringRect(cursor, Offset(cursor, resolved.x, resolved.y));
+        ImGui::PushStyleColor(ImGuiCol_Header, kClear);
+        ImGui::PushStyleColor(ImGuiCol_HeaderHovered, kClear);
+        ImGui::PushStyleColor(ImGuiCol_HeaderActive, kClear);
+        ImGui::PushStyleColor(ImGuiCol_Text, selected ? AccentInk()
+            : pointer_over ? ThemeColor(theme.text) : InkColor(0.62f));
+        const bool clicked = ImGui::Selectable(label, selected, 0, size);
+        ImGui::PopStyleColor(4);
+        return clicked;
+    }
+
+    // A vertical list of choices on a content card. Labels change ink on hover
+    // and selection, and a glass lens slides under the selected row.
+    template <typename Label>
+    bool DrawLensRail(const char* id, const std::size_t count, std::size_t& selected,
+        Label&& label, const float row_height) const {
+        ImDrawList* const list = ImGui::GetWindowDrawList();
+        list->ChannelsSplit(2);
+        list->ChannelsSetCurrent(1);
+        ImRect selected_rect;
+        bool changed = false;
+        ImGui::PushID(id);
+        ImGui::PushStyleVar(ImGuiStyleVar_SelectableTextAlign, ImVec2(0.08f, 0.5f));
+        for (std::size_t index = 0; index < count; ++index) {
+            ImGui::PushID(static_cast<int>(index));
+            if (CapsuleSelectable(label(index).c_str(), index == selected,
+                    FillAvailableSize(row_height))) {
+                changed = changed || selected != index;
+                selected = index;
+            }
+            if (index == selected) {
+                selected_rect = ImRect(ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
+            }
+            ImGui::PopID();
+        }
+        ImGui::PopStyleVar();
+        list->ChannelsSetCurrent(0);
+        if (selected_rect.GetWidth() > 0.0f) {
+            const ImRect thumb = cabbird::glass::AnimateThumb(
+                ImGui::GetID("##rail-thumb"), selected_rect, ImGui::GetWindowPos());
+            cabbird::glass::DrawThumb(list, thumb.Min, thumb.Max,
+                thumb.GetHeight() * kTabBarRounding, PlatformUiScale(), true);
+        }
+        list->ChannelsMerge();
+        ImGui::PopID();
+        return changed;
+    }
+
     [[nodiscard]] bool PrimaryButton(const char* label, ImVec2 size = {}) const {
         const auto& theme = cabbird::CabbirdUiTheme();
         ImGui::PushStyleColor(ImGuiCol_Button, AccentColor());
-        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ThemeColor(theme.accent_hovered));
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, AccentColor());
         ImGui::PushStyleColor(ImGuiCol_ButtonActive, ThemeColor(theme.accent_active));
+        ImGui::PushStyleColor(ImGuiCol_Text, ThemeColor(theme.inverse_text));
+        ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, CapsuleRounding(size));
         const bool pressed = ImGui::Button(label, size);
-        ImGui::PopStyleColor(3);
+        ImGui::PopStyleVar();
+        ImGui::PopStyleColor(4);
         return pressed;
     }
 
     [[nodiscard]] bool DestructiveButton(const char* label, ImVec2 size = {}) const {
         const auto& theme = cabbird::CabbirdUiTheme();
-        ImGui::PushStyleColor(ImGuiCol_Button, ThemeColorWithAlpha(theme.danger, 0.72f));
-        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ThemeColor(theme.danger));
-        ImGui::PushStyleColor(ImGuiCol_ButtonActive, ThemeColorWithAlpha(theme.danger, 0.60f));
+        ImGui::PushStyleColor(ImGuiCol_Button, ThemeColorWithAlpha(theme.danger, 0.86f));
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ThemeColorWithAlpha(theme.danger, 0.86f));
+        ImGui::PushStyleColor(ImGuiCol_ButtonActive, ThemeColorWithAlpha(theme.danger, 0.70f));
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 1.0f, 1.0f, 1.0f));
+        ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, CapsuleRounding(size));
         const bool pressed = ImGui::Button(label, size);
-        ImGui::PopStyleColor(3);
+        ImGui::PopStyleVar();
+        ImGui::PopStyleColor(4);
         return pressed;
     }
 
@@ -2026,23 +2620,44 @@ private:
         return pressed;
     }
 
+    static void DrawGlyphCentred(const ShellGlyph glyph, const ImVec2 min, const ImVec2 max,
+        const ImU32 color, const float size = 0.0f) {
+        ImFont* const font = ImGui::GetFont();
+        if (font == nullptr) return;
+        const float glyph_size = size > 0.0f ? size : ImGui::GetFontSize();
+        const char* const text = ShellGlyphText(glyph);
+        const ImVec2 center = cabbird::glass::GlyphInkCenter(font, glyph_size, text);
+        ImGui::GetWindowDrawList()->AddText(font, glyph_size,
+            ImVec2(min.x + (max.x - min.x) * 0.5f - center.x,
+                min.y + (max.y - min.y) * 0.5f - center.y), color, text);
+    }
+
     [[nodiscard]] bool DrawShellIconButton(const char* id, const ShellGlyph glyph,
         const char* tooltip, const bool enabled = true, const bool selected = false) const {
         const auto& theme = cabbird::CabbirdUiTheme();
         ImGui::PushID(id);
-        ImGui::PushStyleColor(ImGuiCol_Button,
-            selected ? ThemeColorWithAlpha(theme.accent, 0.16f)
-                    : ImVec4(0.0f, 0.0f, 0.0f, 0.0f));
-        ImGui::PushStyleColor(ImGuiCol_ButtonHovered,
-            selected ? ThemeColorWithAlpha(theme.accent, 0.26f) : RaisedColor());
-        ImGui::PushStyleColor(ImGuiCol_ButtonActive, ThemeColor(theme.button_active));
-        ImGui::PushStyleColor(ImGuiCol_Text, selected ? AccentColor()
-            : ThemeColor(theme.text_muted));
+        const ImVec2 cursor = ImGui::GetCursorScreenPos();
+        const bool pointer_over = enabled && ImGui::IsWindowHovered() &&
+            ImGui::IsMouseHoveringRect(cursor, Offset(cursor, Scaled(30.0f), Scaled(30.0f)));
+        const ImVec4 fill = selected ? ThemeColorWithAlpha(theme.accent, 0.24f) : kClear;
+        ImVec4 text_color = selected || pointer_over
+            ? ThemeColor(theme.text) : ThemeColor(theme.text_muted);
+        if (!enabled) text_color.w *= ImGui::GetStyle().DisabledAlpha;
+        ImGui::PushStyleColor(ImGuiCol_Button, fill);
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, fill);
+        ImGui::PushStyleColor(ImGuiCol_ButtonActive, fill);
+        ImGui::PushStyleColor(ImGuiCol_Text, kClear);
+        ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, Scaled(10.0f));
         ImGui::BeginDisabled(!enabled);
-        const bool pressed = ImGui::Button(ShellGlyphText(glyph), Scaled(30.0f, 30.0f));
+        const bool pressed = ImGui::Button("##icon", Scaled(30.0f, 30.0f));
         ImGui::EndDisabled();
         const bool hovered = ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled);
+        const ImVec2 item_min = ImGui::GetItemRectMin();
+        const ImVec2 item_max = ImGui::GetItemRectMax();
+        ImGui::PopStyleVar();
         ImGui::PopStyleColor(4);
+        DrawGlyphCentred(glyph, item_min, item_max,
+            ImGui::ColorConvertFloat4ToU32(text_color));
         ImGui::PopID();
         if (hovered && tooltip != nullptr) ImGui::SetTooltip("%s", tooltip);
         return pressed && enabled;
@@ -2054,33 +2669,61 @@ private:
         const auto& theme = cabbird::CabbirdUiTheme();
         const std::string text = std::string(ShellGlyphText(glyph)) + "  " + label;
         ImGui::PushID(id);
-        ImGui::PushStyleColor(ImGuiCol_Button, primary ? AccentColor() : SurfaceColor());
-        ImGui::PushStyleColor(ImGuiCol_ButtonHovered,
-            primary ? ThemeColor(theme.accent_hovered) : RaisedColor());
+        ImGui::PushStyleColor(ImGuiCol_Button, primary ? AccentColor() : InkColor(0.085f));
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, primary ? AccentColor() : InkColor(0.085f));
         ImGui::PushStyleColor(ImGuiCol_ButtonActive,
-            primary ? ThemeColor(theme.accent_active) : ThemeColor(theme.button_active));
+            primary ? ThemeColor(theme.accent_active) : InkColor(0.14f));
         ImGui::PushStyleColor(ImGuiCol_Text,
-            primary ? ThemeColor(theme.inverse_text) : ThemeColor(theme.text_muted));
+            primary ? ThemeColor(theme.inverse_text) : ThemeColor(theme.text));
+        const ImVec2 button_size = size.x > 0.0f ? size : ImVec2(0.0f, Scaled(30.0f));
+        ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, CapsuleRounding(button_size));
         ImGui::BeginDisabled(!enabled);
-        const bool pressed = ImGui::Button(
-            text.c_str(), size.x > 0.0f ? size : ImVec2(0.0f, Scaled(30.0f)));
+        const bool pressed = ImGui::Button(text.c_str(), button_size);
         ImGui::EndDisabled();
+        ImGui::PopStyleVar();
         ImGui::PopStyleColor(4);
         ImGui::PopID();
         return pressed && enabled;
     }
 
+    static void DrawCardSurface(const ImVec2 origin, const ImVec2 size) {
+        cabbird::glass::SurfaceOptions options;
+        options.variant = cabbird::glass::Variant::Material;
+        options.rounding = Scaled(14.0f);
+        options.scale = PlatformUiScale();
+        options.shadow = false;
+        cabbird::glass::DrawSurface(ImGui::GetWindowDrawList(), origin,
+            Offset(origin, size.x, size.y), options);
+    }
+
+    void BeginCardChild(const char* id, const ImVec2 size, const float padding,
+        const ImGuiWindowFlags flags = 0) const {
+        const ImVec2 resolved = ImGui::CalcItemSize(size,
+            ImGui::GetContentRegionAvail().x, ImGui::GetContentRegionAvail().y);
+        DrawCardSurface(ImGui::GetCursorScreenPos(), resolved);
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, Scaled(padding, padding));
+        ImGui::BeginChild(id, resolved, ImGuiChildFlags_AlwaysUseWindowPadding,
+            flags | ImGuiWindowFlags_NoBackground);
+        ImGui::PopStyleVar();
+    }
+
+    void EndCardChild() const { ImGui::EndChild(); }
+
     void BeginShellBodyChild(const char* id, const ImVec2 size = {},
         const bool bordered = false, const ImGuiWindowFlags window_flags = 0) const {
         const float padding = Scaled(IsCompact() ? 12.0f : 16.0f);
+        if (bordered) {
+            const ImVec2 resolved = ImGui::CalcItemSize(size,
+                ImGui::GetContentRegionAvail().x, ImGui::GetContentRegionAvail().y);
+            DrawCardSurface(ImGui::GetCursorScreenPos(), resolved);
+        }
         ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(padding, padding));
-        ImGui::BeginChild(id, size,
-            bordered ? ImGuiChildFlags_Borders | ImGuiChildFlags_AlwaysUseWindowPadding
-                     : ImGuiChildFlags_AlwaysUseWindowPadding,
-            window_flags);
+        ImGui::BeginChild(id, size, ImGuiChildFlags_AlwaysUseWindowPadding,
+            window_flags | (bordered ? ImGuiWindowFlags_NoBackground : 0));
     }
 
     void EndShellBodyChild() const {
+        ImGui::Dummy(ImVec2(0.0f, FloatingBarClearance()));
         ImGui::EndChild();
         ImGui::PopStyleVar();
     }
@@ -2118,13 +2761,49 @@ private:
         return std::string(suffix);
     }
 
+    // Draws the glossy top sheen of a plugin tile. AddRectFilledMultiColor cannot be used
+    // here: that fill is an axis-aligned rectangle, so it squares off the rounded top
+    // corners. The silhouette is emitted once as a convex fan with a per-vertex alpha
+    // ramp instead: the corners follow the tile's own path, and the ramp is interpolated
+    // by the rasterizer, so the fade is exactly the linear gradient the rectangle faked.
+    static void DrawIconTopSheen(ImDrawList* const draw_list, const ImVec2 minimum,
+        const ImVec2 maximum, const float rounding) {
+        const float height = maximum.y - minimum.y;
+        if (height <= 0.0f) return;
+        draw_list->PathRect(minimum, maximum, rounding, ImDrawFlags_RoundCornersTop);
+        const int point_count = draw_list->_Path.Size;
+        if (point_count < 3) {
+            draw_list->PathClear();
+            return;
+        }
+        const ImVec2 white_uv = draw_list->_Data->TexUvWhitePixel;
+        draw_list->PrimReserve((point_count - 2) * 3, point_count);
+        const auto index_base = static_cast<ImDrawIdx>(draw_list->_VtxCurrentIdx);
+        for (int i = 0; i < point_count; ++i) {
+            const ImVec2 point = draw_list->_Path[i];
+            const float fade = ImClamp(1.0f - (point.y - minimum.y) / height, 0.0f, 1.0f);
+            draw_list->PrimWriteVtx(point, white_uv,
+                IM_COL32(255, 255, 255, static_cast<int>(40.0f * fade + 0.5f)));
+        }
+        for (int i = 2; i < point_count; ++i) {
+            draw_list->PrimWriteIdx(index_base);
+            draw_list->PrimWriteIdx(static_cast<ImDrawIdx>(index_base + i - 1));
+            draw_list->PrimWriteIdx(static_cast<ImDrawIdx>(index_base + i));
+        }
+        draw_list->PathClear();
+    }
+
     static void DrawGenericPluginIcon(const ImVec2 position, const float size) {
         const auto& theme = cabbird::CabbirdUiTheme();
         ImDrawList* const draw_list = ImGui::GetWindowDrawList();
-        const ImU32 border = ImGui::ColorConvertFloat4ToU32(ThemeColor(theme.icon_border));
+        const ImU32 border = ImGui::ColorConvertFloat4ToU32(
+            ThemeColorWithAlpha(theme.icon_border, 0.55f));
         const ImU32 fill = ImGui::ColorConvertFloat4ToU32(ThemeColor(theme.icon_fill));
-        draw_list->AddRectFilled(position, Offset(position, size, size), fill, Scaled(4.0f));
-        draw_list->AddRect(position, Offset(position, size, size), border, Scaled(4.0f));
+        // A continuous-corner tile in the proportion Apple uses for app icons.
+        const float rounding = size * 0.26f;
+        draw_list->AddRectFilled(position, Offset(position, size, size), fill, rounding);
+        DrawIconTopSheen(draw_list, position, Offset(position, size, size * 0.5f), rounding);
+        draw_list->AddRect(position, Offset(position, size, size), border, rounding);
         const ImVec2 glyph_size = ImGui::CalcTextSize(ShellGlyphText(ShellGlyph::Package));
         draw_list->AddText(Offset(position, (size - glyph_size.x) * 0.5f,
             (size - glyph_size.y) * 0.5f - Scaled(1.0f)),
@@ -2140,21 +2819,20 @@ private:
             ImGui::CalcTextSize(label).x + Scaled(14.0f);
     }
 
+    [[nodiscard]] static float PluginStateBadgeHeight() noexcept { return Scaled(20.0f); }
+
     void DrawPluginStateBadge(const ImVec2 position,
         const cabbird::PlatformUiPluginState state) const {
         const char* const glyph = ShellGlyphText(StateGlyph(state));
         const char* const label = DisplayPluginState(state);
         const float glyph_width = ImGui::CalcTextSize(glyph).x;
         const float width = PluginStateBadgeWidth(state);
-        const float height = Scaled(20.0f);
+        const float height = PluginStateBadgeHeight();
         const ImVec4 color = PluginStateColor(state);
         ImDrawList* const draw_list = ImGui::GetWindowDrawList();
         draw_list->AddRectFilled(position, Offset(position, width, height),
-            ImGui::ColorConvertFloat4ToU32(ImVec4(color.x, color.y, color.z, 0.15f)),
-            Scaled(3.0f));
-        draw_list->AddRect(position, Offset(position, width, height),
-            ImGui::ColorConvertFloat4ToU32(ImVec4(color.x, color.y, color.z, 0.34f)),
-            Scaled(3.0f));
+            ImGui::ColorConvertFloat4ToU32(ImVec4(color.x, color.y, color.z, 0.17f)),
+            height * 0.5f);
         draw_list->AddText(ScaledOffset(position, 7.0f, 4.0f),
             ImGui::ColorConvertFloat4ToU32(color), glyph);
         draw_list->AddText(Offset(
@@ -2191,30 +2869,172 @@ private:
     }
 
     void DrawManagementShell() {
-        RedirectHiddenUnityCompatibilityRoute();
-        const bool was_collapsed = ManagementShellCollapsed();
+        page_header_actions_ = nullptr;
+        // The route is drawn first so the header can carry the route's actions
+        // in the same row as the window controls.
+        const ImVec2 top = ImGui::GetCursorPos();
+        if (!ManagementShellCollapsed()) {
+            ImGui::SetCursorPos(ImVec2(top.x, top.y + Scaled(kPlatformHeaderHeight)));
+            DrawShellWorkspace();
+        }
+        ImGui::SetCursorPos(top);
         DrawShellHeader();
-        if (was_collapsed || ManagementShellCollapsed()) return;
+    }
 
+    void DrawShellWorkspace() {
         const float workspace_height = ImGui::GetContentRegionAvail().y;
         ImGui::BeginChild("PlatformShellWorkspace", ImVec2(0.0f, workspace_height), false,
-            ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
-        const float navigation_width = NavigationWidth();
-        ImGui::PushStyleColor(ImGuiCol_ChildBg, NavColor());
-        // Shell navigation applies its own 8px inset so the selected state
-        // has the same width in compact and expanded layouts.
-        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.0f, 0.0f));
-        ImGui::BeginChild("PlatformShellNavigation", ImVec2(navigation_width, 0.0f), true,
-            ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
-        DrawShellNavigation();
-        ImGui::EndChild();
-        ImGui::PopStyleVar();
-        ImGui::PopStyleColor();
-        ImGui::SameLine(0.0f, 0.0f);
-        ImGui::BeginChild("PlatformShellRoute", ImVec2(0.0f, 0.0f), false,
-            ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
+            ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse |
+                ImGuiWindowFlags_NoBackground);
+        ImGui::SetCursorPos(ImVec2(Scaled(14.0f), 0.0f));
+        ImGui::BeginChild("PlatformShellRoute",
+            ImVec2(-Scaled(14.0f), -Scaled(12.0f)), false,
+            ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse |
+                ImGuiWindowFlags_NoBackground);
         DrawShellRoute();
         ImGui::EndChild();
+        DrawShellTabBar();
+        DrawSettingsDraftBar();
+        ImGui::EndChild();
+    }
+
+    // The route switcher: a floating Liquid Glass tab bar centred at the
+    // bottom of the shell, with each route's icon above its label and a glass
+    // lens sliding under the selected one.
+    void DrawShellTabBar() {
+        const auto& theme = cabbird::CabbirdUiTheme();
+        const auto& snapshot = model_.Snapshot();
+        constexpr std::array<Route, 3> routes{
+            Route::Plugins, Route::Diagnostics, Route::Settings};
+        const float scale = PlatformUiScale();
+        const float icon_scale = IsCompact() ? 1.40f : 1.55f;
+        ImFont* const icon_font = FontForScale(scale * icon_scale);
+        const float icon_size = Scaled(cabbird::CabbirdUiBaseFontSize() * icon_scale);
+        ImFont* const label_font = ImGui::GetFont();
+        const float label_size = ImGui::GetFontSize();
+        float content_width = 0.0f;
+        for (const Route route : routes) {
+            content_width = std::max(content_width,
+                label_font->CalcTextSizeA(label_size, FLT_MAX, 0.0f, RouteLabel(route)).x);
+            content_width = std::max(content_width, icon_size);
+        }
+        const float desired_item_width = content_width + Scaled(kTabBarItemPadding) * 2.0f;
+        const float maximum_item_width = (std::max)(1.0f,
+            (ImGui::GetWindowSize().x - Scaled(28.0f + kTabBarInset * 2.0f)) /
+                static_cast<float>(routes.size()));
+        const float item_width = (std::min)(desired_item_width, maximum_item_width);
+        const float item_height = Scaled(kTabBarItemHeight);
+        const float inset = Scaled(kTabBarInset);
+        const float item_rounding = item_height * kTabBarRounding;
+        const float bar_width = item_width * static_cast<float>(routes.size()) + inset * 2.0f;
+        const float bar_height = item_height + inset * 2.0f;
+        const ImVec2 window_position = ImGui::GetWindowPos();
+        const ImVec2 window_size = ImGui::GetWindowSize();
+        const ImVec2 bar_min(
+            std::round(window_position.x + (window_size.x - bar_width) * 0.5f),
+            std::round(window_position.y + window_size.y - Scaled(kTabBarBottomMargin) -
+                bar_height));
+        const ImVec2 bar_max = Offset(bar_min, bar_width, bar_height);
+        tab_bar_rect_ = ImRect(bar_min, bar_max);
+        // The bar is a child window of its own, submitted after the route, so it
+        // floats over the page and takes the pointer before the page does.
+        ImGui::SetCursorScreenPos(bar_min);
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.0f, 0.0f));
+        ImGui::BeginChild("PlatformShellTabBar", ImVec2(bar_width, bar_height), false,
+            ImGuiWindowFlags_NoBackground | ImGuiWindowFlags_NoScrollbar |
+                ImGuiWindowFlags_NoScrollWithMouse);
+        ImGui::PopStyleVar();
+        ImDrawList* const list = ImGui::GetWindowDrawList();
+
+        // The bar floats over the wallpaper and the stickers, so it is captured
+        // fresh: everything the route drew is part of what it refracts.
+        cabbird::glass::CaptureBackdrop(list);
+        cabbird::glass::SurfaceOptions bar;
+        bar.variant = cabbird::glass::Variant::Regular;
+        bar.rounding = item_rounding + inset;
+        bar.scale = scale;
+        bar.shadow = false;
+        bar.tint_strength = cabbird::glass::DarkAppearance() ? 0.30f : 0.16f;
+        cabbird::glass::DrawSurface(list, bar_min, bar_max, bar);
+
+        std::size_t selected_index = 0;
+        for (std::size_t index = 0; index < routes.size(); ++index) {
+            if (model_.State().route == routes[index]) selected_index = index;
+        }
+        {
+            const ImVec2 item_min = Offset(bar_min,
+                inset + item_width * static_cast<float>(selected_index), inset);
+            const ImRect target(item_min, Offset(item_min, item_width, item_height));
+            ImRect thumb = cabbird::glass::AnimateThumb(
+                ImGui::GetID("##tab-bar-thumb"), target, bar_min);
+            const float press = cabbird::glass::Animate(
+                ImGui::GetID("##tab-bar-press"), tab_bar_held_ ? 1.0f : 0.0f, 20.0f);
+            const float grow = press * Scaled(2.5f);
+            thumb.Expand(ImVec2(grow * 1.4f, grow));
+            cabbird::glass::DrawThumb(list, thumb.Min, thumb.Max, item_rounding + grow,
+                scale, false);
+        }
+
+        bool held = false;
+        for (std::size_t index = 0; index < routes.size(); ++index) {
+            const Route route = routes[index];
+            const bool selected = index == selected_index;
+            const ImVec2 item_min = Offset(bar_min,
+                inset + item_width * static_cast<float>(index), inset);
+            ImGui::SetCursorScreenPos(item_min);
+            std::string item_id{"##tab-"};
+            item_id += cabbird::ToString(route);
+            const bool clicked = ImGui::InvisibleButton(
+                item_id.c_str(), ImVec2(item_width, item_height));
+            const bool hovered = ImGui::IsItemHovered();
+            held = held || ImGui::IsItemActive();
+            // Hover only changes the ink of the icon and the label.
+            const ImU32 ink = ImGui::GetColorU32(
+                selected ? AccentInk() : hovered ? ThemeColor(theme.text) : InkColor(0.62f));
+            const char* const glyph = ShellGlyphText(RouteGlyph(route));
+            const ImVec2 glyph_center =
+                cabbird::glass::GlyphInkCenter(icon_font, icon_size, glyph);
+            const float center_x = item_min.x + item_width * 0.5f;
+            const ImVec2 icon_center(center_x, item_min.y + item_height * 0.36f);
+            list->AddText(icon_font, icon_size,
+                ImVec2(std::round(icon_center.x - glyph_center.x),
+                    std::round(icon_center.y - glyph_center.y)),
+                ink, glyph);
+            const std::string display_label = Ellipsize(RouteLabel(route),
+                (std::max)(1.0f, item_width - Scaled(12.0f)));
+            const char* const label = display_label.c_str();
+            const ImVec2 label_extent =
+                label_font->CalcTextSizeA(label_size, FLT_MAX, 0.0f, label);
+            list->AddText(label_font, label_size,
+                ImVec2(std::round(center_x - label_extent.x * 0.5f),
+                    std::round(item_min.y + item_height * 0.77f - label_extent.y * 0.5f)),
+                ink, label);
+
+            std::string badge;
+            bool dot = false;
+            if (route == Route::Plugins && snapshot.runtime_summary.issues != 0) {
+                badge = std::to_string(snapshot.runtime_summary.issues);
+            } else if (route == Route::Settings && SettingsDirty()) {
+                dot = true;
+            }
+            if (!badge.empty() || dot) {
+                const ImVec2 badge_center(icon_center.x + icon_size * 0.52f,
+                    icon_center.y - icon_size * 0.40f);
+                const float badge_radius = Scaled(dot ? 4.0f : 8.0f);
+                list->AddCircleFilled(badge_center, badge_radius,
+                    ImGui::GetColorU32(dot ? WarningColor() : ErrorColor()));
+                if (!badge.empty()) {
+                    const float badge_text = ImGui::GetFontSize() * 0.80f;
+                    const ImVec2 extent = label_font->CalcTextSizeA(
+                        badge_text, FLT_MAX, 0.0f, badge.c_str());
+                    list->AddText(label_font, badge_text,
+                        ImVec2(badge_center.x - extent.x * 0.5f, badge_center.y - extent.y * 0.5f),
+                        IM_COL32(255, 255, 255, 255), badge.c_str());
+                }
+            }
+            if (clicked) Navigate(route);
+        }
+        tab_bar_held_ = held;
         ImGui::EndChild();
     }
 
@@ -2227,7 +3047,11 @@ private:
                              : cabbird::MessageId::ShellCollapse);
         if (DrawShellHeaderControl("##shell-collapse", ShellHeaderControl::Collapse,
                 collapsed, locked, collapse_tooltip)) {
-            management_shell_collapsed_ = !management_shell_collapsed_;
+            if (diagnostics_.standalone_window && g_window != nullptr) {
+                ShowWindow(g_window->window, SW_MINIMIZE);
+            } else {
+                management_shell_collapsed_ = !management_shell_collapsed_;
+            }
         }
         ImGui::SameLine(0.0f, Scaled(4.0f));
         const char* const lock_tooltip = locked
@@ -2242,7 +3066,9 @@ private:
         ImGui::SameLine(0.0f, Scaled(4.0f));
         if (DrawShellHeaderControl("##shell-close", ShellHeaderControl::Close,
                 false, false, Text(cabbird::MessageId::ShellClose))) {
-            if (plugins_.UiResources().CloseWindow(
+            if (diagnostics_.standalone_window && g_window != nullptr) {
+                PostMessageW(g_window->window, WM_CLOSE, 0, 0);
+            } else if (plugins_.UiResources().CloseWindow(
                     management_window_scope_, management_window_)) {
                 cabbird::SetHostUiMenusCollapsed(true);
             }
@@ -2250,6 +3076,7 @@ private:
     }
 
     void DrawShellDragRegion(const ImVec2 origin, const ImVec2 size) const {
+        if (diagnostics_.standalone_window) return;
         ImGuiWindow* const header = ImGui::GetCurrentWindow();
         if (header == nullptr) return;
         ImGuiWindow* const root = header->RootWindow == nullptr ? header : header->RootWindow;
@@ -2273,11 +3100,11 @@ private:
         const auto& theme = cabbird::CabbirdUiTheme();
         ImGui::PushStyleColor(ImGuiCol_ChildBg, ThemeColor(theme.header_background));
         ImGui::BeginChild("PlatformGlobalHeader",
-            ImVec2(0.0f, Scaled(kPlatformHeaderHeight)), true,
-            ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
+            ImVec2(0.0f, Scaled(kPlatformHeaderHeight)), false,
+            ImGuiWindowFlags_NoBackground | ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
         const ImVec2 origin = ImGui::GetWindowPos();
         const ImVec2 size = ImGui::GetWindowSize();
-        DrawShellDragRegion(origin, size);
+        ImDrawList* const list = ImGui::GetWindowDrawList();
         ImGui::SetCursorScreenPos(ScaledOffset(origin, 16.0f, 11.0f));
         const float logo_size = Scaled(kPlatformHeaderLogoSize);
         const bool logo_drawn = (logo_texture_ && plugins_.DrawUiTexture(
@@ -2285,116 +3112,49 @@ private:
             logo_size, 0xffffffffU)) ||
             DrawStandaloneHeaderLogo(logo_size, logo_size);
         if (!logo_drawn) ImGui::Dummy(ImVec2(logo_size, logo_size));
-        ImGui::GetWindowDrawList()->AddText(ImGui::GetFont(), ImGui::GetFontSize() * 1.35f,
-            ScaledOffset(origin, 56.0f, 16.0f),
-            ImGui::ColorConvertFloat4ToU32(ThemeColor(theme.text)),
-            Text(cabbird::MessageId::ApplicationTitle));
+        const bool strip = ManagementShellCollapsed();
+        {
+            // A fixed product title, drawn from a bake of its own size.
+            const float title_scale = 1.45f;
+            ImFont* const title_font =
+                FontForScale(PlatformUiScale() * title_scale);
+            const float title_size = Scaled(cabbird::CabbirdUiBaseFontSize() * title_scale);
+            list->AddText(title_font, title_size,
+                ImVec2(std::round(origin.x + Scaled(56.0f)),
+                    std::round(origin.y + (size.y - title_size) * 0.5f)),
+                ImGui::ColorConvertFloat4ToU32(ThemeColor(theme.text)),
+                Text(cabbird::MessageId::ApplicationTitle));
+        }
+        // Page actions go in before the drag region so they own the pointer.
+        if (!strip && page_header_actions_) {
+            const ImVec2 area_origin = Offset(origin, Scaled(40.0f), Scaled(1.0f));
+            const ImVec2 area_size(std::max(0.0f, size.x - Scaled(40.0f) -
+                    Scaled(kPlatformHeaderActionColumnWidth) - Scaled(6.0f)),
+                Scaled(kPlatformHeaderHeight));
+            page_header_actions_(area_origin, area_size);
+        }
+        DrawShellDragRegion(origin, size);
         if (!ManagementShellGloballyCollapsed()) {
-            ImGui::SetCursorScreenPos(
-                Offset(origin, size.x - Scaled(kPlatformHeaderActionColumnWidth), Scaled(11.0f)));
+            const ImVec2 controls = Offset(
+                origin, size.x - Scaled(kPlatformHeaderActionColumnWidth), Scaled(11.0f));
+            DrawGlass(list, Offset(controls, -Scaled(4.0f), -Scaled(4.0f)),
+                Offset(controls, Scaled(102.0f), Scaled(34.0f)),
+                cabbird::glass::Variant::Regular, 12.0f);
+            ImGui::SetCursorScreenPos(controls);
             DrawShellWindowControls();
         }
         ImGui::EndChild();
         ImGui::PopStyleColor();
     }
 
-    void DrawShellNavigation() {
-        const auto& theme = cabbird::CabbirdUiTheme();
-        constexpr std::array<Route, 3> routes{
-            Route::Plugins, Route::Diagnostics, Route::Settings};
-        const bool collapsed = NavigationCollapsed();
-        const auto& snapshot = model_.Snapshot();
-        const float width = ImGui::GetContentRegionAvail().x;
-        float y = Scaled(10.0f);
-        for (const Route route : routes) {
-            ImGui::SetCursorPos(ImVec2(Scaled(8.0f), y));
-            const bool selected = model_.State().route == route;
-            std::string item_id{"##nav-"};
-            item_id += cabbird::ToString(route);
-            ImGui::PushStyleColor(ImGuiCol_Header, selected
-                ? ThemeColorWithAlpha(theme.accent, 0.16f) : ImVec4(0, 0, 0, 0));
-            const bool clicked = ImGui::Selectable(item_id.c_str(), selected, 0,
-                ImVec2(std::max(0.0f, width - Scaled(16.0f)), Scaled(40.0f)));
-            ImGui::PopStyleColor();
-            const ImVec2 item_min = ImGui::GetItemRectMin();
-            const ImVec2 item_max = ImGui::GetItemRectMax();
-            ImDrawList* const draw_list = ImGui::GetWindowDrawList();
-            if (selected) {
-                draw_list->AddRectFilled(
-                    item_min, ImVec2(item_min.x + Scaled(3.0f), item_max.y),
-                    ImGui::ColorConvertFloat4ToU32(AccentColor()), Scaled(2.0f));
-            }
-            const ImU32 primary_text = ImGui::ColorConvertFloat4ToU32(selected
-                ? ThemeColor(theme.text) : ThemeColor(theme.text_muted));
-            const char* const glyph = ShellGlyphText(RouteGlyph(route));
-            // Keep the route icons on one left-aligned grid when the rail changes width.
-            const float icon_x = Scaled(12.0f);
-            draw_list->AddText(Offset(item_min, icon_x, Scaled(12.0f)), primary_text, glyph);
-            if (!collapsed) {
-                const char* route_label = RouteLabel(route);
-                draw_list->AddText(ScaledOffset(item_min, 38.0f, 12.0f), primary_text, route_label);
-                std::string indicator;
-                if (route == Route::Plugins && snapshot.runtime_summary.issues != 0) {
-                    indicator = std::to_string(snapshot.runtime_summary.issues);
-                } else if (route == Route::Settings && SettingsDirty()) {
-                    indicator = "*";
-                }
-                if (!indicator.empty()) {
-                    const float indicator_width = ImGui::CalcTextSize(indicator.c_str()).x;
-                    const float indicator_slot_width = Scaled(16.0f);
-                    const float indicator_x = item_max.x - Scaled(12.0f) - indicator_slot_width +
-                        (indicator_slot_width - indicator_width) * 0.5f;
-                    draw_list->AddText(ImVec2(indicator_x, item_min.y + Scaled(12.0f)),
-                        ImGui::ColorConvertFloat4ToU32(WarningColor()), indicator.c_str());
-                }
-            }
-            if (collapsed) {
-                std::string tooltip{RouteLabel(route)};
-                if (route == Route::Plugins && snapshot.runtime_summary.issues != 0) {
-                    const std::string count = std::to_string(snapshot.runtime_summary.issues);
-                    const std::array<std::string_view, 1> arguments{count};
-                    tooltip += ": " + Format(cabbird::MessageId::ShellIssues, arguments);
-                }
-                DrawTooltip(tooltip.c_str());
-            }
-            if (clicked) Navigate(route);
-            y += Scaled(44.0f);
-        }
-
-        ImGui::SetCursorPos(ImVec2(Scaled(8.0f),
-            std::max(y + Scaled(8.0f), ImGui::GetWindowSize().y - Scaled(48.0f))));
-        if (DrawShellIconButton("navigation-collapse",
-                collapsed ? ShellGlyph::ChevronRight : ShellGlyph::ChevronLeft,
-                Text(collapsed ? cabbird::MessageId::ShellExpandNavigation
-                               : cabbird::MessageId::ShellCollapseNavigation),
-                !IsCompact())) {
-            navigation_collapsed_ = !navigation_collapsed_;
-        }
-    }
-
+    // Publishes the route's header actions; the global header draws them
+    // after the route. `actions` receives the origin and size of the header
+    // area left of the window controls. The title is fixed to the product
+    // name, so the route's own title is not shown.
     template <typename DrawActions>
     void DrawShellPageHeader(
-        const char* title, const std::string_view subtitle, DrawActions&& actions,
-        const float title_inset = 0.0f) {
-        ImGui::PushStyleColor(ImGuiCol_ChildBg,
-            ThemeColor(cabbird::CabbirdUiTheme().window_background));
-        ImGui::BeginChild("PlatformPageHeader", ImVec2(0.0f, Scaled(48.0f)), true,
-            ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
-        const ImVec2 origin = ImGui::GetWindowPos();
-        const ImVec2 size = ImGui::GetWindowSize();
-        const float title_x = Scaled(IsCompact() ? 10.0f : 16.0f) + title_inset;
-        ImGui::SetCursorScreenPos(Offset(
-            origin, title_x, Scaled(subtitle.empty() ? 14.0f : 7.0f)));
-        ImGui::SetWindowFontScale(IsCompact() ? 1.12f : 1.35f);
-        ImGui::TextUnformatted(title);
-        ImGui::SetWindowFontScale(1.0f);
-        if (!subtitle.empty() && !IsCompact()) {
-            ImGui::SetCursorScreenPos(Offset(origin, title_x, Scaled(28.0f)));
-            ImGui::TextDisabled("%.*s", static_cast<int>(subtitle.size()), subtitle.data());
-        }
-        actions(origin, size);
-        ImGui::EndChild();
-        ImGui::PopStyleColor();
+        const char*, const std::string_view, DrawActions&& actions, const float = 0.0f) {
+        page_header_actions_ = std::forward<DrawActions>(actions);
     }
 
     void DrawShellProviderUnavailable(const char* subject, const char* reason) {
@@ -2580,10 +3340,7 @@ private:
     void DrawShellRoute() {
         switch (model_.State().route) {
         case Route::Plugins: DrawPluginsShell(); break;
-        case Route::UnityCompatibility:
-            RedirectHiddenUnityCompatibilityRoute();
-            DrawDiagnosticsShell();
-            break;
+        case Route::UnityCompatibility: DrawDiagnosticsShell(); break;
         case Route::Diagnostics: DrawDiagnosticsShell(); break;
         case Route::Settings: DrawSettingsShell(); break;
         }
@@ -2610,16 +3367,19 @@ private:
             state.plugin_tab == Tab::Installed;
         const auto* selected = model_.Snapshot().FindPlugin(state.selected_plugin_id);
         if (compact_detail && selected != nullptr) {
-            DrawShellPageHeader(selected->name.empty() ? selected->id.c_str() : selected->name.c_str(), {},
-                [this](const ImVec2& origin, const ImVec2&) {
-                    ImGui::SetCursorScreenPos(ScaledOffset(origin, 10.0f, 9.0f));
-                    if (DrawShellIconButton("back-to-plugin-list", ShellGlyph::ChevronLeft,
-                            Text(cabbird::MessageId::CommonBack))) {
-                        compact_plugin_detail_ = false;
-                    }
-                }, Scaled(42.0f));
+            DrawShellPageHeader(Text(cabbird::MessageId::ShellRoutePlugins), {},
+                [](const ImVec2&, const ImVec2&) {});
+            if (DrawShellIconButton("back-to-plugin-list", ShellGlyph::ChevronLeft,
+                    Text(cabbird::MessageId::CommonBack))) {
+                compact_plugin_detail_ = false;
+            }
+            ImGui::SameLine();
+            ImGui::SetCursorPosY(ImGui::GetCursorPosY() +
+                (Scaled(30.0f) - ImGui::GetTextLineHeight()) * 0.5f);
+            ImGui::TextUnformatted(
+                selected->name.empty() ? selected->id.c_str() : selected->name.c_str());
             ImGui::BeginChild("PlatformCompactPluginDetail", ImVec2(0.0f, 0.0f), false,
-                ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
+                ImGuiWindowFlags_NoBackground | ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
             DrawPluginPublicDetail(*selected);
             ImGui::EndChild();
             return;
@@ -2636,8 +3396,12 @@ private:
         DrawShellPageHeader(Text(cabbird::MessageId::ShellRoutePlugins),
             installed ? std::string_view{} : repository_subtitle,
             [this, installed, repository_catalog](const ImVec2& origin, const ImVec2& size) {
-                const float more_x = size.x - Scaled(46.0f);
-                ImGui::SetCursorScreenPos(Offset(origin, more_x, Scaled(9.0f)));
+                const float more_x = size.x - Scaled(42.0f);
+                const ImVec2 disc = Offset(origin, more_x, Scaled(10.0f));
+                DrawGlass(ImGui::GetWindowDrawList(), Offset(disc, -Scaled(4.0f), -Scaled(4.0f)),
+                    Offset(disc, Scaled(34.0f), Scaled(34.0f)),
+                    cabbird::glass::Variant::Regular, 12.0f);
+                ImGui::SetCursorScreenPos(disc);
                 if (repository_catalog) {
                     if (DrawShellIconButton("repository-refresh", ShellGlyph::Refresh,
                             Text(cabbird::MessageId::PluginsRefreshRepositories)) &&
@@ -2674,15 +3438,15 @@ private:
             });
 
         ImGui::BeginChild("PlatformPluginsRoute", ImVec2(0.0f, 0.0f), false,
-            ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
-        DrawPluginTabs();
+            ImGuiWindowFlags_NoBackground | ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
+        DrawPluginsTopBar(installed);
         if (third_party) {
-            BeginShellBodyChild("PlatformThirdPartyPlugins");
+            BeginShellBodyChild("PlatformThirdPartyPlugins", {}, true);
             DrawRepositoryChannelsEditor();
             EndShellBodyChild();
         } else if (!installed) {
             if (repository.BrowseAvailable()) {
-                BeginShellBodyChild("PlatformRepositoryCatalog");
+                BeginShellBodyChild("PlatformRepositoryCatalog", {}, true);
                 DrawRepositoryWorkspace(state.plugin_tab == Tab::Updates);
                 EndShellBodyChild();
             } else {
@@ -2693,122 +3457,163 @@ private:
                     repository.reason.c_str());
             }
         } else {
-            DrawPluginToolbar();
             DrawInstalledPluginWorkspace();
         }
         ImGui::EndChild();
     }
 
-    void DrawPluginTabs() {
-        const std::size_t installed = model_.Snapshot().runtime_summary.installed;
-        const auto& theme = cabbird::CabbirdUiTheme();
-        ImGui::PushStyleColor(ImGuiCol_ChildBg, ThemeColor(theme.toolbar_background));
-        ImGui::BeginChild("PlatformPluginTabs", ImVec2(0.0f, Scaled(36.0f)), true,
-            ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
+    void DrawPluginsTopBar(const bool installed) {
+        auto& state = model_.State();
+        const std::size_t installed_count = model_.Snapshot().runtime_summary.installed;
+        const std::string installed_label =
+            std::string(PluginTabLabel(Tab::Installed)) + "  " + std::to_string(installed_count);
+        const std::array<const char*, 4> tab_labels{installed_label.c_str(),
+            PluginTabLabel(Tab::Available), PluginTabLabel(Tab::Updates),
+            PluginTabLabel(Tab::ThirdParty)};
+        cabbird::glass::SegmentedOptions tab_options;
+        tab_options.height = 40.0f;
+        tab_options.scale = PlatformUiScale();
+        tab_options.padding_x = IsCompact() ? 10.0f : 16.0f;
+        const float tabs_width = cabbird::glass::SegmentedControlWidth(tab_labels, tab_options);
+        const std::array<const char*, 5> filter_labels{FilterLabel(Filter::All),
+            FilterLabel(Filter::Favorites), FilterLabel(Filter::Running),
+            FilterLabel(Filter::Disabled), FilterLabel(Filter::Issues)};
+        const float filter_width = IsCompact() ? Scaled(100.0f)
+            : cabbird::glass::SegmentedControlWidth(filter_labels, FilterSegmentOptions());
+        const float sort_width = Scaled(IsCompact() ? 86.0f : 112.0f);
+        const float edge = Scaled(4.0f);
+        const float gap = Scaled(10.0f);
+        const float row_height = Scaled(52.0f);
+        const float available = ImGui::GetContentRegionAvail().x;
+        const float search_collapsed = Scaled(40.0f);
+        const bool one_row = !installed || available >= edge + tabs_width + gap +
+            search_collapsed + Scaled(8.0f) + filter_width + Scaled(8.0f) + sort_width + edge;
+        ImGui::BeginChild("PlatformPluginsTopBar",
+            ImVec2(0.0f, one_row ? row_height : row_height * 2.0f), false,
+            ImGuiWindowFlags_NoBackground | ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
         const ImVec2 origin = ImGui::GetWindowPos();
-        float x = Scaled(IsCompact() ? 8.0f : 16.0f);
-        const auto draw_tab = [this, &origin, &x, &theme](
-            const Tab tab, const std::string& label) {
-            const bool selected = model_.State().plugin_tab == tab;
-            const float width = ImGui::CalcTextSize(label.c_str()).x + Scaled(20.0f);
-            ImGui::SetCursorScreenPos(Offset(origin, x, Scaled(3.0f)));
-            ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.0f, 0.0f, 0.0f, 0.0f));
-            ImGui::PushStyleColor(ImGuiCol_ButtonHovered,
-                ThemeColorWithAlpha(theme.text, 0.08f));
-            const std::string stable_label = cabbird::StableDisplayLabel(
-                label, "plugin-tab-" + std::to_string(static_cast<unsigned>(tab)));
-            if (ImGui::Button(stable_label.c_str(), ImVec2(width, Scaled(30.0f)))) {
-                model_.State().plugin_tab = tab;
-                compact_plugin_detail_ = false;
-                compact_plugin_detail_pending_id_.clear();
-            }
-            ImGui::PopStyleColor(2);
-            if (selected) {
-                const ImVec2 minimum = ImGui::GetItemRectMin();
-                const ImVec2 maximum = ImGui::GetItemRectMax();
-                ImGui::GetWindowDrawList()->AddRectFilled(
-                    Offset(minimum, 0.0f, Scaled(28.0f)), maximum,
-                    ImGui::ColorConvertFloat4ToU32(AccentColor()));
-            }
-            x += width + Scaled(2.0f);
-        };
-        draw_tab(Tab::Installed,
-            std::string(PluginTabLabel(Tab::Installed)) + "  " + std::to_string(installed));
-        draw_tab(Tab::Available, PluginTabLabel(Tab::Available));
-        draw_tab(Tab::Updates, PluginTabLabel(Tab::Updates));
-        draw_tab(Tab::ThirdParty, PluginTabLabel(Tab::ThirdParty));
+        const float width = ImGui::GetWindowSize().x;
+        ImGui::SetCursorScreenPos(Offset(origin, edge, Scaled(6.0f)));
+        int selected = static_cast<int>(state.plugin_tab);
+        if (cabbird::glass::SegmentedControl("plugin-tabs", tab_labels, selected, tab_options)) {
+            state.plugin_tab = static_cast<Tab>(selected);
+            compact_plugin_detail_ = false;
+            compact_plugin_detail_pending_id_.clear();
+        }
+        if (installed) {
+            const float controls_y = one_row ? Scaled(8.0f) : row_height + Scaled(8.0f);
+            const float sort_x = width - edge - sort_width;
+            const float filter_x = sort_x - Scaled(8.0f) - filter_width;
+            // The search field is anchored to the filter and grows to the
+            // left; on its own row it may reach the left edge.
+            const float search_right = filter_x - Scaled(8.0f);
+            const float search_limit = one_row ? edge + tabs_width + gap : edge;
+            DrawPluginSearchField(Offset(origin, search_right, controls_y),
+                std::max(search_collapsed, std::min(Scaled(320.0f), search_right - search_limit)),
+                search_collapsed);
+            ImGui::SetCursorScreenPos(Offset(origin, filter_x, controls_y));
+            DrawPluginFilterControl(IsCompact());
+            ImGui::SetCursorScreenPos(Offset(origin, sort_x, controls_y));
+            DrawPluginSortControl();
+        }
         ImGui::EndChild();
-        ImGui::PopStyleColor();
     }
 
-    void DrawPluginToolbar() {
-        const float toolbar_height = Scaled(
-            layout_mode_ == LayoutMode::Wide ? 46.0f : 84.0f);
-        const auto& theme = cabbird::CabbirdUiTheme();
-        ImGui::PushStyleColor(ImGuiCol_ChildBg, ThemeColor(theme.window_background));
-        ImGui::BeginChild("PlatformPluginToolbar", ImVec2(0.0f, toolbar_height), true,
-            ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
+    // A search field that rests as a magnifier button and opens to the left,
+    // toward `expanded` width, while the pointer is over it, while it has
+    // keyboard focus and for as long as it holds text. `right` is the
+    // top-right corner it is anchored to.
+    void DrawPluginSearchField(const ImVec2 right, const float expanded, const float collapsed) {
         auto& state = model_.State();
-        const ImVec2 origin = ImGui::GetWindowPos();
-        const ImVec2 size = ImGui::GetWindowSize();
-        const float padding = Scaled(IsCompact() ? 8.0f : 12.0f);
-        const bool wide = layout_mode_ == LayoutMode::Wide;
-        const float search_width = wide
-            ? Scaled(280.0f) : size.x - padding * 2.0f - Scaled(38.0f);
-        ImGui::SetCursorScreenPos(Offset(origin, padding, Scaled(8.0f)));
+        const auto& theme = cabbird::CabbirdUiTheme();
+        const float height = Scaled(36.0f);
+        const float shown_width = collapsed + (expanded - collapsed) * plugin_search_reveal_;
+        const ImVec2 field_min(right.x - shown_width, right.y);
+        const ImVec2 field_max(right.x, right.y + height);
+        const bool pointer_over = ImGui::IsWindowHovered(ImGuiHoveredFlags_ChildWindows) &&
+            ImGui::IsMouseHoveringRect(field_min, field_max);
+        const bool open = pointer_over || plugin_search_active_ || focus_plugin_search_ ||
+            !state.search.empty();
+        const float target = open ? 1.0f : 0.0f;
+        if (cabbird::glass::ReduceMotion()) {
+            plugin_search_reveal_ = target;
+        } else {
+            const float step = 1.0f - std::exp(-16.0f * std::max(0.0f, ImGui::GetIO().DeltaTime));
+            plugin_search_reveal_ += (target - plugin_search_reveal_) * step;
+            if (std::abs(target - plugin_search_reveal_) < 0.002f) plugin_search_reveal_ = target;
+        }
+        const float reveal = plugin_search_reveal_;
+        const float field_width = collapsed + (expanded - collapsed) * reveal;
+        const ImVec2 min(right.x - field_width, right.y);
+        ImDrawList* const list = ImGui::GetWindowDrawList();
+        const ImVec4 fill = ImGui::GetStyleColorVec4(ImGuiCol_FrameBg);
+        if (reveal < 0.02f) {
+            // Resting state: just the magnifier on a small rounded tile.
+            ImGui::SetCursorScreenPos(min);
+            if (ImGui::InvisibleButton("##plugin-search-button", ImVec2(collapsed, height))) {
+                focus_plugin_search_ = true;
+            }
+            list->AddRectFilled(min, Offset(min, collapsed, height),
+                ImGui::GetColorU32(fill), Scaled(11.0f));
+            const char* const glyph = ShellGlyphText(ShellGlyph::Search);
+            const ImVec2 glyph_size = ImGui::CalcTextSize(glyph);
+            list->AddText(Offset(min, (collapsed - glyph_size.x) * 0.5f,
+                    (height - ImGui::GetTextLineHeight()) * 0.5f + Scaled(1.0f)),
+                ImGui::GetColorU32(ImGui::IsItemHovered()
+                    ? ThemeColor(theme.text) : ThemeColor(theme.text_muted)), glyph);
+            DrawTooltip(Text(cabbird::MessageId::PluginsSearchHint));
+            plugin_search_active_ = false;
+            return;
+        }
+        ImGui::SetCursorScreenPos(min);
         if (focus_plugin_search_) {
             ImGui::SetKeyboardFocusHere();
             focus_plugin_search_ = false;
         }
-        ImGui::SetNextItemWidth(std::max(Scaled(80.0f), search_width));
-        ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, Scaled(28.0f, 6.0f));
+        ImGui::SetNextItemWidth(field_width);
+        ImGui::SetNextItemAllowOverlap();
+        const bool show_clear = !state.search.empty() && reveal > 0.6f;
+        ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(Scaled(30.0f), FieldPaddingY()));
+        ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, Scaled(11.0f));
         if (ImGui::InputTextWithHint("##plugin-search",
-                Text(cabbird::MessageId::PluginsSearchHint), search_.data(), search_.size())) {
+                reveal > 0.6f ? Text(cabbird::MessageId::PluginsSearchHint) : "",
+                search_.data(), search_.size())) {
             state.search = search_.data();
             cabbird::ReconcileUiStateSelection(model_.Snapshot(), state, developer_mode_);
         }
-        ImGui::PopStyleVar();
-        const ImVec2 search_min = ImGui::GetItemRectMin();
-        ImGui::GetWindowDrawList()->AddText(ScaledOffset(search_min, 8.0f, 7.0f),
+        ImGui::PopStyleVar(2);
+        plugin_search_active_ = ImGui::IsItemActive();
+        const ImVec2 field_rect_min = ImGui::GetItemRectMin();
+        const ImVec2 field_rect_max = ImGui::GetItemRectMax();
+        list->AddText(FieldGlyphPosition(),
             ImGui::ColorConvertFloat4ToU32(ThemeColor(theme.text_muted)),
             ShellGlyphText(ShellGlyph::Search));
-        ImGui::SetCursorScreenPos(Offset(
-            origin, padding + search_width + Scaled(8.0f), Scaled(8.0f)));
-        if (DrawShellIconButton("clear-plugin-search", ShellGlyph::Close,
-                Text(cabbird::MessageId::PluginsClearSearch),
-                !state.search.empty())) {
-            search_.fill('\0');
-            state.search.clear();
-            cabbird::ReconcileUiStateSelection(model_.Snapshot(), state, developer_mode_);
-            focus_plugin_search_ = true;
+        if (show_clear) {
+            ImGui::SetCursorScreenPos(ImVec2(field_rect_max.x - Scaled(33.0f),
+                field_rect_min.y + (field_rect_max.y - field_rect_min.y - Scaled(30.0f)) * 0.5f));
+            if (DrawShellIconButton("clear-plugin-search", ShellGlyph::Close,
+                    Text(cabbird::MessageId::PluginsClearSearch))) {
+                search_.fill('\0');
+                state.search.clear();
+                cabbird::ReconcileUiStateSelection(model_.Snapshot(), state, developer_mode_);
+                focus_plugin_search_ = true;
+            }
         }
-        const float controls_y = Scaled(wide ? 8.0f : 46.0f);
-        float x = wide ? padding + search_width + Scaled(46.0f) : padding;
-        ImGui::SetCursorScreenPos(Offset(origin, x, controls_y));
-        if (IsCompact()) {
-            DrawPluginFilterControl(true);
-        } else {
-            DrawPluginFilterControl(false);
-        }
-        const float filter_width = IsCompact() ? Scaled(100.0f) :
-            ImGui::CalcTextSize(FilterLabel(Filter::All)).x + Scaled(18.0f) +
-            ImGui::CalcTextSize(FilterLabel(Filter::Running)).x + Scaled(18.0f) +
-            ImGui::CalcTextSize(FilterLabel(Filter::Disabled)).x + Scaled(18.0f) +
-            ImGui::CalcTextSize(FilterLabel(Filter::Issues)).x + Scaled(18.0f);
-        x += filter_width + Scaled(8.0f);
-        ImGui::SetCursorScreenPos(Offset(origin, x, controls_y));
-        DrawPluginSortControl();
-        ImGui::EndChild();
-        ImGui::PopStyleColor();
     }
 
     void DrawPluginFilterControl(const bool compact_control) {
         auto& state = model_.State();
-        constexpr std::array<Filter, 4> filters{
-            Filter::All, Filter::Running, Filter::Disabled, Filter::Issues};
+        constexpr std::array<Filter, 5> filters{
+            Filter::All, Filter::Favorites, Filter::Running, Filter::Disabled, Filter::Issues};
         if (compact_control) {
             ImGui::SetNextItemWidth(Scaled(100.0f));
-            if (ImGui::BeginCombo("##plugin-filter", FilterLabel(state.plugin_filter))) {
+            ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, Scaled(11.0f));
+            ImGui::PushStyleVar(ImGuiStyleVar_FramePadding,
+                ImVec2(ImGui::GetStyle().FramePadding.x, FieldPaddingY()));
+            const bool filter_open =
+                cabbird::glass::BeginCombo("##plugin-filter", FilterLabel(state.plugin_filter));
+            ImGui::PopStyleVar(2);
+            if (filter_open) {
                 for (const Filter filter : filters) {
                     if (ImGui::Selectable(FilterLabel(filter), state.plugin_filter == filter)) {
                         state.plugin_filter = filter;
@@ -2821,37 +3626,48 @@ private:
             DrawTooltip(Text(cabbird::MessageId::PluginsFilterAll));
             return;
         }
-        ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(0.0f, 0.0f));
+        const std::array<const char*, 5> labels{FilterLabel(filters[0]),
+            FilterLabel(filters[1]), FilterLabel(filters[2]), FilterLabel(filters[3]),
+            FilterLabel(filters[4])};
+        // The segmented control reports the displayed slot, and the slots no
+        // longer follow the enum order, so both directions go through `filters`.
+        int selected = 0;
         for (std::size_t index = 0; index < filters.size(); ++index) {
-            if (index != 0) ImGui::SameLine(0.0f, 0.0f);
-            const Filter filter = filters[index];
-            const bool selected = state.plugin_filter == filter;
-            const char* const label = FilterLabel(filter);
-            ImGui::PushStyleColor(ImGuiCol_Button, selected
-                ? ThemeColorWithAlpha(cabbird::CabbirdUiTheme().accent, 0.18f)
-                : SurfaceColor());
-            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, RaisedColor());
-            ImGui::PushID(static_cast<int>(filter));
-            if (ImGui::Button(label, ImVec2(
-                    ImGui::CalcTextSize(label).x + Scaled(18.0f), Scaled(30.0f)))) {
-                state.plugin_filter = filter;
-                cabbird::ReconcileUiStateSelection(model_.Snapshot(), state, developer_mode_);
+            if (filters[index] == state.plugin_filter) {
+                selected = static_cast<int>(index);
+                break;
             }
-            ImGui::PopID();
-            ImGui::PopStyleColor(2);
         }
-        ImGui::PopStyleVar();
+        if (cabbird::glass::SegmentedControl(
+                "plugin-filter", labels, selected, FilterSegmentOptions())) {
+            if (selected >= 0 && static_cast<std::size_t>(selected) < filters.size()) {
+                state.plugin_filter = filters[static_cast<std::size_t>(selected)];
+            }
+            cabbird::ReconcileUiStateSelection(model_.Snapshot(), state, developer_mode_);
+        }
+    }
+
+    [[nodiscard]] static cabbird::glass::SegmentedOptions FilterSegmentOptions() noexcept {
+        cabbird::glass::SegmentedOptions options;
+        options.height = 36.0f;
+        options.padding_x = 11.0f;
+        options.scale = PlatformUiScale();
+        options.glass_track = false;
+        return options;
     }
 
     void DrawPluginSortControl() {
         auto& state = model_.State();
         ImGui::SetNextItemWidth(Scaled(IsCompact() ? 86.0f : 112.0f));
-        if (ImGui::BeginCombo("##plugin-sort", SortLabel(state.plugin_sort))) {
+        ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, Scaled(11.0f));
+        ImGui::PushStyleVar(ImGuiStyleVar_FramePadding,
+            ImVec2(ImGui::GetStyle().FramePadding.x, FieldPaddingY()));
+        const bool sort_open = cabbird::glass::BeginCombo("##plugin-sort", SortLabel(state.plugin_sort));
+        ImGui::PopStyleVar(2);
+        if (sort_open) {
             constexpr std::array<Sort, 3> sorts{Sort::Name, Sort::State, Sort::Author};
             for (const Sort sort : sorts) {
-                const char* label = sort == Sort::State
-                    ? Text(cabbird::MessageId::PluginsSortStateIssuesFirst)
-                    : SortLabel(sort);
+                const char* label = SortLabel(sort);
                 ImGui::PushID(static_cast<int>(sort));
                 if (ImGui::Selectable(label, state.plugin_sort == sort)) {
                     state.plugin_sort = sort;
@@ -2863,6 +3679,31 @@ private:
             ImGui::EndCombo();
         }
         DrawTooltip(Text(cabbird::MessageId::PluginsSortName));
+    }
+
+    void DrawPluginRows(const std::vector<cabbird::InstalledPluginView>& visible) {
+        ImGuiListClipper clipper;
+        clipper.Begin(static_cast<int>(visible.size()), Scaled(IsCompact() ? 60.0f : 64.0f));
+        if (!keyboard_plugin_focus_id_.empty()) {
+            const auto focus = std::find_if(visible.begin(), visible.end(), [&](const auto& plugin) {
+                return plugin.id == keyboard_plugin_focus_id_;
+            });
+            if (focus != visible.end()) {
+                clipper.IncludeItemByIndex(static_cast<int>(focus - visible.begin()));
+            }
+        }
+        while (clipper.Step()) {
+            for (int row = clipper.DisplayStart; row < clipper.DisplayEnd; ++row) {
+                const auto index = static_cast<std::size_t>(row);
+                DrawShellPluginRow(visible[index],
+                    index == 0 ? std::string_view{} : std::string_view{visible[index - 1].id},
+                    index + 1 == visible.size() ? std::string_view{}
+                                               : std::string_view{visible[index + 1].id});
+            }
+        }
+        if (layout_mode_ != LayoutMode::Wide) {
+            ImGui::Dummy(ImVec2(0.0f, FloatingBarClearance()));
+        }
     }
 
     void DrawInstalledPluginWorkspace() {
@@ -2905,43 +3746,35 @@ private:
         }
 
         if (IsCompact()) {
-            ImGui::BeginChild("PlatformPluginList", ImVec2(0.0f, 0.0f), true);
-            for (std::size_t index = 0; index < visible.size(); ++index) {
-                DrawShellPluginRow(visible[index],
-                    index == 0 ? std::string_view{} : std::string_view{visible[index - 1].id},
-                    index + 1 == visible.size() ? std::string_view{}
-                                               : std::string_view{visible[index + 1].id});
-            }
+            BeginCardChild("PlatformPluginList", ImVec2(0.0f, 0.0f), 6.0f);
+            DrawPluginRows(visible);
             ImGui::EndChild();
             return;
         }
 
         const float available = ImGui::GetContentRegionAvail().x;
         const float list_width = PluginListWidth(available);
-        ImGui::BeginChild("PlatformPluginList", ImVec2(list_width, 0.0f), true);
-        for (std::size_t index = 0; index < visible.size(); ++index) {
-            DrawShellPluginRow(visible[index],
-                index == 0 ? std::string_view{} : std::string_view{visible[index - 1].id},
-                index + 1 == visible.size() ? std::string_view{}
-                                           : std::string_view{visible[index + 1].id});
-        }
+        BeginCardChild("PlatformPluginList", ImVec2(list_width, 0.0f), 6.0f);
+        DrawPluginRows(visible);
         ImGui::EndChild();
         ImGui::SameLine(0.0f, 0.0f);
         const ImVec2 splitter_origin = ImGui::GetCursorScreenPos();
         ImGui::InvisibleButton("PlatformPluginSplit",
-            ImVec2(Scaled(6.0f), ImGui::GetContentRegionAvail().y));
+            ImVec2(Scaled(10.0f), ImGui::GetContentRegionAvail().y));
         if (ImGui::IsItemActive()) {
             plugin_list_width_ =
                 (list_width + ImGui::GetIO().MouseDelta.x) / PlatformUiScale();
         }
-        ImGui::GetWindowDrawList()->AddLine(
-            ImVec2(splitter_origin.x + Scaled(2.5f), splitter_origin.y),
-            ImVec2(splitter_origin.x + Scaled(2.5f),
-                splitter_origin.y + ImGui::GetItemRectSize().y),
-            ImGui::ColorConvertFloat4ToU32(
-                ThemeColor(cabbird::CabbirdUiTheme().border)));
+        if (ImGui::IsItemHovered() || ImGui::IsItemActive()) {
+            ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeEW);
+            const float middle = splitter_origin.y + ImGui::GetItemRectSize().y * 0.5f;
+            ImGui::GetWindowDrawList()->AddRectFilled(
+                ImVec2(splitter_origin.x + Scaled(3.5f), middle - Scaled(18.0f)),
+                ImVec2(splitter_origin.x + Scaled(6.5f), middle + Scaled(18.0f)),
+                ImGui::GetColorU32(InkColor(ImGui::IsItemActive() ? 0.40f : 0.24f)), Scaled(2.0f));
+        }
         ImGui::SameLine(0.0f, 0.0f);
-        ImGui::BeginChild("PlatformPluginDetail", ImVec2(0.0f, 0.0f), true,
+        BeginCardChild("PlatformPluginDetail", ImVec2(0.0f, 0.0f), 0.0f,
             ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
         const auto* selected = model_.Snapshot().FindPlugin(model_.State().selected_plugin_id);
         if (selected != nullptr) DrawPluginPublicDetail(*selected);
@@ -2982,16 +3815,46 @@ private:
         SubmitIntent(std::move(intent));
     }
 
+    [[nodiscard]] bool IsPluginFavorite(const cabbird::InstalledPluginView& plugin) const {
+        return model_.State().favorite_plugin_ids.contains(plugin.id);
+    }
+
+    [[nodiscard]] bool DrawFavoriteToggle(const char* id, const bool favorite) const {
+        const auto& theme = cabbird::CabbirdUiTheme();
+        ImGui::PushID(id);
+        const bool pressed = ImGui::InvisibleButton("##favorite", Scaled(30.0f, 30.0f));
+        const bool hovered = ImGui::IsItemHovered();
+        DrawGlyphCentred(favorite ? ShellGlyph::StarFilled : ShellGlyph::Star,
+            ImGui::GetItemRectMin(), ImGui::GetItemRectMax(),
+            ImGui::GetColorU32(ThemeColor(favorite
+                ? (hovered ? theme.accent_hovered : theme.accent)
+                : (hovered ? theme.text : theme.text_muted))), ImGui::GetFontSize() * 1.45f);
+        ImGui::PopID();
+        if (hovered) ImGui::SetTooltip("%s", Text(favorite
+            ? cabbird::MessageId::PluginsRemoveFavorite : cabbird::MessageId::PluginsAddFavorite));
+        return pressed;
+    }
+
+    void TogglePluginFavorite(const cabbird::InstalledPluginView& plugin) {
+        auto& favorites = model_.State().favorite_plugin_ids;
+        const bool favorite = !favorites.contains(plugin.id);
+        if (favorite) favorites.insert(plugin.id);
+        else favorites.erase(plugin.id);
+        plugins_.SetPluginFavorite(plugin.id, favorite);
+        cabbird::ReconcileUiStateSelection(model_.Snapshot(), model_.State(), developer_mode_);
+    }
+
     void DrawShellPluginRow(const cabbird::InstalledPluginView& plugin,
         const std::string_view previous_plugin_id, const std::string_view next_plugin_id) {
         const float height = Scaled(IsCompact() ? 60.0f : 64.0f);
         const ImVec2 origin = ImGui::GetCursorScreenPos();
         const float width = ImGui::GetContentRegionAvail().x;
-        const float toggle_x = width - Scaled(IsCompact() ? 40.0f : 44.0f);
+        const ImVec2 toggle_size = Scaled(40.0f, 24.0f);
+        const float toggle_x = width - toggle_size.x - Scaled(12.0f);
         const ImVec2 toggle_position = Offset(
-            origin, toggle_x, (height - Scaled(18.0f)) * 0.5f);
+            origin, toggle_x, (height - toggle_size.y) * 0.5f);
         const bool toggle_hovered = ImGui::IsMouseHoveringRect(
-            toggle_position, ScaledOffset(toggle_position, 32.0f, 18.0f));
+            toggle_position, Offset(toggle_position, toggle_size.x, toggle_size.y));
         const bool selected = model_.State().selected_plugin_id == plugin.id;
         ImGui::PushID(plugin.id.c_str());
         // Keep the row hit target clear of the toggle. Overlapping invisible
@@ -3005,7 +3868,8 @@ private:
         const bool row_focused = ImGui::IsItemFocused();
         const bool row_right_clicked = ImGui::IsItemClicked(ImGuiMouseButton_Right);
         const bool enter_pressed = row_focused && ImGui::IsKeyPressed(ImGuiKey_Enter, false);
-        const bool row_hovered = ImGui::IsMouseHoveringRect(origin, Offset(origin, width, height));
+        const bool row_hovered = ImGui::IsWindowHovered() &&
+            ImGui::IsMouseHoveringRect(origin, Offset(origin, width, height));
         if (row_clicked) {
             model_.State().selected_plugin_id = plugin.id;
             if (IsCompact() && !enter_pressed) {
@@ -3054,13 +3918,12 @@ private:
         }
 
         const auto& theme = cabbird::CabbirdUiTheme();
-        const ImVec4 background = selected ? ThemeColorWithAlpha(theme.accent, 0.14f)
-            : (row_hovered ? ThemeColor(theme.row_hovered) : SurfaceColor());
         ImDrawList* const draw_list = ImGui::GetWindowDrawList();
-        draw_list->AddRectFilled(origin, Offset(origin, width, height),
-            ImGui::ColorConvertFloat4ToU32(background));
-        draw_list->AddRectFilled(origin, Offset(origin, Scaled(3.0f), height),
-            ImGui::ColorConvertFloat4ToU32(PluginStateColor(plugin.UiState())));
+        if (selected) {
+            cabbird::glass::DrawThumb(draw_list, Offset(origin, 0.0f, Scaled(2.0f)),
+                Offset(origin, width, height - Scaled(2.0f)), Scaled(12.0f),
+                PlatformUiScale(), false);
+        }
         const float icon_size = Scaled(IsCompact() ? 36.0f : 40.0f);
         const ImVec2 icon_position = Offset(
             origin, Scaled(11.0f), (height - icon_size) * 0.5f);
@@ -3069,9 +3932,21 @@ private:
         const float status_x = toggle_x - Scaled(27.0f);
         const float text_width = std::max(
             Scaled(20.0f), origin.x + status_x - text_x - Scaled(8.0f));
-        const std::string name = Ellipsize(plugin.name.empty() ? plugin.id : plugin.name, text_width);
-        draw_list->AddText(ImVec2(text_x, origin.y + Scaled(12.0f)),
+        const bool favorite = IsPluginFavorite(plugin);
+        const float star_size = ImGui::GetFontSize() * 0.85f;
+        const ImVec2 star_extent = ImGui::GetFont()->CalcTextSizeA(
+            star_size, FLT_MAX, 0.0f, ShellGlyphText(ShellGlyph::StarFilled));
+        const std::string name = Ellipsize(plugin.name.empty() ? plugin.id : plugin.name,
+            std::max(Scaled(20.0f), text_width - (favorite ? star_extent.x + Scaled(4.0f) : 0.0f)));
+        const ImVec2 name_position(text_x, origin.y + Scaled(12.0f));
+        draw_list->AddText(name_position,
             ImGui::ColorConvertFloat4ToU32(ThemeColor(theme.text)), name.c_str());
+        if (favorite) {
+            const ImVec2 star_min(name_position.x + ImGui::CalcTextSize(name.c_str()).x + Scaled(4.0f), name_position.y);
+            DrawGlyphCentred(ShellGlyph::StarFilled, star_min,
+                Offset(star_min, star_extent.x, ImGui::GetTextLineHeight()),
+                ImGui::GetColorU32(ThemeColor(theme.accent)), star_size);
+        }
         if (!plugin.author.empty() || !plugin.version.empty()) {
             std::string metadata;
             if (!plugin.author.empty()) metadata = plugin.author;
@@ -3092,26 +3967,25 @@ private:
         ImGui::SetCursorScreenPos(toggle_position);
         ImGui::BeginDisabled(!toggle_allowed);
         const bool toggle_clicked =
-            ImGui::InvisibleButton("enable-toggle", Scaled(32.0f, 18.0f));
+            ImGui::InvisibleButton("enable-toggle", toggle_size);
+        const bool toggle_held = ImGui::IsItemActive();
         ImGui::EndDisabled();
         const bool current_toggle_hovered = ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled);
         if (toggle_clicked && toggle_allowed) {
             model_.State().selected_plugin_id = plugin.id;
             SubmitPluginToggle(plugin);
         }
-        const ImVec4 toggle_background = plugin.enabled
-            ? ThemeColorWithAlpha(theme.accent, 0.35f) : ThemeColor(theme.toggle_off);
-        const ImVec4 toggle_border = plugin.enabled ? AccentColor()
-            : ThemeColor(theme.toggle_off_border);
-        draw_list->AddRectFilled(toggle_position, ScaledOffset(toggle_position, 32.0f, 18.0f),
-            ImGui::ColorConvertFloat4ToU32(toggle_background), Scaled(9.0f));
-        draw_list->AddRect(toggle_position, ScaledOffset(toggle_position, 32.0f, 18.0f),
-            ImGui::ColorConvertFloat4ToU32(toggle_border), Scaled(9.0f));
-        const float knob_x = Scaled(plugin.enabled ? 23.0f : 9.0f);
-        draw_list->AddCircleFilled(
-            Offset(toggle_position, knob_x, Scaled(9.0f)), Scaled(6.0f),
-            ImGui::ColorConvertFloat4ToU32(plugin.enabled
-                ? ThemeColor(theme.toggle_on_knob) : ThemeColor(theme.text_muted)));
+        const bool pending = HasPendingMutation(plugin.id, Mutation::None);
+        const ImGuiID switch_id = ImGui::GetID("enable-switch");
+        const float on = cabbird::glass::Animate(switch_id, plugin.enabled ? 1.0f : 0.0f, 15.0f);
+        const float press = cabbird::glass::Animate(switch_id ^ 0x9e3779b9U,
+            toggle_held ? 1.0f : 0.0f, 22.0f);
+        ImGui::PushStyleVar(ImGuiStyleVar_Alpha,
+            ImGui::GetStyle().Alpha * (toggle_allowed || pending ? 1.0f : 0.45f));
+        cabbird::glass::DrawSwitch(draw_list, toggle_position,
+            Offset(toggle_position, toggle_size.x, toggle_size.y), on,
+            press, current_toggle_hovered && toggle_allowed, PlatformUiScale());
+        ImGui::PopStyleVar();
         if (current_toggle_hovered && !toggle_allowed) {
             const std::string reason = PluginToggleDisabledReason(plugin);
             ImGui::SetTooltip("%s", reason.c_str());
@@ -3171,6 +4045,12 @@ private:
             if (frozen) DrawTooltip(Text(cabbird::MessageId::OperationInProgress));
         }
 
+        ImGui::Separator();
+        if (ImGui::MenuItem(Text(IsPluginFavorite(plugin) ? cabbird::MessageId::PluginsRemoveFavorite
+                                                        : cabbird::MessageId::PluginsAddFavorite))) {
+            TogglePluginFavorite(plugin);
+        }
+
         if (repository_plugin != nullptr && !repository_removed) {
             ImGui::Separator();
             if (ImGui::MenuItem(Text(cabbird::MessageId::CommonUninstall),
@@ -3200,6 +4080,14 @@ private:
         ImGui::EndPopup();
     }
 
+    [[nodiscard]] bool ShowPluginReloadAction(const cabbird::InstalledPluginView& plugin) const {
+        const auto state = plugin.UiState();
+        const bool pending = HasPendingMutation(plugin.id, Mutation::None);
+        return (plugin.has_runtime_view || pending) &&
+            (state != cabbird::PlatformUiPluginState::Stopping || pending) &&
+            state != cabbird::PlatformUiPluginState::Faulted;
+    }
+
     [[nodiscard]] float PluginPublicActionsWidth(
         const cabbird::InstalledPluginView& plugin,
         const bool compact_secondary) const {
@@ -3216,11 +4104,9 @@ private:
             : state == cabbird::PlatformUiPluginState::DependencyBlocked
                 ? Text(cabbird::MessageId::PluginsViewStatus)
                 : Text(cabbird::MessageId::CommonDisable);
-        float width = std::max(
+        float width = Scaled(36.0f) + std::max(
             Scaled(74.0f), ImGui::CalcTextSize(primary_label).x + Scaled(38.0f));
-        const bool show_reload = plugin.has_runtime_view &&
-            state != cabbird::PlatformUiPluginState::Stopping &&
-            state != cabbird::PlatformUiPluginState::Faulted;
+        const bool show_reload = ShowPluginReloadAction(plugin);
         if (show_reload) width += Scaled(compact_secondary ? 36.0f : 82.0f);
         const auto* repository_plugin = RepositoryPlugin(plugin.id);
         const auto* repository_operation = RepositoryOperation(plugin.id);
@@ -3253,8 +4139,8 @@ private:
             : (IsCompact() ? 84.0f : 96.0f));
         ImGui::PushStyleColor(ImGuiCol_ChildBg,
             ThemeColor(cabbird::CabbirdUiTheme().panel_background));
-        ImGui::BeginChild("PlatformPluginDetailHeader", ImVec2(0.0f, height), true,
-            ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
+        ImGui::BeginChild("PlatformPluginDetailHeader", ImVec2(0.0f, height), false,
+            ImGuiWindowFlags_NoBackground | ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
         const ImVec2 origin = ImGui::GetWindowPos();
         const ImVec2 size = ImGui::GetWindowSize();
         DrawGenericPluginIcon(Offset(origin, inset,
@@ -3265,14 +4151,20 @@ private:
         const float name_width = std::max(Scaled(20.0f),
             identity_width - PluginStateBadgeWidth(plugin.UiState()) - Scaled(8.0f));
         const std::string name = Ellipsize(
-            plugin.name.empty() ? plugin.id : plugin.name, name_width);
+            plugin.name.empty() ? plugin.id : plugin.name, name_width / 1.15f);
         ImGui::SetCursorScreenPos(Offset(
             origin, title_x, Scaled(IsCompact() ? 17.0f : 20.0f)));
         ImGui::SetWindowFontScale(1.15f);
         ImGui::TextUnformatted(name.c_str());
         ImGui::SetWindowFontScale(1.0f);
-        DrawPluginStateBadge(ScaledOffset(
-            ImGui::GetItemRectMax(), 8.0f, -20.0f), plugin.UiState());
+        // Centring the pill on the name line box keeps its text on the same
+        // baseline as the label; hanging it from the bottom edge left it high.
+        const ImVec2 name_rect_min = ImGui::GetItemRectMin();
+        const ImVec2 name_rect_max = ImGui::GetItemRectMax();
+        DrawPluginStateBadge(ImVec2(name_rect_max.x + Scaled(8.0f),
+            (name_rect_min.y + name_rect_max.y) * 0.5f -
+                PluginStateBadgeHeight() * 0.5f),
+            plugin.UiState());
         if (!plugin.author.empty() || !plugin.version.empty()) {
             std::string metadata = plugin.author;
             if (!plugin.version.empty()) {
@@ -3290,13 +4182,16 @@ private:
         DrawPluginPublicActions(plugin, actions_origin,
             stack_actions ? size.x - title_x - inset : actions_width,
             compact_actions && !stack_actions);
+        ImGui::GetWindowDrawList()->AddLine(
+            Offset(origin, inset, size.y - 1.0f), Offset(origin, size.x - inset, size.y - 1.0f),
+            ImGui::GetColorU32(InkColor(0.08f)));
         ImGui::EndChild();
         ImGui::PopStyleColor();
 
         const float body_padding = Scaled(IsCompact() ? 12.0f : 16.0f);
         ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(body_padding, body_padding));
         ImGui::BeginChild("PlatformPluginDetailBody", ImVec2(0.0f, 0.0f),
-            ImGuiChildFlags_AlwaysUseWindowPadding);
+            ImGuiChildFlags_AlwaysUseWindowPadding, ImGuiWindowFlags_NoBackground);
         ImGui::TextUnformatted(Text(cabbird::MessageId::PluginsAbout));
         ImGui::Separator();
         ImGui::Spacing();
@@ -3306,6 +4201,7 @@ private:
             ? Text(cabbird::MessageId::PluginsNoIntroduction)
             : plugin.description.c_str());
         ImGui::PopTextWrapPos();
+        ImGui::Dummy(ImVec2(0.0f, FloatingBarClearance()));
         ImGui::EndChild();
         ImGui::PopStyleVar();
         ImGui::PopID();
@@ -3314,6 +4210,8 @@ private:
     void DrawPluginPublicActions(const cabbird::InstalledPluginView& plugin,
         const ImVec2 origin, const float available, const bool compact_secondary) {
         const bool frozen = HasPendingMutation(plugin.id, Mutation::None);
+        ImGui::PushStyleVar(ImGuiStyleVar_DisabledAlpha,
+            frozen ? 1.0f : ImGui::GetStyle().DisabledAlpha);
         const auto* repository_plugin = RepositoryPlugin(plugin.id);
         const auto* repository_operation = RepositoryOperation(plugin.id);
         const bool repository_removed = repository_operation != nullptr &&
@@ -3358,7 +4256,10 @@ private:
                 : PluginToggleAllowed(plugin);
         const float primary_width = std::max(
             Scaled(74.0f), ImGui::CalcTextSize(primary_label).x + Scaled(38.0f));
+        const float favorite_block = Scaled(36.0f);
         ImGui::SetCursorScreenPos(origin);
+        if (DrawFavoriteToggle("detail-favorite", IsPluginFavorite(plugin))) TogglePluginFavorite(plugin);
+        ImGui::SetCursorScreenPos(Offset(origin, favorite_block, 0.0f));
         if (DrawShellCommandButton("detail-primary", primary_label, primary_glyph, true,
                 primary_allowed, ImVec2(primary_width, Scaled(30.0f)))) {
             if (can_open) submit_visibility();
@@ -3371,11 +4272,9 @@ private:
         if (!primary_allowed) DrawTooltip(
             frozen ? Text(cabbird::MessageId::OperationInProgress)
                    : PluginToggleDisabledReason(plugin).c_str());
-        const bool show_reload = plugin.has_runtime_view &&
-            state != cabbird::PlatformUiPluginState::Stopping &&
-            state != cabbird::PlatformUiPluginState::Faulted;
+        const bool show_reload = ShowPluginReloadAction(plugin);
         const float reload_width = Scaled(compact_secondary ? 30.0f : 76.0f);
-        if (show_reload && primary_width + Scaled(6.0f) + reload_width <= available) {
+        if (show_reload && favorite_block + primary_width + Scaled(6.0f) + reload_width <= available) {
             ImGui::SameLine(0.0f, Scaled(6.0f));
             const bool reload_pressed = compact_secondary
                 ? DrawShellIconButton("detail-reload", ShellGlyph::Refresh,
@@ -3389,7 +4288,7 @@ private:
         }
         const bool show_uninstall = repository_plugin != nullptr && !repository_removed;
         const bool show_more = developer_mode_ || show_uninstall;
-        const float used_width = primary_width +
+        const float used_width = favorite_block + primary_width +
             (show_reload ? Scaled(6.0f) + reload_width : 0.0f);
         if (show_more && used_width + Scaled(34.0f) <= available) {
             ImGui::SameLine(0.0f, Scaled(4.0f));
@@ -3428,6 +4327,7 @@ private:
             }
         }
         if (frozen) DrawTooltip(Text(cabbird::MessageId::OperationInProgress));
+        ImGui::PopStyleVar();
     }
 
     void OpenDeveloperPlugin(const std::string_view plugin_id) {
@@ -3438,6 +4338,17 @@ private:
         developer_plugin_tab_ = DeveloperPluginTab::Overview;
         compact_plugin_detail_ = false;
         compact_plugin_detail_pending_id_.clear();
+    }
+
+    void DrawUnityRuntimeDiagnostics() {
+        const auto& compatibility = model_.Snapshot().unity_compatibility;
+        ImGui::TextColored(compatibility.level == cabbird::UnityCompatibilityLevel::Supported
+                ? SuccessColor() : WarningColor(), "%s", UnityLevelName(compatibility.level));
+        if (!compatibility.reason.empty()) ImGui::TextWrapped("%s", compatibility.reason.c_str());
+        ImGui::Spacing();
+        DrawUnityFeatureMatrix();
+        ImGui::Spacing();
+        DrawUnityBuildPanel();
     }
 
     void DrawUnityFeatureMatrix() {
@@ -3522,7 +4433,7 @@ private:
         DrawShellPageHeader(Text(cabbird::MessageId::ShellRouteDiagnostics), {},
             [](const ImVec2&, const ImVec2&) {});
         ImGui::BeginChild("PlatformDiagnosticsRoute", ImVec2(0.0f, 0.0f), false,
-            ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
+            ImGuiWindowFlags_NoBackground | ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
         DrawDiagnosticTabs();
         switch (model_.State().diagnostics_tab) {
         case DiagnosticTab::Overview: DrawDiagnosticsOverviewShell(); break;
@@ -3534,43 +4445,31 @@ private:
     }
 
     void DrawDiagnosticTabs() {
-        ImGui::BeginChild("PlatformDiagnosticTabs", ImVec2(0.0f, Scaled(36.0f)), true,
-            ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
-        const auto draw_tab = [this](const DiagnosticTab tab, const char* label) {
-            const bool selected = model_.State().diagnostics_tab == tab;
-            ImGui::PushStyleColor(ImGuiCol_Button, selected ? SurfaceColor() : ImVec4(0, 0, 0, 0));
-            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, RaisedColor());
-            const std::string stable_label = cabbird::StableDisplayLabel(
-                label, "diagnostics-tab-" + std::to_string(static_cast<unsigned>(tab)));
-            if (ImGui::Button(stable_label.c_str(), ImVec2(0.0f, Scaled(30.0f)))) {
-                model_.State().diagnostics_tab = tab;
-            }
-            ImGui::PopStyleColor(2);
-            if (selected) {
-                const ImVec2 minimum = ImGui::GetItemRectMin();
-                const ImVec2 maximum = ImGui::GetItemRectMax();
-                ImGui::GetWindowDrawList()->AddRectFilled(
-                    ImVec2(minimum.x, maximum.y - Scaled(2.0f)), maximum,
-                    ImGui::ColorConvertFloat4ToU32(AccentColor()));
-            }
-        };
-        draw_tab(DiagnosticTab::Overview, DiagnosticTabLabel(DiagnosticTab::Overview));
-        ImGui::SameLine();
-        draw_tab(DiagnosticTab::PluginPerformance,
-            DiagnosticTabLabel(DiagnosticTab::PluginPerformance));
-        ImGui::SameLine();
-        draw_tab(DiagnosticTab::Logs, DiagnosticTabLabel(DiagnosticTab::Logs));
-        if (developer_mode_) {
-            ImGui::SameLine();
-            draw_tab(DiagnosticTab::Developer, DiagnosticTabLabel(DiagnosticTab::Developer));
+        ImGui::BeginChild("PlatformDiagnosticTabs", ImVec2(0.0f, Scaled(54.0f)), false,
+            ImGuiWindowFlags_NoBackground | ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
+        const std::array<const char*, 4> labels{
+            DiagnosticTabLabel(DiagnosticTab::Overview),
+            DiagnosticTabLabel(DiagnosticTab::PluginPerformance),
+            DiagnosticTabLabel(DiagnosticTab::Logs),
+            DiagnosticTabLabel(DiagnosticTab::Developer)};
+        const std::span<const char* const> shown(
+            labels.data(), developer_mode_ ? labels.size() : labels.size() - 1);
+        ImGui::SetCursorPos(ImVec2(Scaled(IsCompact() ? 4.0f : 8.0f), Scaled(6.0f)));
+        int selected = static_cast<int>(model_.State().diagnostics_tab);
+        cabbird::glass::SegmentedOptions options;
+        options.height = 40.0f;
+        options.scale = PlatformUiScale();
+        options.padding_x = IsCompact() ? 10.0f : 16.0f;
+        if (cabbird::glass::SegmentedControl("diagnostic-tabs", shown, selected, options)) {
+            model_.State().diagnostics_tab = static_cast<DiagnosticTab>(selected);
         }
         ImGui::EndChild();
     }
 
     void DrawDiagnosticsOverviewShell() {
         const auto& snapshot = model_.Snapshot();
-        BeginShellBodyChild("PlatformDiagnosticsOverview");
-        const int summary_columns = IsCompact() ? 2 : 4;
+        BeginShellBodyChild("PlatformDiagnosticsOverview", {}, true);
+        const int summary_columns = IsCompact() ? 2 : 3;
         if (ImGui::BeginTable("PlatformDiagnosticsSummary", summary_columns,
                 ImGuiTableFlags_RowBg | ImGuiTableFlags_Borders | ImGuiTableFlags_SizingStretchProp)) {
             const auto summary = [](const char* label, const std::string& value) {
@@ -3589,6 +4488,10 @@ private:
                 " / " + std::to_string(snapshot.runtime_summary.running) +
                 " / " + std::to_string(snapshot.runtime_summary.issues));
             ImGui::EndTable();
+        }
+        ImGui::Spacing();
+        if (ImGui::CollapsingHeader(Text(cabbird::MessageId::DiagnosticsGameRuntime))) {
+            DrawUnityRuntimeDiagnostics();
         }
         ImGui::Spacing();
         ImGui::TextUnformatted(Text(cabbird::MessageId::DiagnosticsRecentFaults));
@@ -3633,7 +4536,7 @@ private:
             Text(cabbird::MessageId::PluginsFilterAll),
             Text(cabbird::MessageId::CommonUpdate),
             Text(cabbird::MessageId::CommonDraw)};
-        ImGui::Combo("##performance-callback", &performance_callback_filter_, callbacks, IM_ARRAYSIZE(callbacks));
+        cabbird::glass::Combo("##performance-callback", &performance_callback_filter_, callbacks, IM_ARRAYSIZE(callbacks));
         ImGui::SameLine();
         ImGui::SetNextItemWidth(Scaled(90.0f));
         const char* states[] = {
@@ -3641,13 +4544,13 @@ private:
             Text(cabbird::MessageId::PluginStateRunning),
             Text(cabbird::MessageId::PluginsFilterIssues),
             Text(cabbird::MessageId::PluginStateDisabled)};
-        ImGui::Combo("##performance-state", &performance_state_filter_, states, IM_ARRAYSIZE(states));
+        cabbird::glass::Combo("##performance-state", &performance_state_filter_, states, IM_ARRAYSIZE(states));
         ImGui::SameLine();
         ImGui::SetNextItemWidth(Scaled(106.0f));
         const char* sorts[] = {"p95", "p99", Text(cabbird::MessageId::CommonFaults),
             Text(cabbird::MessageId::DiagnosticsSlowCalls),
             Text(cabbird::MessageId::CommonName)};
-        ImGui::Combo("##performance-sort", &performance_sort_, sorts, IM_ARRAYSIZE(sorts));
+        cabbird::glass::Combo("##performance-sort", &performance_sort_, sorts, IM_ARRAYSIZE(sorts));
         ImGui::EndChild();
 
         std::vector<PerformanceRow> rows;
@@ -3717,7 +4620,7 @@ private:
         const int columns = IsCompact() ? 5 : 9;
         if (!ImGui::BeginTable("PlatformPerformanceTable", columns,
                 ImGuiTableFlags_RowBg | ImGuiTableFlags_Borders | ImGuiTableFlags_ScrollY |
-                ImGuiTableFlags_SizingStretchProp, ImVec2(0.0f, 0.0f))) {
+                ImGuiTableFlags_SizingStretchProp, ShellScrollTableSize())) {
             return;
         }
         ImGui::TableSetupColumn(Text(cabbird::MessageId::CommonPlugin),
@@ -3817,7 +4720,7 @@ private:
 
     void DrawLogsShell() {
         ImGui::BeginChild("PlatformLogsToolbar",
-            ImVec2(0.0f, Scaled(IsCompact() ? 82.0f : 50.0f)), true,
+            ImVec2(0.0f, Scaled(50.0f)), true,
             ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
         SetAvailableItemWidth(IsCompact() ? 40.0f : 0.0f, 280.0f);
         if (ImGui::InputTextWithHint("##diagnostic-log-filter",
@@ -3880,7 +4783,7 @@ private:
         ImGui::TextDisabled("%s", buffered.c_str());
         if (ImGui::BeginTable("PlatformLogTable", IsCompact() ? 1 : 2,
                 ImGuiTableFlags_RowBg | ImGuiTableFlags_Borders | ImGuiTableFlags_ScrollY |
-                ImGuiTableFlags_SizingStretchProp, ImVec2(0.0f, 0.0f))) {
+                ImGuiTableFlags_SizingStretchProp, ShellScrollTableSize())) {
             if (!IsCompact()) ImGui::TableSetupColumn(Text(cabbird::MessageId::CommonRecord),
                 ImGuiTableColumnFlags_WidthFixed, 84.0f);
             ImGui::TableSetupColumn(Text(cabbird::MessageId::CommonMessage),
@@ -3935,6 +4838,24 @@ private:
         return Text(cabbird::MessageId::DeveloperPanelPlugins);
     }
 
+    void DrawDeveloperPluginSelector() {
+        const auto& plugins = model_.Snapshot().installed_plugins;
+        if (plugins.empty()) return;
+        const auto* selected = model_.Snapshot().FindPlugin(model_.State().selected_plugin_id);
+        if (selected == nullptr) selected = &plugins.front();
+        if (cabbird::glass::BeginCombo("##developer-plugin", selected->name.empty()
+                ? selected->id.c_str() : selected->name.c_str())) {
+            for (const auto& plugin : plugins) {
+                ImGui::PushID(plugin.id.c_str());
+                const char* name = plugin.name.empty() ? plugin.id.c_str() : plugin.name.c_str();
+                if (ImGui::Selectable(name, plugin.id == selected->id))
+                    model_.State().selected_plugin_id = plugin.id;
+                ImGui::PopID();
+            }
+            ImGui::EndCombo();
+        }
+    }
+
     void DrawDeveloperShell() {
         const auto draw_content = [this] {
             switch (developer_panel_) {
@@ -3947,20 +4868,26 @@ private:
         };
         const auto draw_content_panel = [this, &draw_content] {
             if (developer_panel_ == DeveloperPanel::Plugins) {
-                ImGui::BeginChild("PlatformDeveloperContent", ImVec2(0.0f, 0.0f), false);
+                ImGui::BeginChild("PlatformDeveloperContent", ImVec2(0.0f, 0.0f), false,
+                    ImGuiWindowFlags_NoBackground);
                 draw_content();
                 ImGui::EndChild();
                 return;
             }
-            BeginShellBodyChild("PlatformDeveloperContent");
+            BeginShellBodyChild("PlatformDeveloperContent", {}, true);
             draw_content();
             EndShellBodyChild();
         };
         if (IsCompact()) {
-            ImGui::BeginChild("PlatformDeveloperPicker", ImVec2(0.0f, 48.0f), true,
-                ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
-            SetAvailableItemWidth();
-            if (ImGui::BeginCombo("##developer-panel", DeveloperPanelLabel(developer_panel_))) {
+            ImGui::BeginChild("PlatformDeveloperPicker", ImVec2(0.0f, Scaled(48.0f)), false,
+                ImGuiWindowFlags_NoBackground | ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
+            const bool show_plugin_selector = developer_panel_ == DeveloperPanel::Plugins &&
+                !model_.Snapshot().installed_plugins.empty();
+            if (show_plugin_selector)
+                ImGui::SetNextItemWidth(std::max(1.0f, (ImGui::GetContentRegionAvail().x - Scaled(10.0f)) * 0.4f));
+            else
+                SetAvailableItemWidth();
+            if (cabbird::glass::BeginCombo("##developer-panel", DeveloperPanelLabel(developer_panel_))) {
                 constexpr std::array<DeveloperPanel, 5> panels{
                     DeveloperPanel::Plugins, DeveloperPanel::Services, DeveloperPanel::Hooks,
                     DeveloperPanel::Memory, DeveloperPanel::UnityProfile};
@@ -3973,30 +4900,29 @@ private:
                 }
                 ImGui::EndCombo();
             }
+            if (show_plugin_selector && developer_panel_ == DeveloperPanel::Plugins) {
+                ImGui::SameLine(0.0f, Scaled(10.0f));
+                ImGui::SetNextItemWidth(std::max(1.0f, ImGui::GetContentRegionAvail().x));
+                DrawDeveloperPluginSelector();
+            }
             ImGui::EndChild();
             draw_content_panel();
             return;
         }
 
-        ImGui::BeginChild("PlatformDeveloperRail", ImVec2(168.0f, 0.0f), true);
         constexpr std::array<DeveloperPanel, 5> panels{
             DeveloperPanel::Plugins, DeveloperPanel::Services, DeveloperPanel::Hooks,
             DeveloperPanel::Memory, DeveloperPanel::UnityProfile};
-        for (const DeveloperPanel panel : panels) {
-            const bool selected = developer_panel_ == panel;
-            ImGui::PushStyleColor(ImGuiCol_Header, selected
-                ? ThemeColorWithAlpha(cabbird::CabbirdUiTheme().accent, 0.16f)
-                : ImVec4(0, 0, 0, 0));
-            ImGui::PushID(static_cast<int>(panel));
-            if (ImGui::Selectable(
-                    DeveloperPanelLabel(panel), selected, 0, ImVec2(0.0f, 32.0f))) {
-                developer_panel_ = panel;
-            }
-            ImGui::PopID();
-            ImGui::PopStyleColor();
-        }
-        ImGui::EndChild();
-        ImGui::SameLine(0.0f, 0.0f);
+        BeginCardChild("PlatformDeveloperRail", ImVec2(Scaled(168.0f), 0.0f), 8.0f);
+        std::size_t panel_index = static_cast<std::size_t>(
+            std::ranges::find(panels, developer_panel_) - panels.begin());
+        DrawLensRail("developer-panels", panels.size(), panel_index,
+            [&](const std::size_t index) { return std::string(DeveloperPanelLabel(panels[index])); },
+            40.0f);
+        if (panel_index < panels.size()) developer_panel_ = panels[panel_index];
+        ImGui::Dummy(ImVec2(0.0f, FloatingBarClearance()));
+        EndCardChild();
+        ImGui::SameLine(0.0f, Scaled(10.0f));
         draw_content_panel();
     }
 
@@ -4010,73 +4936,85 @@ private:
         }
         const auto* selected = model_.Snapshot().FindPlugin(model_.State().selected_plugin_id);
         if (selected == nullptr) selected = &plugins.front();
-        ImGui::BeginChild("PlatformDeveloperPluginToolbar", ImVec2(0.0f, 50.0f), true,
-            ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
-        ImGui::TextDisabled("%s", Text(cabbird::MessageId::CommonPlugin));
-        ImGui::SameLine();
-        SetAvailableItemWidth(56.0f, 300.0f);
-        if (ImGui::BeginCombo("##developer-plugin", selected->name.empty()
-                ? selected->id.c_str() : selected->name.c_str())) {
-            for (const auto& plugin : plugins) {
-                const char* name = plugin.name.empty() ? plugin.id.c_str() : plugin.name.c_str();
-                if (ImGui::Selectable(name, plugin.id == selected->id)) {
-                    model_.State().selected_plugin_id = plugin.id;
-                    selected = &plugin;
-                }
-            }
-            ImGui::EndCombo();
+        if (!IsCompact()) {
+            ImGui::BeginChild("PlatformDeveloperPluginToolbar", ImVec2(0.0f, Scaled(48.0f)), false,
+                ImGuiWindowFlags_NoBackground | ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
+            ImGui::TextDisabled("%s", Text(cabbird::MessageId::CommonPlugin));
+            ImGui::SameLine();
+            SetAvailableItemWidth(56.0f, 300.0f);
+            DrawDeveloperPluginSelector();
+            ImGui::EndChild();
+            selected = model_.Snapshot().FindPlugin(model_.State().selected_plugin_id);
+            if (selected == nullptr) selected = &plugins.front();
         }
-        ImGui::EndChild();
 
         ImGui::PushID(selected->id.c_str());
-        ImGui::BeginChild("PlatformDeveloperPluginHeader", ImVec2(0.0f, 84.0f), true,
-            ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
-        const ImVec2 icon_position = Offset(ImGui::GetCursorScreenPos(), 12.0f, 14.0f);
-        DrawGenericPluginIcon(icon_position, 56.0f);
-        ImGui::Dummy(ImVec2(68.0f, 0.0f));
-        ImGui::SameLine();
-        ImGui::BeginGroup();
-        ImGui::SetWindowFontScale(1.12f);
-        ImGui::TextUnformatted(selected->name.empty() ? selected->id.c_str() : selected->name.c_str());
-        ImGui::SetWindowFontScale(1.0f);
-        ImGui::SameLine();
-        ImGui::TextColored(PluginStateColor(selected->UiState()), "%s",
-            DisplayPluginState(selected->UiState()));
-        ImGui::TextDisabled("%s", selected->id.c_str());
-        ImGui::EndGroup();
-        ImGui::EndChild();
-
-        ImGui::BeginChild("PlatformDeveloperPluginTabs", ImVec2(0.0f, 36.0f), true,
-            ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
-        const auto draw_tab = [this](const DeveloperPluginTab tab, const char* label) {
-            const bool active = developer_plugin_tab_ == tab;
-            ImGui::PushStyleColor(ImGuiCol_Button, active ? SurfaceColor() : ImVec4(0, 0, 0, 0));
-            const std::string stable_label = cabbird::StableDisplayLabel(
-                label, "developer-plugin-tab-" + std::to_string(static_cast<unsigned>(tab)));
-            if (ImGui::Button(stable_label.c_str(), ImVec2(0.0f, 30.0f))) {
-                developer_plugin_tab_ = tab;
-            }
-            ImGui::PopStyleColor();
-        };
-        draw_tab(DeveloperPluginTab::Overview, Text(cabbird::MessageId::DiagnosticsTabOverview));
-        if (selected->has_runtime_view) {
+        // The selector already identifies the plugin in compact layouts.
+        // Keep the detail body reachable when large fonts consume the fixed bands.
+        if (!IsCompact()) {
+            BeginCardChild("PlatformDeveloperPluginHeader", ImVec2(0.0f, Scaled(84.0f)), 0.0f,
+                ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
+            const ImVec2 icon_position = Offset(ImGui::GetCursorScreenPos(), Scaled(12.0f), Scaled(14.0f));
+            DrawGenericPluginIcon(icon_position, Scaled(56.0f));
+            ImGui::Dummy(Scaled(68.0f, 0.0f));
             ImGui::SameLine();
-            draw_tab(DeveloperPluginTab::Capabilities,
-                Text(cabbird::MessageId::DeveloperTabCapabilities));
+            ImGui::BeginGroup();
+            ImGui::SetWindowFontScale(1.12f);
+            ImGui::TextUnformatted(selected->name.empty() ? selected->id.c_str() : selected->name.c_str());
+            ImGui::SetWindowFontScale(1.0f);
             ImGui::SameLine();
-            draw_tab(DeveloperPluginTab::Performance,
-                Text(cabbird::MessageId::DeveloperTabPerformance));
+            ImGui::TextColored(PluginStateColor(selected->UiState()), "%s",
+                DisplayPluginState(selected->UiState()));
+            ImGui::TextDisabled("%s", selected->id.c_str());
+            ImGui::EndGroup();
+            EndCardChild();
         }
-        ImGui::SameLine();
-        draw_tab(DeveloperPluginTab::Logs, Text(cabbird::MessageId::DiagnosticsTabLogs));
-        ImGui::EndChild();
+
+        ImGui::Dummy(Scaled(0.0f, 4.0f));
+        {
+            std::vector<DeveloperPluginTab> tabs{DeveloperPluginTab::Overview};
+            if (selected->has_runtime_view) {
+                tabs.push_back(DeveloperPluginTab::Capabilities);
+                tabs.push_back(DeveloperPluginTab::Performance);
+            }
+            tabs.push_back(DeveloperPluginTab::Logs);
+            std::vector<const char*> labels;
+            labels.reserve(tabs.size());
+            for (const DeveloperPluginTab tab : tabs) {
+                switch (tab) {
+                case DeveloperPluginTab::Overview:
+                    labels.push_back(Text(cabbird::MessageId::DiagnosticsTabOverview));
+                    break;
+                case DeveloperPluginTab::Capabilities:
+                    labels.push_back(Text(cabbird::MessageId::DeveloperTabCapabilities));
+                    break;
+                case DeveloperPluginTab::Performance:
+                    labels.push_back(Text(cabbird::MessageId::DeveloperTabPerformance));
+                    break;
+                case DeveloperPluginTab::Logs:
+                    labels.push_back(Text(cabbird::MessageId::DiagnosticsTabLogs));
+                    break;
+                }
+            }
+            const auto found = std::ranges::find(tabs, developer_plugin_tab_);
+            int current = found == tabs.end() ? 0 : static_cast<int>(found - tabs.begin());
+            cabbird::glass::SegmentedOptions options;
+            options.height = 36.0f;
+            options.scale = PlatformUiScale();
+            options.padding_x = 14.0f;
+            if (cabbird::glass::SegmentedControl(
+                    "developer-plugin-tabs", labels, current, options)) {
+                developer_plugin_tab_ = tabs[static_cast<std::size_t>(current)];
+            }
+        }
+        ImGui::Dummy(Scaled(0.0f, 4.0f));
 
         if (!selected->has_runtime_view &&
             (developer_plugin_tab_ == DeveloperPluginTab::Capabilities ||
              developer_plugin_tab_ == DeveloperPluginTab::Performance)) {
             developer_plugin_tab_ = DeveloperPluginTab::Overview;
         }
-        BeginShellBodyChild("PlatformDeveloperPluginBody");
+        BeginShellBodyChild("PlatformDeveloperPluginBody", {}, true);
         switch (developer_plugin_tab_) {
         case DeveloperPluginTab::Overview: DrawDeveloperPluginOverview(*selected); break;
         case DeveloperPluginTab::Capabilities: DrawDeveloperPluginCapabilities(*selected); break;
@@ -4378,7 +5316,11 @@ private:
         if (id == "interface.opacity_percent") {
             return Text(cabbird::MessageId::SettingsValidationOpacity);
         }
-        if (id == "input.menu_toggle") {
+        if (id == "input.hide_all_toggle" && settings_draft_ &&
+            settings_draft_->input_hide_all_toggle == settings_draft_->input_menu_toggle) {
+            return Text(cabbird::MessageId::SettingsValidationHotkeyConflict);
+        }
+        if (id == "input.menu_toggle" || id == "input.hide_all_toggle") {
             return Text(cabbird::MessageId::SettingsValidationMenuToggle);
         }
         if (id == "diagnostics.ring_capacity") {
@@ -4508,7 +5450,8 @@ private:
     // detect a fresh press by its rising edge. The async-input reconciler polls
     // GetAsyncKeyState every frame, which clears the "pressed since last call"
     // low-order bit, so that bit cannot be used to detect key presses here.
-    void BeginSettingsHotkeyCapture() {
+    void BeginSettingsHotkeyCapture(bool hide_all) {
+        settings_hotkey_hide_all_ = hide_all;
         settings_hotkey_capture_ = true;
         for (std::uint32_t key = 0; key <= 0xff; ++key) {
             settings_hotkey_down_[key] = (GetAsyncKeyState(static_cast<int>(key)) & 0x8000) != 0;
@@ -4517,6 +5460,10 @@ private:
 
     void CaptureSettingsHotkey() {
         if (!settings_hotkey_capture_ || !settings_draft_) return;
+        if (ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopupId | ImGuiPopupFlags_AnyPopupLevel)) {
+            settings_hotkey_capture_ = false;
+            return;
+        }
         const auto is_down = [](std::uint32_t key) {
             return (GetAsyncKeyState(static_cast<int>(key)) & 0x8000) != 0;
         };
@@ -4535,7 +5482,8 @@ private:
                 settings_hotkey_capture_ = false;
                 return;
             }
-            settings_draft_->input_menu_toggle = key;
+            if (settings_hotkey_hide_all_) settings_draft_->input_hide_all_toggle = key;
+            else settings_draft_->input_menu_toggle = key;
             settings_hotkey_capture_ = false;
             return;
         }
@@ -4624,7 +5572,7 @@ private:
         EnsureRepositoryEditorLoaded();
 
         ImGui::BeginDisabled(repo_editor_save_pending_);
-        ImGui::Checkbox(StableLabel(cabbird::MessageId::SettingsRepositoriesEnable,
+        cabbird::glass::Switch(StableLabel(cabbird::MessageId::SettingsRepositoriesEnable,
             "repo-master-enable").c_str(), &repo_editor_master_enabled_);
         ImGui::TextDisabled("%s", Text(cabbird::MessageId::SettingsRepositoriesEnableHint));
         ImGui::Spacing();
@@ -4651,7 +5599,7 @@ private:
         for (std::size_t index = 0; index < repo_editor_rows_.size(); ++index) {
             ImGui::PushID(static_cast<int>(index));
             auto& row = repo_editor_rows_[index];
-            ImGui::Checkbox("##channel-enabled", &row.enabled);
+            cabbird::glass::Switch("##channel-enabled", &row.enabled);
             if (ImGui::IsItemHovered()) {
                 ImGui::SetTooltip("%s", Text(cabbird::MessageId::SettingsRepositoriesToggleHint));
             }
@@ -4732,7 +5680,7 @@ private:
         case SettingsSection::Interface:
             row("interface.language", Text(cabbird::MessageId::SettingsLanguage),
                 Text(cabbird::MessageId::SettingsLanguageHint), "locale language", [&] {
-                    if (ImGui::BeginCombo(
+                    if (cabbird::glass::BeginCombo(
                             "##value", LanguagePreferenceLabel(values.interface_language))) {
                         constexpr std::array<cabbird::LanguagePreference, 3> options{
                             cabbird::LanguagePreference::Auto,
@@ -4754,7 +5702,7 @@ private:
             row("interface.palette", Text(cabbird::MessageId::SettingsPalette),
                 Text(cabbird::MessageId::SettingsPaletteHint),
                 "palette theme color moss aurora ember paper cabbirdhub custom", [&] {
-                    if (ImGui::BeginCombo("##value", PaletteLabel(values.interface_palette))) {
+                    if (cabbird::glass::BeginCombo("##value", PaletteLabel(values.interface_palette))) {
                         constexpr std::array<cabbird::CabbirdUiPalette, 6> options{
                             cabbird::CabbirdUiPalette::Moss,
                             cabbird::CabbirdUiPalette::Aurora,
@@ -4813,12 +5761,67 @@ private:
                     "custom palette border outline separator color",
                     values.interface_custom_colors.border);
             }
+            row("interface.background_image", Text(cabbird::MessageId::SettingsBackgroundImage),
+                Text(cabbird::MessageId::SettingsBackgroundImageHint),
+                "background wallpaper image fill crop stretch", [&] {
+                    if (!theme_layout_available_) {
+                        ImGui::TextDisabled("%s", Text(cabbird::MessageId::SettingsThemeLayoutUnavailable));
+                        return;
+                    }
+                    const float line_start = ImGui::GetCursorPosX();
+                    bool enabled = theme_layout_.background.mode != cabbird::PlatformUiBackgroundMode::Disabled;
+                    if (cabbird::glass::Switch("##background-enabled", &enabled)) {
+                        const int mode = static_cast<int>(enabled ? cabbird::PlatformUiBackgroundMode::Crop
+                            : cabbird::PlatformUiBackgroundMode::Disabled);
+                        { std::scoped_lock lock(theme_mutex_); theme_mode_request_ = mode; }
+                        theme_layout_.background.mode = static_cast<cabbird::PlatformUiBackgroundMode>(mode);
+                        theme_changed_.notify_all();
+                    }
+                    ImGui::SameLine();
+                    bool picking;
+                    { std::scoped_lock lock(theme_mutex_); picking = theme_pick_request_ || theme_picker_running_; }
+                    ImGui::BeginDisabled(picking);
+                    if (ImGui::Button(StableLabel(cabbird::MessageId::SettingsBackgroundOpen, "background-open").c_str())) {
+                        { std::scoped_lock lock(theme_mutex_); theme_pick_request_ = true; }
+                        theme_changed_.notify_all();
+                    }
+                    ImGui::EndDisabled();
+                    ImGui::SameLine();
+                    ImGui::SetNextItemWidth(std::max(Scaled(48.0f),
+                        Scaled(238.0f) - (ImGui::GetCursorPosX() - line_start)));
+                    const std::array labels{Text(cabbird::MessageId::SettingsBackgroundModeCenter),
+                        Text(cabbird::MessageId::SettingsBackgroundModeCrop),
+                        Text(cabbird::MessageId::SettingsBackgroundModeStretch)};
+                    int mode = std::clamp(static_cast<int>(theme_layout_.background.mode), 1, 3) - 1;
+                    if (cabbird::glass::Combo("##background-mode", &mode, labels.data(), static_cast<int>(labels.size()))) {
+                        { std::scoped_lock lock(theme_mutex_); theme_mode_request_ = mode + 1; }
+                        theme_layout_.background.mode = static_cast<cabbird::PlatformUiBackgroundMode>(mode + 1);
+                        theme_changed_.notify_all();
+                    }
+                    if (!theme_layout_message_.empty()) {
+                        const std::array<std::string_view, 1> arguments{theme_layout_message_};
+                        ImGui::TextWrapped("%s", Format(cabbird::MessageId::SettingsBackgroundFailed, arguments).c_str());
+                    }
+                });
+            row("interface.background_visibility", Text(cabbird::MessageId::SettingsBackgroundVisibility),
+                Text(cabbird::MessageId::SettingsBackgroundVisibilityHint),
+                "background wallpaper veil dim opacity readability", [&] {
+                    int value = static_cast<int>(std::lround(theme_opacity_edit_.value_or(theme_layout_.surface_opacity) * 100.0f));
+                    if (cabbird::glass::SliderInt("##value", &value, 0, 100, "%d%%"))
+                        theme_opacity_edit_ = static_cast<float>(value) / 100.0f;
+                    if (theme_opacity_edit_ && !ImGui::IsItemActive() && !ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
+                        theme_layout_.surface_opacity = *theme_opacity_edit_;
+                        { std::scoped_lock lock(theme_mutex_); theme_opacity_request_ = *theme_opacity_edit_; }
+                        theme_opacity_edit_.reset();
+                        theme_changed_.notify_all();
+                    }
+                });
             row("interface.scale_percent", Text(cabbird::MessageId::SettingsInterfaceScale),
                 Text(cabbird::MessageId::SettingsInterfaceScaleHint),
                 "dpi font size zoom", [&] {
                     int value = static_cast<int>(settings_scale_edit_percent_.value_or(
                         values.interface_scale_percent));
-                    if (ImGui::SliderInt("##value", &value,
+                    if (cabbird::glass::SliderInt("##value", &value,
                             static_cast<int>(cabbird::kPlatformInterfaceScaleMinimumPercent),
                             static_cast<int>(cabbird::kPlatformInterfaceScaleMaximumPercent),
                             "%d%%")) {
@@ -4837,7 +5840,7 @@ private:
                 Text(cabbird::MessageId::SettingsWindowOpacityHint),
                 "alpha transparency", [&] {
                     int value = static_cast<int>(values.interface_opacity_percent);
-                    if (ImGui::SliderInt("##value", &value, 10, 100, "%d%%")) {
+                    if (cabbird::glass::SliderInt("##value", &value, 10, 100, "%d%%")) {
                         value = ((value + 2) / 5) * 5;
                         values.interface_opacity_percent = static_cast<std::uint32_t>(value);
                     }
@@ -4845,29 +5848,46 @@ private:
             row("interface.reduced_motion", Text(cabbird::MessageId::SettingsReduceMotion),
                 Text(cabbird::MessageId::SettingsReduceMotionHint),
                 "animation accessibility", [&] {
-                    ImGui::Checkbox("##value", &values.interface_reduced_motion);
+                    cabbird::glass::Switch("##value", &values.interface_reduced_motion);
+                });
+            row("interface.reduced_transparency", Text(cabbird::MessageId::SettingsReduceTransparency),
+                Text(cabbird::MessageId::SettingsReduceTransparencyHint),
+                "glass blur transparency contrast accessibility", [&] {
+                    cabbird::glass::Switch("##value", &values.interface_reduced_transparency);
                 });
             row("interface.remember_last_route", Text(cabbird::MessageId::SettingsRememberLastPage),
                 Text(cabbird::MessageId::SettingsRememberLastPageHint),
                 "startup route page", [&] {
-                    ImGui::Checkbox("##value", &values.interface_remember_last_route);
+                    cabbird::glass::Switch("##value", &values.interface_remember_last_route);
                 });
             break;
         case SettingsSection::Input:
+            CaptureSettingsHotkey();
             row("input.menu_toggle", Text(cabbird::MessageId::SettingsMenuToggle),
                 Text(cabbird::MessageId::SettingsMenuToggleHint),
                 "hotkey keyboard insert", [&] {
-                    CaptureSettingsHotkey();
-                    const std::string label = settings_hotkey_capture_
+                    settings_hotkey_capture_drawn_ = true;
+                    const std::string label = settings_hotkey_capture_ && !settings_hotkey_hide_all_
                         ? Text(cabbird::MessageId::SettingsPressKey)
                         : VirtualKeyName(values.input_menu_toggle);
-                    if (ImGui::Button(label.c_str(), FillAvailableSize(0.0f))) {
-                        BeginSettingsHotkeyCapture();
+                    if (ImGui::Button((label + std::string("###settings-hotkey")).c_str(), FillAvailableSize(0.0f))) {
+                        BeginSettingsHotkeyCapture(false);
+                    }
+                });
+            row("input.hide_all_toggle", Text(cabbird::MessageId::SettingsHideAllToggle),
+                Text(cabbird::MessageId::SettingsHideAllToggleHint),
+                "hotkey keyboard delete hide all overlay", [&] {
+                    settings_hotkey_capture_drawn_ = true;
+                    const std::string label = settings_hotkey_capture_ && settings_hotkey_hide_all_
+                        ? Text(cabbird::MessageId::SettingsPressKey)
+                        : VirtualKeyName(values.input_hide_all_toggle);
+                    if (ImGui::Button((label + std::string("###settings-hotkey")).c_str(), FillAvailableSize(0.0f))) {
+                        BeginSettingsHotkeyCapture(true);
                     }
                 });
             row("input.gamepad_navigation", Text(cabbird::MessageId::SettingsGamepadNavigation),
                 Text(cabbird::MessageId::SettingsGamepadNavigationHint),
-                "controller", [&] { ImGui::Checkbox("##value", &values.input_gamepad_navigation); });
+                "controller", [&] { cabbird::glass::Switch("##value", &values.input_gamepad_navigation); });
             break;
         case SettingsSection::Updates:
             row("updates.channel", Text(cabbird::MessageId::SettingsUpdateChannel),
@@ -4897,16 +5917,16 @@ private:
                 });
             row("updates.automatic_check", Text(cabbird::MessageId::SettingsAutomaticUpdates),
                 Text(cabbird::MessageId::SettingsAutomaticUpdatesHint),
-                "repository network", [&] { ImGui::Checkbox("##value", &values.updates_automatic_check); });
+                "repository network", [&] { cabbird::glass::Switch("##value", &values.updates_automatic_check); });
             row("updates.include_disabled", Text(cabbird::MessageId::SettingsIncludeDisabled),
                 Text(cabbird::MessageId::SettingsIncludeDisabledHint),
-                "repository profile", [&] { ImGui::Checkbox("##value", &values.updates_include_disabled); });
+                "repository profile", [&] { cabbird::glass::Switch("##value", &values.updates_include_disabled); });
             break;
         case SettingsSection::Diagnostics:
             row("diagnostics.log_level", Text(cabbird::MessageId::SettingsMinimumLogLevel),
                 Text(cabbird::MessageId::SettingsLogLevelHint),
                 "trace debug info warning error", [&] {
-                    if (ImGui::BeginCombo(
+                    if (cabbird::glass::BeginCombo(
                             "##value", MinimumLogLevelLabel(values.diagnostics_log_level))) {
                         constexpr std::array<cabbird::PlatformMinimumLogLevel, 5> levels{
                             cabbird::PlatformMinimumLogLevel::Trace,
@@ -4941,13 +5961,13 @@ private:
             row("advanced.developer_mode", Text(cabbird::MessageId::SettingsDeveloperMode),
                 Text(cabbird::MessageId::SettingsDeveloperModeHint),
                 "services hooks memory unity", [&] {
-                    ImGui::Checkbox("##value", &values.advanced_developer_mode);
+                    cabbird::glass::Switch("##value", &values.advanced_developer_mode);
                 });
             row("advanced.detailed_performance_diagnostics",
                 Text(cabbird::MessageId::SettingsDetailedPerformanceDiagnostics),
                 Text(cabbird::MessageId::SettingsDetailedPerformanceDiagnosticsHint),
                 "performance timing render ui tick worker plugin", [&] {
-                    ImGui::Checkbox(
+                    cabbird::glass::Switch(
                         "##value", &values.advanced_detailed_performance_diagnostics);
                 });
             break;
@@ -5095,7 +6115,7 @@ private:
             const std::string developer_session = StableLabel(
                 cabbird::MessageId::SettingsEnableDeveloperSession,
                 "settings-developer-session");
-            if (ImGui::Checkbox(developer_session.c_str(), &developer_mode)) {
+            if (cabbird::glass::Switch(developer_session.c_str(), &developer_mode)) {
                 SetDeveloperMode(developer_mode);
             }
             EndShellBodyChild();
@@ -5104,38 +6124,42 @@ private:
 
         settings_validation_errors_ = cabbird::ValidatePlatformSettings(*settings_draft_);
         ImGui::BeginChild("PlatformSettingsRoute", ImVec2(0.0f, 0.0f), false,
-            ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
-        ImGui::BeginChild("PlatformSettingsSearch", ImVec2(0.0f, Scaled(44.0f)), true,
-            ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
-        ImGui::SetCursorPos(Scaled(16.0f, 7.0f));
+            ImGuiWindowFlags_NoBackground | ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
+        ImGui::BeginChild("PlatformSettingsSearch", ImVec2(0.0f, Scaled(48.0f)), false,
+            ImGuiWindowFlags_NoBackground | ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
+        ImGui::SetCursorPos(Scaled(12.0f, 6.0f));
         SetAvailableItemWidth(16.0f, 520.0f);
+        ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(Scaled(30.0f), FieldPaddingY()));
+        ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, Scaled(10.0f));
         ImGui::InputTextWithHint("##settings-search", Text(cabbird::MessageId::SettingsSearchHint),
             settings_search_.data(), settings_search_.size());
+        ImGui::PopStyleVar(2);
+        ImGui::GetWindowDrawList()->AddText(
+            FieldGlyphPosition(),
+            ImGui::GetColorU32(ThemeColor(cabbird::CabbirdUiTheme().text_muted)),
+            ShellGlyphText(ShellGlyph::Search));
         ImGui::EndChild();
 
-        const bool dirty = SettingsDirty();
-        const float footer_height = dirty || settings_save_pending_ || !settings_apply_error_.empty()
-            ? Scaled(54.0f) : 0.0f;
-        ImGui::BeginChild("PlatformSettingsWorkspace", ImVec2(0.0f, -footer_height), false,
-            ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
+        ImGui::BeginChild("PlatformSettingsWorkspace", ImVec2(0.0f, 0.0f), false,
+            ImGuiWindowFlags_NoBackground | ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
         constexpr std::array<SettingsSection, 6> sections{
             SettingsSection::Interface, SettingsSection::Input, SettingsSection::Updates,
             SettingsSection::Diagnostics, SettingsSection::Advanced, SettingsSection::About};
         const float rail_width = Scaled(
             layout_mode_ == LayoutMode::Wide ? 200.0f : 180.0f);
-        ImGui::BeginChild("PlatformSettingsSections", ImVec2(rail_width, 0.0f), true);
-        for (const auto section : sections) {
-            const std::string label = cabbird::StableDisplayLabel(
-                SettingsSectionName(section), std::to_string(static_cast<int>(section)));
-            if (ImGui::Selectable(label.c_str(), settings_section_ == section,
-                    0, FillAvailableSize(34.0f))) {
-                settings_section_ = section;
-            }
-        }
-        ImGui::EndChild();
-        ImGui::SameLine(0.0f, 0.0f);
-        ImGui::BeginChild("PlatformSettingsContent", ImVec2(0.0f, 0.0f), true,
-            ImGuiWindowFlags_AlwaysVerticalScrollbar);
+        BeginCardChild("PlatformSettingsSections", ImVec2(rail_width, 0.0f), 8.0f);
+        std::size_t section_index = static_cast<std::size_t>(
+            std::ranges::find(sections, settings_section_) - sections.begin());
+        DrawLensRail("settings-sections", sections.size(), section_index,
+            [&](const std::size_t index) {
+                return cabbird::StableDisplayLabel(SettingsSectionName(sections[index]),
+                    std::to_string(static_cast<int>(sections[index])));
+            }, 40.0f);
+        if (section_index < sections.size()) settings_section_ = sections[section_index];
+        ImGui::Dummy(ImVec2(0.0f, SettingsScrollClearance()));
+        EndCardChild();
+        ImGui::SameLine(0.0f, Scaled(10.0f));
+        BeginCardChild("PlatformSettingsContent", ImVec2(0.0f, 0.0f), 16.0f, 0);
         ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, Scaled(12.0f, 10.0f));
         bool any_visible{};
         if (settings_search_[0] == '\0') {
@@ -5158,54 +6182,105 @@ private:
                 cabbird::MessageId::CommonClearSearch, "settings-clear-search");
             if (ImGui::Button(clear_search.c_str())) settings_search_.fill('\0');
         }
+        ImGui::Dummy(ImVec2(0.0f, SettingsScrollClearance()));
         ImGui::PopStyleVar();
-        ImGui::EndChild();
+        EndCardChild();
         ImGui::EndChild();
 
-        if (footer_height > 0.0f) {
-            ImGui::BeginChild("PlatformSettingsDraftBar", ImVec2(0.0f, footer_height), true,
-                ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
-            ImGui::SetCursorPos(Scaled(12.0f, 17.0f));
-            if (!settings_apply_error_.empty()) {
-                ImGui::TextColored(ErrorColor(), "%s", settings_apply_error_.c_str());
-            } else if (!settings_validation_errors_.empty()) {
-                const std::string error_count =
-                    std::to_string(settings_validation_errors_.size());
-                const std::array<std::string_view, 1> error_arguments{error_count};
-                const std::string error_text = Format(
-                    cabbird::MessageId::SettingsValidationErrors, error_arguments);
-                ImGui::TextColored(ErrorColor(), "%s", error_text.c_str());
-            } else {
-                ImGui::TextDisabled("%s", Text(settings_save_pending_
-                    ? cabbird::MessageId::SettingsSavingChanges
-                    : cabbird::MessageId::SettingsUnsavedChanges));
-            }
-            const float save_width = Scaled(76.0f);
-            const float discard_width = Scaled(82.0f);
-            ImGui::SetCursorPos(ImVec2((std::max)(Scaled(12.0f),
-                ImGui::GetWindowSize().x - save_width - discard_width - Scaled(28.0f)),
-                Scaled(10.0f)));
-            ImGui::BeginDisabled(settings_save_pending_);
-            const std::string discard = StableLabel(
-                cabbird::MessageId::CommonDiscard, "settings-discard");
-            if (ImGui::Button(discard.c_str(), ImVec2(discard_width, Scaled(32.0f)))) {
-                DiscardSettingsDraft();
-            }
-            ImGui::EndDisabled();
-            ImGui::SameLine();
-            const bool stale = settings_base_revision_ != settings_snapshot_.revision;
-            ImGui::BeginDisabled(settings_save_pending_ || !settings_validation_errors_.empty() || stale);
-            const std::string save = StableLabel(settings_save_pending_
-                    ? cabbird::MessageId::CommonSaving
-                    : cabbird::MessageId::CommonSave,
-                "settings-save");
-            if (PrimaryButton(save.c_str(),
-                    ImVec2(save_width, Scaled(32.0f)))) {
-                QueueSettingsSave();
-            }
-            ImGui::EndDisabled();
-            ImGui::EndChild();
+        ImGui::EndChild();
+    }
+
+    // Unsaved settings float as a glass bar in the bottom-right corner, beside
+    // the tab bar, so the page never changes height while it is edited. In a
+    // window too narrow for both it rises above the tab bar.
+    void DrawSettingsDraftBar() {
+        if (model_.State().route != Route::Settings || !settings_snapshot_.ready ||
+            !settings_draft_) {
+            return;
         }
+        if (!SettingsDirty() && !settings_save_pending_ && settings_apply_error_.empty()) return;
+        const auto& theme = cabbird::CabbirdUiTheme();
+        std::string status;
+        ImVec4 status_ink = ThemeColor(theme.text_muted);
+        if (!settings_apply_error_.empty()) {
+            status = settings_apply_error_;
+            status_ink = ErrorColor();
+        } else if (!settings_validation_errors_.empty()) {
+            const std::string error_count = std::to_string(settings_validation_errors_.size());
+            const std::array<std::string_view, 1> error_arguments{error_count};
+            status = Format(cabbird::MessageId::SettingsValidationErrors, error_arguments);
+            status_ink = ErrorColor();
+        } else {
+            status = Text(settings_save_pending_
+                ? cabbird::MessageId::SettingsSavingChanges
+                : cabbird::MessageId::SettingsUnsavedChanges);
+        }
+        const float button_height = Scaled(36.0f);
+        const float inset = Scaled(kTabBarInset + 2.0f);
+        const float discard_width = Scaled(84.0f);
+        const float save_width = Scaled(84.0f);
+        const float gap = Scaled(8.0f);
+        const float text_padding = Scaled(16.0f);
+        status = Ellipsize(status, Scaled(320.0f));
+        const float text_width = ImGui::CalcTextSize(status.c_str()).x;
+        const float bar_width = text_padding + text_width + text_padding +
+            discard_width + gap + save_width + inset;
+        const float bar_height = button_height + inset * 2.0f;
+        const ImVec2 window_position = ImGui::GetWindowPos();
+        const ImVec2 window_size = ImGui::GetWindowSize();
+        ImVec2 bar_min(
+            std::round(window_position.x + window_size.x - Scaled(14.0f) - bar_width),
+            std::round(tab_bar_rect_.GetCenter().y - bar_height * 0.5f));
+        if (tab_bar_rect_.GetWidth() <= 0.0f || bar_min.x < tab_bar_rect_.Max.x + Scaled(12.0f)) {
+            bar_min.y = std::round((tab_bar_rect_.GetWidth() > 0.0f ? tab_bar_rect_.Min.y
+                : window_position.y + window_size.y) - Scaled(10.0f) - bar_height);
+        }
+        ImGui::SetCursorScreenPos(bar_min);
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.0f, 0.0f));
+        ImGui::BeginChild("PlatformSettingsDraftBar", ImVec2(bar_width, bar_height), false,
+            ImGuiWindowFlags_NoBackground | ImGuiWindowFlags_NoScrollbar |
+                ImGuiWindowFlags_NoScrollWithMouse);
+        ImGui::PopStyleVar();
+        ImDrawList* const list = ImGui::GetWindowDrawList();
+        cabbird::glass::CaptureBackdrop(list);
+        cabbird::glass::SurfaceOptions surface;
+        surface.variant = cabbird::glass::Variant::Regular;
+        surface.rounding = button_height * kTabBarRounding + inset;
+        surface.scale = PlatformUiScale();
+        surface.shadow = false;
+        surface.tint_strength = cabbird::glass::DarkAppearance() ? 0.30f : 0.16f;
+        cabbird::glass::DrawSurface(list, bar_min, Offset(bar_min, bar_width, bar_height), surface);
+        list->AddText(Offset(bar_min, text_padding,
+                (bar_height - ImGui::GetTextLineHeight()) * 0.5f),
+            ImGui::GetColorU32(status_ink), status.c_str());
+
+        ImGui::SetCursorScreenPos(Offset(bar_min,
+            bar_width - inset - save_width - gap - discard_width, inset));
+        ImGui::BeginDisabled(settings_save_pending_);
+        const std::string discard = StableLabel(
+            cabbird::MessageId::CommonDiscard, "settings-discard");
+        ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, button_height * kTabBarRounding);
+        ImGui::PushStyleColor(ImGuiCol_Button, InkColor(0.085f));
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, InkColor(0.085f));
+        ImGui::PushStyleColor(ImGuiCol_ButtonActive, InkColor(0.14f));
+        const bool discard_pressed =
+            ImGui::Button(discard.c_str(), ImVec2(discard_width, button_height));
+        ImGui::PopStyleColor(3);
+        ImGui::PopStyleVar();
+        if (discard_pressed) DiscardSettingsDraft();
+        ImGui::EndDisabled();
+        ImGui::SameLine(0.0f, gap);
+        const bool stale = settings_base_revision_ != settings_snapshot_.revision;
+        ImGui::BeginDisabled(
+            settings_save_pending_ || !settings_validation_errors_.empty() || stale);
+        const std::string save = StableLabel(settings_save_pending_
+                ? cabbird::MessageId::CommonSaving
+                : cabbird::MessageId::CommonSave,
+            "settings-save");
+        if (PrimaryButton(save.c_str(), ImVec2(save_width, button_height))) {
+            QueueSettingsSave();
+        }
+        ImGui::EndDisabled();
         ImGui::EndChild();
     }
 
@@ -5223,28 +6298,44 @@ private:
             return;
         }
         const float text_width = ImGui::CalcTextSize(toast_status_.c_str()).x;
-        const float minimum_width = Scaled(220.0f);
-        const float width = std::min(std::max(minimum_width, text_width + Scaled(58.0f)),
+        const float minimum_width = Scaled(200.0f);
+        const float width = std::min(std::max(minimum_width, text_width + Scaled(64.0f)),
             std::max(minimum_width, size.x - Scaled(28.0f)));
-        const float height = Scaled(kPlatformToastHeight);
-        const float margin = Scaled(kPlatformToastBottomMargin);
-        const ImVec2 position = Offset(
-            origin, size.x - width - margin, size.y - height - margin);
+        const float height = Scaled(kPlatformToastHeight + 4.0f);
+        const float margin = Scaled(kPlatformTabBarReserve + 2.0f);
+        // The toast rises into place and fades out over its last quarter second.
+        const double now = ImGui::GetTime();
+        const float age = static_cast<float>(now - (toast_expires_at_ - 3.2));
+        const float remaining = static_cast<float>(toast_expires_at_ - now);
+        const bool motion = !cabbird::glass::ReduceMotion();
+        const float enter = motion ? std::clamp(age / 0.22f, 0.0f, 1.0f) : 1.0f;
+        const float eased = 1.0f - (1.0f - enter) * (1.0f - enter) * (1.0f - enter);
+        const float fade = std::clamp(remaining / 0.25f, 0.0f, 1.0f) *
+            (motion ? std::clamp(age / 0.12f, 0.0f, 1.0f) : 1.0f);
+        const ImVec2 position = Offset(origin, (size.x - width) * 0.5f,
+            size.y - height - margin + (1.0f - eased) * Scaled(16.0f));
         const ImVec4 color = toast_failure_ ? ErrorColor() : SuccessColor();
         const auto& theme = cabbird::CabbirdUiTheme();
         ImDrawList* const draw_list = ImGui::GetForegroundDrawList();
         draw_list->PushClipRect(origin, Offset(origin, size.x, size.y), true);
-        draw_list->AddRectFilled(position, Offset(position, width, height),
-            ImGui::ColorConvertFloat4ToU32(ThemeColor(theme.toast_background)), Scaled(4.0f));
-        draw_list->AddRect(position, Offset(position, width, height),
-            ImGui::ColorConvertFloat4ToU32(ImVec4(color.x, color.y, color.z, 0.42f)),
-            Scaled(4.0f));
-        draw_list->AddText(ScaledOffset(position, 12.0f, 11.0f),
-            ImGui::ColorConvertFloat4ToU32(color),
-            ShellGlyphText(toast_failure_ ? ShellGlyph::Warning : ShellGlyph::Check));
-        draw_list->AddText(ScaledOffset(position, 34.0f, 11.0f),
-            ImGui::ColorConvertFloat4ToU32(ThemeColor(theme.text)),
-            Ellipsize(toast_status_, width - Scaled(46.0f)).c_str());
+        ImGui::PushStyleVar(ImGuiStyleVar_Alpha, ImGui::GetStyle().Alpha * fade);
+        cabbird::glass::CaptureBackdrop(draw_list);
+        DrawGlass(draw_list, position, Offset(position, width, height),
+            cabbird::glass::Variant::Regular, (kPlatformToastHeight + 4.0f) * kTabBarRounding,
+            true, false);
+        const float text_y = (height - ImGui::GetTextLineHeight()) * 0.5f;
+        draw_list->AddCircleFilled(Offset(position, Scaled(22.0f), height * 0.5f), Scaled(9.0f),
+            ImGui::GetColorU32(ImVec4(color.x, color.y, color.z, 0.20f)));
+        const char* const glyph =
+            ShellGlyphText(toast_failure_ ? ShellGlyph::Warning : ShellGlyph::Check);
+        const ImVec2 glyph_size = ImGui::CalcTextSize(glyph);
+        draw_list->AddText(Offset(position, Scaled(22.0f) - glyph_size.x * 0.5f,
+                height * 0.5f - glyph_size.y * 0.5f),
+            ImGui::GetColorU32(color), glyph);
+        draw_list->AddText(Offset(position, Scaled(42.0f), text_y),
+            ImGui::GetColorU32(ThemeColor(theme.text)),
+            Ellipsize(toast_status_, width - Scaled(56.0f)).c_str());
+        ImGui::PopStyleVar();
         draw_list->PopClipRect();
     }
 
@@ -5448,7 +6539,7 @@ private:
         ImGui::SameLine();
         const std::string patch_label = StableLabel(
             cabbird::MessageId::DeveloperMemoryPatchProtection, "memory-patch-protection");
-        ImGui::Checkbox(patch_label.c_str(), &patch_);
+        cabbird::glass::Switch(patch_label.c_str(), &patch_);
         ImGui::SameLine();
         const std::string apply = StableLabel(
             cabbird::MessageId::CommonApply, "memory-apply");
@@ -5478,33 +6569,21 @@ private:
     }
 
     void Navigate(Route route) {
+        if (route == Route::UnityCompatibility) route = Route::Diagnostics;
         if (model_.State().route == Route::Settings && route != Route::Settings &&
             SettingsDirty()) {
             settings_pending_route_ = route;
             settings_leave_popup_requested_ = true;
             return;
         }
-        if (route == Route::UnityCompatibility) {
-            route = Route::Diagnostics;
-            if (developer_mode_) {
-                model_.State().diagnostics_tab = DiagnosticTab::Developer;
-                developer_panel_ = DeveloperPanel::UnityProfile;
-            } else {
-                model_.State().diagnostics_tab = DiagnosticTab::Overview;
-            }
-        }
         model_.State().route = route;
+        if (route != Route::Settings) settings_hotkey_capture_ = false;
         if (diagnostics_.settings_record_route) {
             settings_route_to_record_ = std::string(cabbird::ToString(route));
         }
         if (route != Route::Plugins) compact_plugin_detail_pending_id_.clear();
         status_.clear();
         status_failure_ = false;
-    }
-
-    void RedirectHiddenUnityCompatibilityRoute() {
-        if (model_.State().route != Route::UnityCompatibility) return;
-        Navigate(Route::UnityCompatibility);
     }
 
     void OpenPluginLogs(std::string_view plugin_id) {
@@ -6071,6 +7150,7 @@ private:
                     throw;
                 }
                 operation_lock.lock();
+                next_snapshot_refresh_ = {};
             };
             const auto observed_revision = model_.Snapshot().revision;
             if (intent.expected_revision != observed_revision) {
@@ -6302,7 +7382,7 @@ private:
         }
     }
 
-    void ResolveAwaitingBatch(cabbird::PlatformUiSnapshot& next_snapshot) {
+    void ResolveAwaitingBatch(const cabbird::PlatformUiSnapshot& next_snapshot) {
         if (awaiting_batches_.empty()) return;
         for (auto iterator = awaiting_batches_.begin(); iterator != awaiting_batches_.end();) {
             std::map<std::string, AwaitingBatch::Observation, std::less<>> observations;
@@ -6388,7 +7468,7 @@ private:
                 continue;
             }
             cabbird::FinalizeOperation(result);
-            next_snapshot.operation_results.push_back(std::move(result));
+            model_.ApplyOperationResult(std::move(result));
             status_ = Text(cabbird::MessageId::OperationReloadAllPublished);
             status_failure_ = false;
             iterator = awaiting_batches_.erase(iterator);
@@ -6447,12 +7527,7 @@ private:
     PlatformDiagnostics diagnostics_;
     std::optional<ContactInformation> contact_;
     cabbird::PlatformUiModel model_;
-    std::uint64_t revision_{};
-    bool catalog_ready_{};
-    std::optional<cabbird::PluginCatalogSnapshot> catalog_;
-    std::optional<cabbird::PluginDependencyPlan> dependencies_;
-    cabbird::PluginDisplayNameMap plugin_display_names_;
-    cabbird::PluginDescriptionMap plugin_descriptions_;
+    std::chrono::steady_clock::time_point next_snapshot_refresh_{};
     mutable std::mutex catalog_mutex_;
     mutable std::mutex submission_mutex_;
     mutable std::recursive_mutex operation_mutex_;
@@ -6463,6 +7538,22 @@ private:
     bool closing_{};
     std::shared_ptr<const CatalogCache> catalog_cache_;
     std::jthread catalog_worker_;
+    mutable std::mutex theme_mutex_;
+    std::condition_variable_any theme_changed_;
+    cabbird::CabbirdUiPalette theme_requested_palette_{cabbird::CabbirdUiPalette::Paper};
+    bool theme_reload_{true};
+    bool theme_pick_request_{};
+    bool theme_picker_running_{};
+    std::optional<int> theme_mode_request_;
+    std::optional<float> theme_opacity_request_;
+    std::optional<float> theme_opacity_edit_;
+    std::shared_ptr<const cabbird::PlatformUiLayoutSnapshot> theme_published_;
+    cabbird::PlatformUiLayoutDocument theme_layout_;
+    bool theme_layout_available_{};
+    std::string theme_layout_message_;
+    ThemeImage theme_background_;
+    std::vector<ThemeImage> theme_stickers_;
+    std::jthread theme_worker_;
     std::vector<QueuedIntent> queued_intents_;
     std::vector<AwaitingBatch> awaiting_batches_;
     std::vector<std::shared_ptr<QueuedIntent>> rejected_callbacks_;
@@ -6481,31 +7572,17 @@ private:
     bool management_shell_was_collapsed_{};
     float management_shell_ui_scale_{1.0f};
     ImVec2 management_shell_expanded_size_{};
-    // CABBIRD ADDITION -- the only deliberate divergence from Anomaly in this file's layout code.
-    //
-    // The viewport, in logical units, as of the previous frame.  Anomaly persists the shell's size
-    // and never derives it from the display: the shell is an independently draggable window, so
-    // enlarging the host/game window does NOT enlarge it.  On this product that was reported as two
-    // bugs -- the navigation's expand button is disabled while LayoutMode::Compact, and the plugin
-    // page only reaches its two-column form at LayoutMode::Wide -- because a shell left at its
-    // 760px minimum (kPlatformMinimumShellWidth, which is what state/ui-window-state.json held)
-    // can never reach the 900px Standard threshold, so the layout was pinned to Compact forever no
-    // matter how large the window got.  Upstream is not wrong to do this; it is simply a different
-    // product decision, and the user chose to diverge.
-    //
-    // The rule: re-derive the stored size from the viewport when the viewport changes, and on the
-    // first frame when nothing is stored.  Two consequences worth stating, because a "fill every
-    // frame" variant would be one line shorter and worse:
-    //   * a manual resize sticks -- while the host window stays put the viewport does not change,
-    //     so the size the user dragged to is left alone;
-    //   * the initial size no longer comes from kPlatformInitialShellWidth/Height (1180x700),
-    //     which sits 20px SHORT of Wide's 720 height threshold and so could never reach Wide on a
-    //     fresh state however large the display was.
+    // Logical viewport size from the previous frame. Embedded windows keep a
+    // manual size until the viewport changes; desktop hosts fill their client.
     ImVec2 management_shell_viewport_{};
-    bool navigation_collapsed_{};
     bool compact_plugin_detail_{};
     std::string compact_plugin_detail_pending_id_;
     double compact_plugin_detail_requested_at_{};
+    std::function<void(const ImVec2&, const ImVec2&)> page_header_actions_;
+    bool tab_bar_held_{};
+    ImRect tab_bar_rect_;
+    bool plugin_search_active_{};
+    float plugin_search_reveal_{};
     bool focus_plugin_search_{};
     std::string keyboard_plugin_focus_id_;
     bool keyboard_plugin_navigation_consumed_{};
@@ -6540,6 +7617,8 @@ private:
     bool settings_route_restored_{};
     std::optional<std::string> pending_external_url_;
     bool settings_hotkey_capture_{};
+    bool settings_hotkey_hide_all_{};
+    bool settings_hotkey_capture_drawn_{};
     std::array<bool, 256> settings_hotkey_down_{};
     bool settings_leave_popup_requested_{};
     bool repo_editor_loaded_{};
@@ -6710,6 +7789,7 @@ void PreparePlatformUiResources() noexcept {
 }
 
 void DrawPlatformUi() {
+    if (cabbird::HostUiAllHidden()) return;
     std::shared_ptr<PlatformUi> ui;
     {
         std::scoped_lock lock(g_platform_ui_lifecycle_mutex);
@@ -6956,6 +8036,7 @@ void RunPlatform(
             return;
         }
         if (imgui_dx11_initialized) {
+            cabbird::glass::ShutdownRenderer();
             try { ImGui_ImplDX11_Shutdown(); } catch (...) { }
             imgui_dx11_initialized = false;
         }
@@ -6965,7 +8046,10 @@ void RunPlatform(
         }
         if (imgui_context_created) {
             try {
-                if (ImGui::GetCurrentContext() != nullptr) ImGui::DestroyContext();
+                if (ImGui::GetCurrentContext() != nullptr) {
+                    if (ImGui::GetCurrentContext()->SettingsLoaded) SaveStandaloneImGuiSettings(root);
+                    ImGui::DestroyContext();
+                }
             } catch (...) { }
             imgui_context_created = false;
         }
@@ -6983,10 +8067,14 @@ void RunPlatform(
     };
     host.visible = config.platform_visible;
     host.toggle_key = config.platform_toggle_key;
+    host.hide_all_key = config.platform_hide_all_key;
     const auto settings_snapshot = diagnostics.settings_snapshot;
     if (settings_snapshot) {
         const auto settings = settings_snapshot();
-        if (settings.ready) host.toggle_key = settings.values.input_menu_toggle;
+        if (settings.ready) {
+            host.toggle_key = settings.values.input_menu_toggle;
+            host.hide_all_key = settings.values.input_hide_all_toggle;
+        }
     }
     if (config.platform_attach_to_process_window) {
         for (int attempt = 0;
@@ -7003,7 +8091,7 @@ void RunPlatform(
     g_window = &host;
 
     class_registered = RegisterClassExW(&window_class) != 0;
-    const DWORD extended_style = WS_EX_TOOLWINDOW;
+    const DWORD extended_style = host.attached ? WS_EX_TOOLWINDOW : WS_EX_APPWINDOW;
     const DWORD window_style = host.attached ? WS_POPUP : WS_OVERLAPPEDWINDOW;
     host.window = CreateWindowExW(
         extended_style, window_class.lpszClassName, L"Cabbird Plugin Platform", window_style,
@@ -7054,12 +8142,15 @@ void RunPlatform(
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
     io.ConfigNavCursorVisibleAuto = false;
     io.ConfigNavEscapeClearFocusWindow = true;
-    host.imgui_ini_path = std::make_shared<std::string>((root / L"cabbird-imgui.ini").string());
-    io.IniFilename = host.imgui_ini_path->c_str();
+    LoadStandaloneImGuiSettings(root);
     imgui_win32_initialized = ImGui_ImplWin32_Init(host.window);
     if (!imgui_win32_initialized) return;
     imgui_dx11_initialized = ImGui_ImplDX11_Init(host.device, host.context);
     if (!imgui_dx11_initialized) return;
+    if (!ImGui_ImplDX11_CreateDeviceObjects()) return;
+    if (io.Fonts != nullptr) io.Fonts->ClearTexData();
+    static_cast<void>(cabbird::glass::InitializeRenderer(host.device, host.context));
+    ApplyCabbirdUiStyle();
     static_cast<void>(CreateStandaloneHeaderLogo(host));
 
     plugin_mutex = std::make_shared<std::mutex>();
@@ -7096,13 +8187,13 @@ void RunPlatform(
     };
     if (adapter != nullptr) {
         tick_callback_installed = true;
-        const auto game_pump = diagnostics.game_pump;
-        adapter->SetTickCallback([plugin_mutex, &plugins, game_pump](double delta_seconds) {
-            if (game_pump) static_cast<void>(game_pump());
-            std::scoped_lock lock(*plugin_mutex);
+        adapter->SetTickCallback([plugin_mutex, &plugins](double delta_seconds) {
+            std::unique_lock lock(*plugin_mutex, std::try_to_lock);
+            if (!lock.owns_lock()) return;
             plugins.GameUpdate(delta_seconds);
         });
     }
+    diagnostics.standalone_window = !host.attached;
     ui_initialized = InitializePlatformUi(plugins, std::move(diagnostics), plugin_owner);
     if (!ui_initialized) {
         // A pending owner is a teardown fence. Do not expose this new ImGui
@@ -7124,6 +8215,7 @@ void RunPlatform(
     UpdateWindow(host.window);
 
     auto previous = std::chrono::steady_clock::now();
+    HRESULT present_error = S_OK;
     bool running = true;
     while (running && !stop_token.stop_requested()) {
         MSG message{};
@@ -7134,7 +8226,10 @@ void RunPlatform(
         }
         if (settings_snapshot) {
             const auto settings = settings_snapshot();
-            if (settings.ready) host.toggle_key = settings.values.input_menu_toggle;
+            if (settings.ready) {
+                host.toggle_key = settings.values.input_menu_toggle;
+                host.hide_all_key = settings.values.input_hide_all_toggle;
+            }
         }
         // The menu hotkey must only react while the game (or, in attached mode,
         // the overlay host itself) owns focus, not while the user is typing in
@@ -7146,13 +8241,22 @@ void RunPlatform(
             host.attached && host.target != nullptr &&
             foreground_window == host.target;
         const bool menu_focus = host_window_focused || game_window_focused;
-        // Same latch as the overlay's present hook: sample the physical key, let the shared
-        // edge own the press, and take it only if this site owns focus.  Both sites sampling the
-        // same key is safe -- one press is one toggle, handed to one of them.
-        cabbird::PollMenuHotkey(host.toggle_key);
-        if (cabbird::ShouldTogglePlatformMenus(
-                PlatformUiCapturingHotkey(), cabbird::TakeMenuHotkeyToggleState(menu_focus))) {
-            if (!host.visible) {
+        const int toggle_state = GetAsyncKeyState(static_cast<int>(host.toggle_key));
+        const int hide_all_state = GetAsyncKeyState(static_cast<int>(host.hide_all_key));
+        const bool recording_hotkey = PlatformUiCapturingHotkey();
+        host.menu_hotkey.Configure(host.toggle_key, toggle_state);
+        host.hide_all_hotkey.Configure(host.hide_all_key, hide_all_state);
+        if (host.hide_all_hotkey.Consume(recording_hotkey, menu_focus, hide_all_state, host_window_focused) &&
+            host.hide_all_key != host.toggle_key) {
+            cabbird::SetHostUiAllHidden(!cabbird::HostUiAllHidden());
+        }
+        if (host.menu_hotkey.Consume(recording_hotkey, menu_focus, toggle_state, host_window_focused)) {
+            if (!host.attached) {
+                // A desktop host remains reachable through its taskbar entry.
+                // Hiding it would make this focus-gated hotkey unable to reveal it.
+                cabbird::SetHostUiMenusCollapsed(false);
+                ShowWindow(host.window, SW_MINIMIZE);
+            } else if (!host.visible) {
                 host.visible = true;
                 if (host.attached) PlaceAttachedWindow(host);
                 ShowWindow(host.window, host.attached ? SW_SHOWNOACTIVATE : SW_SHOW);
@@ -7191,8 +8295,14 @@ void RunPlatform(
             }
         }
         plugins.PersistUiWindowState();
+        if (io.WantSaveIniSettings) SaveStandaloneImGuiSettings(root);
         if (host.attached && !IsWindow(host.target)) running = false;
         if (host.visible && host.attached && !IsIconic(host.target)) PlaceAttachedWindow(host);
+        if (cabbird::HostUiAllHidden()) {
+            UpdateHostWindowRegion(host);
+            Sleep(10);
+            continue;
+        }
         if (!host.visible || IsIconic(host.window) || (host.attached && IsIconic(host.target))) {
             Sleep(50);
             continue;
@@ -7213,15 +8323,26 @@ void RunPlatform(
         {
             std::scoped_lock lock(*plugin_mutex);
             DrawPlatformUi();
-            plugins.Draw(ImGui::GetCurrentContext());
+            if (!cabbird::HostUiAllHidden()) plugins.Draw(ImGui::GetCurrentContext());
         }
         ImGui::Render();
+        cabbird::glass::PrepareDrawData(ImGui::GetDrawData());
         UpdateHostWindowRegion(host);
         host.context->OMSetRenderTargets(1, &host.render_target, nullptr);
         host.context->ClearRenderTargetView(host.render_target, kHostClearColor);
-        ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
-        host.swap_chain->Present(1, 0);
+        cabbird::glass::RenderDrawData(host.context, ImGui::GetDrawData());
+        const HRESULT presented = host.swap_chain->Present(1, 0);
+        if (FAILED(presented)) {
+            present_error = presented;
+            running = false;
+        }
         FlushPlatformUiActions();
+    }
+
+    if (FAILED(present_error)) {
+        std::ofstream(root / L"cabbird-platform.log", std::ios::app)
+            << "standalone presentation failed; stopping UI: "
+            << static_cast<unsigned long>(present_error) << '\n';
     }
 
     // Stop the external tick source before draining lifecycle UI callbacks so

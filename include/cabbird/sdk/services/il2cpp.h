@@ -78,6 +78,10 @@ typedef struct CabbirdIl2CppApiV1 {
     const CabbirdMethodInfoV1* (CABBIRD_CALL *il2cpp_class_get_methods)(CabbirdIl2CppClassV1*, void**);
     const char* (CABBIRD_CALL *il2cpp_method_get_name)(const CabbirdMethodInfoV1*);
     uint32_t (CABBIRD_CALL *il2cpp_method_get_param_count)(const CabbirdMethodInfoV1*);
+    void (CABBIRD_CALL *il2cpp_field_static_get_value)(CabbirdFieldInfoV1*, void*);
+    uint32_t (CABBIRD_CALL *il2cpp_field_get_flags)(CabbirdFieldInfoV1*);
+    const CabbirdIl2CppTypeV1* (CABBIRD_CALL *il2cpp_method_get_return_type)(const CabbirdMethodInfoV1*);
+    uint32_t (CABBIRD_CALL *il2cpp_method_get_flags)(const CabbirdMethodInfoV1*, uint32_t*);
 } CabbirdIl2CppApiV1;
 
 typedef CabbirdStatusV1 (CABBIRD_CALL *CabbirdIl2CppCallbackV1)(
@@ -87,7 +91,8 @@ typedef struct CabbirdIl2CppServiceV1 {
     uint32_t struct_size;
     uint32_t service_version;
     void* user;
-    /* Synchronous, only from on_update on the observed game thread. The host
+    /* Synchronous, from on_update or a registered Game stop cleanup within the
+     * observed game frame. Matching only the OS thread ID is insufficient. The host
      * reuses cabbird::il2cpp initialization/ThreadScope. Never dispatches or waits. */
     CabbirdStatusV1 (CABBIRD_CALL *with_runtime)(
         void* user, CabbirdIl2CppCallbackV1 callback, void* callback_user);

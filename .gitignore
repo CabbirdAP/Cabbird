@@ -12,5 +12,6 @@ __pycache__/
 # released tree, and nothing outside these paths may depend on it.
 artifacts/
 .local/
+.temp/
 # Crash dumps, if any analysis copies one in.
 *.dmp

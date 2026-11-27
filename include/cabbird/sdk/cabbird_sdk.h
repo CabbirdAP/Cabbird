@@ -1,8 +1,8 @@
 /* cabbird/sdk/cabbird_sdk.h -- umbrella header for plugin authors.
  *
  * Migrated from anomaly/sdk/anomaly_sdk.h.  Include this one header and you have the
- * whole public ABI.  It is deliberately plain C (compiles as C89 with a C99
- * <stdint.h>) so a plugin can be written without a C++ toolchain, and it pulls in
+ * whole public ABI. It is plain C11 so a plugin can be written without a C++
+ * toolchain, and it pulls in
  * nothing from the host's internals.
  *
  * The UE5 service headers from upstream become services/unity.h here; that is the UE -> Unity
@@ -19,8 +19,6 @@
  *      only from the plugin-manager surface that existed to fill that table.  The table is
  *      excluded instead, together with that surface.
  *
- * services/websocket.h is still absent: it has no inventory entry at all, so it
- * is deliberately not included rather than silently dropped.
  */
 #pragma once
 
@@ -32,11 +30,17 @@
 #include "cabbird/sdk/services/localization.h"
 #include "cabbird/sdk/services/interop.h"
 #include "cabbird/sdk/services/ipc.h"
+#include "cabbird/sdk/services/websocket.h"
+#include "cabbird/sdk/services/web.h"
 #include "cabbird/sdk/services/ui.h"
 #include "cabbird/sdk/services/ui_resources.h"
 #include "cabbird/sdk/services/json.h"
+#include "cabbird/sdk/services/profile.h"
 #include "cabbird/sdk/services/unity.h"
+#include "cabbird/sdk/services/player_motion.h"
 #include "cabbird/sdk/services/il2cpp.h"
+#include "cabbird/sdk/services/game_lifecycle.h"
+#include "cabbird/sdk/services/unity_metadata.h"
 /* services/azur.h (Anomaly sdk/services/nte.h) is deliberately NOT included: it is 586 lines
  * of NTE service tables and ~80 CabbirdNte* types with no framework-level part, and NTE-specific
  * content is excluded.  The Unity profile layer defines its own services. */

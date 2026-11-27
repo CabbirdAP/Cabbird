@@ -8,7 +8,6 @@
 
 #include <algorithm>
 #include <array>
-#include <atomic>
 #include <cstddef>
 #include <cstring>
 #include <cwchar>
@@ -22,7 +21,6 @@
 #include <set>
 #include <span>
 #include <string>
-#include <thread>
 #include <utility>
 #include <vector>
 
@@ -466,6 +464,22 @@ std::set<DWORD> SnapshotLauncherProcessIds(
     return result;
 }
 
+// Copied from Anomaly: an existing launcher may refuse termination or exit
+// during enumeration. Neither prevents a new launch and target capture.
+void StopLauncherProcess(const DWORD process_id) noexcept {
+    DWORD open_error{};
+    Handle process = OpenProcessWithAccess(
+        process_id, PROCESS_TERMINATE | SYNCHRONIZE, open_error);
+    if (!process) return;
+    if (TerminateProcess(process.Get(), ERROR_PROCESS_ABORTED) == FALSE &&
+        WaitForSingleObject(process.Get(), 0) != WAIT_OBJECT_0) {
+        return;
+    }
+    // A process that was terminated is signalled; the wait only gives it time to leave before the
+    // launcher starts a new one. A helper that outlasts the budget keeps its pid, which nothing here reads.
+    static_cast<void>(WaitForSingleObject(process.Get(), 5000));
+}
+
 bool TerminateExistingLauncherProcesses(
     const std::filesystem::path& launcher_directory, DWORD& error) noexcept {
     DWORD snapshot_error{};
@@ -474,25 +488,11 @@ bool TerminateExistingLauncherProcesses(
         error = snapshot_error;
         return false;
     }
-    for (const DWORD process_id : process_ids) {
-        DWORD open_error{};
-        Handle process = OpenProcessWithAccess(
-            process_id, PROCESS_TERMINATE | SYNCHRONIZE, open_error);
-        if (!process) {
-            error = open_error;
-            return false;
-        }
-        if (TerminateProcess(process.Get(), ERROR_PROCESS_ABORTED) == FALSE &&
-            WaitForSingleObject(process.Get(), 0) != WAIT_OBJECT_0) {
-            error = GetLastError();
-            return false;
-        }
-        const DWORD wait = WaitForSingleObject(process.Get(), 5000);
-        if (wait != WAIT_OBJECT_0) {
-            error = wait == WAIT_FAILED ? GetLastError() : ERROR_TIMEOUT;
-            return false;
-        }
-    }
+    // Best effort, deliberately: what survives the sweep is what the client protects, and the launch
+    // below does not depend on it. A surviving launcher window is handed the session by the single
+    // instance logic of the launcher that starts next, and the capture records the target processes that
+    // exist after this call, so a stale helper can never be mistaken for the game.
+    for (const DWORD process_id : process_ids) StopLauncherProcess(process_id);
     error = ERROR_SUCCESS;
     return true;
 }
@@ -621,7 +621,6 @@ FastTargetCaptureResult CaptureTargetByFastPolling(
     std::wstring_view requested_target,
     const std::set<DWORD>& existing_targets,
     std::chrono::steady_clock::time_point deadline,
-    std::atomic_bool& ready,
     std::stop_token stop) {
     FastTargetCaptureResult result;
     result.error = ERROR_TIMEOUT;
@@ -630,7 +629,6 @@ FastTargetCaptureResult CaptureTargetByFastPolling(
     std::vector<DWORD> process_ids;
     process_ids.reserve(4);
     std::set<DWORD> rejected;
-    ready.store(true, std::memory_order_release);
 
     while (!stop.stop_requested() &&
         std::chrono::steady_clock::now() < deadline) {
@@ -681,6 +679,7 @@ FastTargetCaptureResult CaptureTargetByFastPolling(
         }
         static_cast<void>(SwitchToThread());
     }
+    if (stop.stop_requested()) result.error = ERROR_CANCELLED;
     return result;
 }
 
@@ -1941,9 +1940,15 @@ ManualMapResult ManualMapRuntimeCore(const ManualMapOptions& options) noexcept {
 }
 
 ManualMapLaunchResult LaunchAndManualMapRuntimeCore(
-    const ManualMapLaunchOptions& options) noexcept {
+    const ManualMapLaunchOptions& options, std::stop_token stop) noexcept {
     ManualMapLaunchResult result;
     try {
+        const auto cancelled = [&] {
+            result.mapping = Failure(ManualMapError::ProcessControlFailure, ERROR_CANCELLED,
+                "launch attachment was cancelled before mapping");
+            return result;
+        };
+        if (stop.stop_requested()) return cancelled();
         if (options.launcher_path.empty() || options.target_executable_name.empty() ||
             options.manual_map.core_path.empty()) {
             result.mapping = Failure(
@@ -1962,12 +1967,13 @@ ManualMapLaunchResult LaunchAndManualMapRuntimeCore(
             command_line.append(options.launcher_arguments);
         }
 
+        if (stop.stop_requested()) return cancelled();
         DWORD launcher_cleanup_error{};
         if (!TerminateExistingLauncherProcesses(
                 launcher.parent_path(), launcher_cleanup_error)) {
             result.mapping = Failure(
                 ManualMapError::ProcessControlFailure, launcher_cleanup_error,
-                "existing official launcher processes could not be stopped");
+                "existing official launcher processes could not be enumerated before launch");
             return result;
         }
 
@@ -1985,35 +1991,16 @@ ManualMapLaunchResult LaunchAndManualMapRuntimeCore(
         const std::wstring requested_target = Fold(options.target_executable_name);
         const auto discovery_timeout = std::clamp<std::int64_t>(
             options.target_timeout.count(), 1, std::chrono::minutes(10).count() * 60'000LL);
-        const auto discovery_deadline = std::chrono::steady_clock::now() +
-            std::chrono::milliseconds(discovery_timeout);
-        FastTargetCaptureResult captured;
-        std::atomic_bool capture_ready{};
-        std::jthread capture_thread([&](std::stop_token stop) noexcept {
-            try {
-                captured = CaptureTargetByFastPolling(
-                    requested_target, existing_targets, discovery_deadline,
-                    capture_ready, stop);
-            } catch (...) {
-                captured.error = ERROR_UNHANDLED_EXCEPTION;
-                capture_ready.store(true, std::memory_order_release);
-            }
-        });
-        while (!capture_ready.load(std::memory_order_acquire)) {
-            static_cast<void>(SwitchToThread());
-        }
-
         STARTUPINFOW startup{.cb = sizeof(startup)};
         PROCESS_INFORMATION created{};
         constexpr DWORD incompatible_flags =
             DEBUG_PROCESS | DEBUG_ONLY_THIS_PROCESS | CREATE_SUSPENDED;
+        if (stop.stop_requested()) return cancelled();
         if (CreateProcessW(
                 launcher.c_str(), command_line.data(), nullptr, nullptr, FALSE,
                 options.creation_flags & ~incompatible_flags,
                 nullptr, working_directory.c_str(), &startup, &created) == FALSE) {
             const DWORD launch_error = GetLastError();
-            capture_thread.request_stop();
-            capture_thread.join();
             result.mapping = Failure(
                 ManualMapError::ProcessLaunchFailure, launch_error,
                 "official launcher could not be started for target capture");
@@ -2023,7 +2010,13 @@ ManualMapLaunchResult LaunchAndManualMapRuntimeCore(
         Handle launcher_process(created.hProcess);
         Handle launcher_thread(created.hThread);
 
-        capture_thread.join();
+        // Capture belongs to the controller Worker, so its shutdown token reaches
+        // the wait directly instead of being hidden behind another thread's join.
+        const auto discovery_deadline = std::chrono::steady_clock::now() +
+            std::chrono::milliseconds(discovery_timeout);
+        auto captured = CaptureTargetByFastPolling(
+            requested_target, existing_targets, discovery_deadline, stop);
+        if (stop.stop_requested()) return cancelled();
         Handle target_process = std::move(captured.process);
         Handle target_cleanup;
         AttachableProcess target;
@@ -2078,6 +2071,7 @@ ManualMapLaunchResult LaunchAndManualMapRuntimeCore(
             DWORD module_error = ERROR_NOT_READY;
             bool loader_ready{};
             do {
+                if (stop.stop_requested()) return cancelled();
                 auto modules = SnapshotModules(target_process.Get(), module_error);
                 loader_ready = module_error == ERROR_SUCCESS &&
                     modules.contains(Fold(target.executable_name)) &&
@@ -2092,6 +2086,7 @@ ManualMapLaunchResult LaunchAndManualMapRuntimeCore(
                 if (!loader_ready) Sleep(1);
             } while (!loader_ready &&
                 std::chrono::steady_clock::now() < loader_deadline);
+            if (stop.stop_requested()) return cancelled();
             if (!loader_ready) {
                 result.mapping = Failure(
                     ManualMapError::DependencyFailure,

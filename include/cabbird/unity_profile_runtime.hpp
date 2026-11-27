@@ -21,24 +21,8 @@ struct UnityProfileRuntimeOptions {
     std::filesystem::path runtime_root;
     std::string game_id{"ap"};
     HMODULE game_module{};
-    // NOT WIRED, AND SAYING SO IS THE POINT.  `[Performance] *SnapshotTickInterval` reaches this
-    // field and stops: nothing reads it, so the ini keys and the docs table describe a cadence
-    // this host does not implement.  Upstream hands the same struct to its adapter, which
-    // throttles snapshots with it, and so does this port now: `entity_tick_interval` becomes the
-    // entity walk's sampling divisor, and the value travels
-    // `[Performance] EntitySnapshotTickInterval` -> `AnalyzerConfig` -> here -> the adapter's
-    // constructor -> the gate in `RefreshUnityEntityEsp`.
-    //
-    // WHAT THIS FIELD USED TO BE.  It was carried here and dropped on the floor: the adapter
-    // constructor that took it was declared and never defined, and the field the gate read
-    // (`EntityComponentState::refresh_divisor`) was never assigned -- so the walk ran every tick
-    // while its own comment claimed "DEFAULT 8 ... THE WHOLE FRAME-RATE FIX".  Both halves of that
-    // are fixed: the value is passed at construction and the field is gone.
-    //
-    // Only the entity interval has a consumer.  `player_tick_interval` describes a cadence this
-    // port does not need (the player snapshot is a handful of field reads on the walk's own tick),
-    // and `actor_tick_interval` describes an upstream split this port's single entity walk already
-    // covers; both are kept as declared data so the shape still matches upstream.
+    // Immutable per-generation player and entity sampling cadences. Both are
+    // demand-driven; camera projection remains current on every active entity tick.
     UnitySnapshotSamplingOptions snapshot_sampling;
     // Profile lifecycle owns the adapter; render code only borrows it.
     bool start_frame_clock{true};

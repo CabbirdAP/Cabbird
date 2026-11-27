@@ -197,7 +197,7 @@ public:
         std::scoped_lock lock(mutex_);
         // No hook is registered by this layer: the frame clock owns the one hook the runtime
         // installs, and it reports through the adapter.  The accessor stays because it is part
-        // of the framework contract src/runtime/core_main.cpp consumes.
+        // of the framework contract src/app/core_main.cpp consumes.
         static_cast<void>(lock);
         return {};
     }

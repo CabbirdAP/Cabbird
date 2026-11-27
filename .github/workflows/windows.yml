@@ -1,16 +1,5 @@
 name: windows
 
-# Ported from Anomaly's .github/workflows/windows.yml, which is the flow this repository's
-# CMake presets and install components were already shaped after: configure the one preset,
-# build the one configuration, stage per-component artifacts for a branch, and package +
-# publish for a tag.  The differences from upstream are the names, and two deliberate ones:
-#
-#   * `--parallel` is NOT passed to `cmake --build`.  Upstream passes it; on this
-#     repository's Visual Studio 17 2022 / MSBuild 17.14 combination it makes the build
-#     return 1 before printing anything useful (see build.cmd and docs/developer-guide/
-#     building.md).  The preset already builds in parallel, so nothing is lost.
-#   * the Tools component holds cabbird-cli only -- this tree has no tools/ directory, so
-#     there is no third archive to stage on a branch.
 
 on:
   push:
@@ -33,12 +22,6 @@ jobs:
       - uses: actions/checkout@v4
       - name: Configure
         shell: pwsh
-        # A tag pins the release version through CABBIRD_RELEASE_VERSION, and that single
-        # variable is what puts the version into the code: cmake/version.h.in is configured
-        # into both SDK headers (in-tree configured_version.h and the installed
-        # cabbird/sdk/version.h), so a release tag needs no version bump in any file.  There
-        # used to be a configure-time check against include/cabbird/sdk/version.h; it is gone
-        # with the manual bump it enforced.
         run: |
           $arguments = @(
             '--preset', 'windows-vs2022'
@@ -48,11 +31,6 @@ jobs:
           }
           cmake @arguments
       - name: Build
-        # CMake 4 is not usable yet: MinHook (fetched by tag) declares
-        # `cmake_minimum_required(VERSION 3.0...3.5)`, and CMake 4 removed compatibility
-        # with minimums below 3.5.  The windows-2022 image currently ships 3.3x; if a
-        # runner bump ever lands on 4.x, this step is where it will fail.  Upstream has the
-        # same constraint, so the fix belongs upstream (or in the pin), not here.
         run: cmake --build --preset windows-relwithdebinfo
       - name: Stage CI runtime and tools
         if: github.ref_type != 'tag'

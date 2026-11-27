@@ -2,6 +2,7 @@
 
 #include "cabbird/config.hpp"
 #include "cabbird/platform_host.hpp"
+#include "cabbird/platform_ui_input_policy.hpp"
 
 #include "cabbird/hook_manager.hpp"
 #include "cabbird/input_service.hpp"
@@ -23,6 +24,7 @@
 #include <mutex>
 #include <string>
 #include <string_view>
+#include <set>
 #include <vector>
 
 struct ImGuiContext;
@@ -143,6 +145,8 @@ void Release(T*& value) {
 // the window-procedure thread.
 struct EmbeddedInputMailbox {
     std::mutex mutex;
+    cabbird::PlatformMenuHotkey menu_hotkey;
+    cabbird::PlatformMenuHotkey hide_all_hotkey;
     cabbird::InputFrameState frame;
     float last_published_mouse_x{};
     float last_published_mouse_y{};
@@ -204,7 +208,13 @@ struct HookTargets {
 
 struct EmbeddedState {
     std::filesystem::path root;
-    std::string imgui_ini_path;
+    // Worker prepares/persists immutable INI text. Render only serializes or
+    // loads memory; the latest snapshot also survives device replacement.
+    std::atomic<std::shared_ptr<const std::string>> imgui_ini_snapshot;
+    std::mutex diagnostic_mutex;
+    std::vector<std::string> pending_diagnostics;
+    // Only the serialized Render owner writes the once-per-reason set.
+    std::set<std::string> reported_gates;
     AnalyzerConfig config;
     PlatformDiagnostics diagnostics;
     EmbeddedPerformanceProbe performance;
@@ -247,6 +257,9 @@ struct EmbeddedState {
     bool win32_initialized{};
     bool platform_ui_initialized{};
     bool plugin_ui_device_active{};
+    // The existing ImGui draw data may be submitted again while the plugin
+    // gate is busy, until Render starts preparing another frame or target.
+    bool completed_ui_frame{};
     bool lifecycle_invoker_bound{};
     bool plugins_loaded{};
     std::atomic<RendererLifecycle> renderer{RendererLifecycle::Cold};
@@ -271,12 +284,20 @@ void RecordEmbeddedInputMessage(
     EmbeddedState& state, UINT message, WPARAM wparam, LPARAM lparam) noexcept;
 // These are called on Render while the existing PluginManager mutex is held.
 // The mailbox keeps their input collection independent from WndProc.
+struct EmbeddedMenuHotkeyActions final {
+    bool toggle_menu{};
+    bool toggle_hide_all{};
+};
+[[nodiscard]] EmbeddedMenuHotkeyActions ConsumeEmbeddedMenuHotkeys(
+    EmbeddedState& state, unsigned menu_key, unsigned hide_all_key, bool recording_menu_key);
 [[nodiscard]] bool PublishEmbeddedInputFrame(EmbeddedState& state) noexcept;
 void PublishEmbeddedUiCapture(EmbeddedState& state) noexcept;
 
 [[nodiscard]] const CabbirdUiServiceV1* EmbeddedUiServiceTable() noexcept;
 
 void RenderEmbedded(IDXGISwapChain* swap_chain, UINT flags);
+void PrepareEmbeddedResize(IDXGISwapChain* swap_chain);
+void CompleteEmbeddedResize(IDXGISwapChain* swap_chain);
 void HandlePresentResult(IDXGISwapChain* swap_chain, HRESULT result);
 [[nodiscard]] bool ReleaseGraphics(
     EmbeddedState& state, RendererLifecycle final_state, bool force_release = false);

@@ -4,7 +4,7 @@
 [`services/json.h`](../../include/cabbird/sdk/services/json.h)、
 [`services/localization.h`](../../include/cabbird/sdk/services/localization.h)
 
-这一族服务与游戏无关：配置、存储、调度、本地化、JSON、命令、通知、运行时信息、自检。
+这一族服务与游戏无关：配置、存储、调度、本地化、JSON、插件 Profile、命令、通知、运行时信息、自检。
 
 ## 1. `cabbird.config`（v1）
 
@@ -106,9 +106,8 @@ typedef CabbirdStatusV1 (CABBIRD_CALL *CabbirdConfigMigrationV1)(
 | `translate(user, key, english_fallback, arguments, argument_count, dest, *inout_size)` | 按 key 取文案；缺失时用英文回退串 |
 
 插件自己的文案放在**插件目录**的 `locales/<locale>.json`，key 形如
-`cabbird.damage-replay.replay-count`；宿主在找不到 `<包>/locales/<locale>.json` 时
-**静默回退英文**，所以拷漏目录会得到「看起来完整其实不是」的包
-（`CMakeLists.txt` 的 DamageReplay 安装块就是为这件事写的）。
+`cabbird.damage-replay.replay-count`；目录缺失、目录不合规或占位符集合与英文不匹配时使用英文回退，
+首次回退记录诊断。`cabbird_add_plugin` 统一同步、安装目录，C++ 插件通过 SDK `Localizer` 消费服务。
 
 ## 10. `cabbird.plugin-state`
 
@@ -119,7 +118,14 @@ typedef CabbirdStatusV1 (CABBIRD_CALL *CabbirdConfigMigrationV1)(
 | 服务 | 备注 |
 |---|---|
 | `cabbird.config` / `cabbird.storage` / `cabbird.runtime-info` / `cabbird.diagnostics` / `cabbird.scheduler` / `cabbird.commands` / `cabbird.notifications` / `cabbird.json` / `cabbird.localization` | 由宿主平台层发布 |
-| `cabbird.websocket` | **没有服务头文件发布它**；`cabbird_sdk.h` 也不包含 `services/websocket.h`。按 `UNAVAILABLE` 处理 |
+| `cabbird.websocket` | Runtime 所有的本机广播；协议与背压见 [WebSocket 广播](websocket.md) |
+| `cabbird.web` | Runtime 所有的本机网页与认证 API；注册与生命周期见 [本机网页](web.md) |
 
 声明为 `optional` 的服务缺失时插件必须降级而不是失败——这是本套 ABI 的核心约定，
 见[约定与总览](README.md#可用性与代次)。
+
+## 插件包内 Profile
+
+`cabbird.profile` 是独立的 v1 服务，和 `cabbird.json` 共用 `json` capability。
+它从当前 generation 的不可变包快照加载、校验 `profile/`，返回作用域内 JSON 句柄。
+路径、格式与 C++ 快照助手见 [兼容资料与元数据](compatibility-profiles.md)。

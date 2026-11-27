@@ -1,0 +1,16 @@
+{
+  "schemaVersion": 1,
+  "locale": "zh-CN",
+  "messages": {
+    "window.title": "自由飞行",
+    "plugin.description": "使用已校验的原生移动控制器，按镜头方向控制当前玩家自由飞行。默认关闭；开关与飞行速度会保存。",
+    "settings.enabled": "启用",
+    "settings.speed": "飞行速度（米/秒）",
+    "log.layout": "自由飞行：镜头元数据或运行时不可用。",
+    "log.update": "自由飞行：游戏线程准备失败。",
+    "log.motion": "自由飞行：共享移动控制不可用。",
+    "log.settings": "自由飞行：已保存的设置无效，已保留默认值。",
+    "log.save": "自由飞行：无法提交配置保存任务。",
+    "log.draw": "自由飞行：窗口回调失败。"
+  }
+}

@@ -48,6 +48,9 @@ MyPlugin\
 - **能选 `optional: true` 就选**——目标 build 上服务缺失是常态；
 - 只读插件**不要**申请写权限（`unity-player-teleport`、`memory-write`、`interop-hook`……）。
 
+构建后对插件包运行 `cabbird-plugin validate <包目录>`，检查 manifest、入口和服务权限声明。
+工具与宿主共用授权规则；例如 `cabbird.window` 需要 `ui-window`，结构合法但漏权限的包也会被拒绝。
+
 ## 3. 用 SDK 的 CMake 助手
 
 SDK 安装后提供 `CabbirdPlugin.cmake`（`cmake/sdk/CabbirdPlugin.cmake`）：
@@ -58,9 +61,9 @@ project(MyPlugin LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 20)
 find_package(CabbirdSDK CONFIG REQUIRED)
 
-cabbird_add_plugin(cabbird_example_my_plugin
-    SOURCES my_plugin/plugin.cpp
-    MANIFEST my_plugin/manifest.json
+cabbird_add_plugin(MyPlugin
+    SOURCES plugin.cpp
+    MANIFEST manifest.json
     PACKAGE_NAME MyPlugin
     OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/packages/MyPlugin")
 ```
@@ -72,20 +75,30 @@ cmake -S . -B build -DCabbirdSDK_DIR=C:/path/to/sdk/lib/cmake/CabbirdSDK
 cmake --build build --config RelWithDebInfo
 ```
 
-`cabbird_add_plugin` 做的事（同文件，共 49 行）：
+`cabbird_add_plugin` 建立链接 `Cabbird::sdk` 的 DLL 目标，统一输出 `plugin.dll`，
+并准备同目录的 manifest 和包数据。`locales/`、`assets/`、`profile/` 自动同步，
+数据文件变化也会更新构建包，无需给每个插件重复编写复制和安装规则。
+`NO_RELEASE` 可用于不应安装的开发示例。内建插件只在
+`cmake/CabbirdBuiltinPlugins.cmake` 登记，预览和符号清单自动派生。
 
-| 行为 | 说明 |
-|---|---|
-| 建 `SHARED` 库并链接 `Cabbird::sdk` | 纯接口目标，只带头文件 |
-| `PREFIX ""`、`OUTPUT_NAME "plugin"` | 产物就是 `plugin.dll`（不带 `lib` 前缀） |
-| 输出到 `OUTPUT_DIRECTORY` | 默认 `<build>/package/<PACKAGE_NAME>` |
-| POST_BUILD 复制 manifest | 保证 `plugin.dll` 与 `manifest.json` 同目录 |
-| MSVC `/W4 /permissive-` | `C_ONLY` 时不加 `/EHsc`（C 插件不引 C++ 异常运行时） |
-| 登记 `CABBIRD_RELEASE_PLUGIN_TARGETS` | 供发布打包使用；`NO_RELEASE` 可退出 |
+C++ 插件可以使用纯头文件助手 `cabbird/sdk/cpp.hpp` 和
+`cabbird/sdk/localization.hpp`；它们不要求链接宿主内部库。
+`cabbird::sdk::Localizer` 封装服务查询、长度协议和英文回退：
 
-**注意**：助手**不会**替你复制 `locales\` 与 `assets\`。需要就自己加
-`add_custom_command(... POST_BUILD ...)`，否则界面会静默回退英文
-（这正是 `CMakeLists.txt` 里 DamageReplay 那段安装块存在的原因）。
+```cpp
+cabbird::sdk::Localizer text(host);
+const auto title = text.Label("window.title", "My Plugin", "my-plugin");
+```
+
+在 `on_load` 保存一次 Localizer；目录使用宿主的 `locales/<locale>.json` 格式，
+manifest 声明 `cabbird.localization` 服务依赖和 `ui` capability。
+
+通用窗口封装位于 `cabbird/sdk/plugin_window.hpp`，使用 `cabbird::sdk::PluginWindow`；
+它把关闭请求交给宿主管理。配置保存队列位于 `cabbird/sdk/config_save_queue.hpp`，
+使用 `cabbird::sdk::ConfigSaveQueue`：先绑定宿主与配置服务，提交已序列化的设置，
+由 Worker 延迟保存，`on_stop` 排空任务后调用 `Flush()`。
+这两个头只依赖标准库和公开 SDK。内建插件的 JSON 配置与 Azur 实体辅助放在
+`include/cabbird/plugin_support/`，不属于独立 SDK 安装内容。
 
 ## 4. 入口与生命周期
 
@@ -234,7 +247,7 @@ read(...)          /* NOT_FOUND = 还没有保存过，用默认值 */
 write_atomic(...)  /* 校验后原子替换 */
 ```
 
-`examples/reliable_config` 演示了完整模式：UI 改动只把状态标脏，`on_stop` 时提交一次。
+`examples/reliable_config` 演示了完整模式：UI 改动标脏并投递 Worker，后台保存，`on_stop` 补存尚未完成的改动。
 把写盘放在绘制回调里是**错误**的（Render 域禁止 IO）。
 
 ## 7. 热重载
@@ -260,8 +273,8 @@ write_atomic(...)  /* 校验后原子替换 */
 | 崩溃 | 先确认没有在 Render / Worker 域碰 IL2CPP；再确认 hook 里有 `begin_callback` / `end_callback` 租约 |
 
 > [!WARNING]
-> 仓库内没有离线自检可执行文件；插件的验证方式是 `cabbird-platform-preview.exe`
-> 加上在游戏里的实际运行。
+> 新增离线验证源码和脚本只放 `.temp/`，不作为生产构建或 CI 依赖。
+> 构建和离线合同通过不代表游戏兼容性已实测；操作真实游戏仍需明确请求。
 
 ## 9. 参考示例
 
@@ -269,8 +282,15 @@ write_atomic(...)  /* 校验后原子替换 */
 |---|---|---|
 | [`hello_ui`](../../examples/hello_ui/plugin.c) | C11 | 生命周期、窗口/字体/纹理/输入、generation handle |
 | [`tick_counter`](../../examples/tick_counter/plugin.cpp) | C++20 | 游戏更新回调 + 轻量 C++ wrapper |
-| [`reliable_config`](../../examples/reliable_config/plugin.cpp) | C++20 | Config ABI + 脏标记 + `on_stop` 提交 |
+| [`reliable_config`](../../examples/reliable_config/plugin.cpp) | C++20 | Config ABI + Worker 保存 + `on_stop` 补存 |
 | [`unity_entity_inspector`](../../examples/unity_entity_inspector/plugin.cpp) | C++20 | 实体源（`cabbird.unity.entities`）+ 本地玩家快照、自报两个可选服务可用性 |
 
-随包内建插件的源码同样可读：`plugins/player_coords/`（最简）、`plugins/entity_overlay/`（最全）、
-`plugins/damage_replay/`（hook + 本地化 + 存储）。
+随包内建插件的源码同样可读：`plugins/PlayerCoords/`（最简）、`plugins/EntityOverlay/`（最全）、
+`plugins/DamageReplay/`（hook + 本地化 + 存储）。
+
+## 包内兼容资料
+
+插件版本相关数据放在 `profile/`，通过宿主 `cabbird.profile` 和 SDK `ProfileSnapshot` 加载。
+不自行打开 JSON 文件、不包含宿主实现头、不把偏移或入口字节写回 C++。
+在 Lifecycle/Worker 加载后，Game/Render 只读取解析好的快照；入口或字段校验失败时按具体原因降级。
+示例格式与只读元数据服务见 [兼容资料与元数据](../api-reference/compatibility-profiles.md)。

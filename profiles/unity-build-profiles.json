@@ -11,6 +11,9 @@
           "type": "Runtime.Extension.UPlayerLoop",
           "method": "Dispatch",
           "signature": "System.Void Dispatch()",
+          "returnType": "System.Void",
+          "parameterTypes": [],
+          "static": true,
           "token": "0x6000F71",
           "rva": "0x68C1F20",
           "prologue": "48895C2408574881EC900000000F29B42480000000803DBB",
@@ -20,9 +23,51 @@
           "type": "UnityEngine.Transform",
           "method": "get_position",
           "signature": "UnityEngine.Vector3 get_position()",
+          "returnType": "UnityEngine.Vector3",
+          "parameterTypes": [],
+          "static": false,
           "rva": "0xD0112A0",
           "prologue": "48895C2408574883EC2033C0488BFA488901488BD9894108",
           "description": "The entity walk's position read, called DIRECTLY instead of through il2cpp_runtime_invoke. The calling convention is not assumed: the 24 prologue bytes above are the first 24 bytes of THIS build's body and they decode as `mov [rsp+8],rbx; push rdi; sub rsp,0x20; xor eax,eax; mov rdi,rdx; mov [rcx],rax; mov rbx,rcx; mov [rcx+8],eax` -- the function ZEROES twelve bytes through RCX before anything else, so RCX is a caller-supplied Vector3 return buffer and RDX is `this`: void (*)(float* out, void* self, const MethodInfo*). The rest of the body (0xD0112B8..0xD0112EC) confirms it: `mov rax,[rip+0x452D6B9]; test rax,rax; jnz +0x13; lea rcx,[rip+0x8A8E35]  ; \"UnityEngine.Transform::get_position_Injected(UnityEngine.Vector3&)\"; call 0x10B61A0 (il2cpp_resolve_icall); mov [rip+0x452D6A1],rax` caches the resolved native icall in a global on first use, then `mov rdx,rbx; mov rcx,rdi; call rax` invokes it as (this, out), `mov rax,rbx` returns the buffer and `mov [rsp+8],rbx; add rsp,0x20; pop rdi; ret` restores. 1.0.1.1 rebound: RVA 0xD0112A0 (was 0xC687860 on 0.6.2.2); the prologue bytes are unchanged, so only the address moved. Located by anchoring on the il2cpp icall name string at RVA 0xD8BA100 and disassembling the referencing wrapper; the neighbour at 0xD011200 is get_lossyScale and must not be used, and 0xD011250 is the thunk that jumps straight to it."
+        },
+        "azur.player.motion.move": {
+          "type": "Lens.Gameplay.Modules.BigWorld.CharacterMovement.CharacterMovement",
+          "method": "Move",
+          "signature": "UnityEngine.CollisionFlags Move(UnityEngine.Vector3, System.Single)",
+          "returnType": "UnityEngine.CollisionFlags",
+          "parameterTypes": [
+            "UnityEngine.Vector3",
+            "System.Single"
+          ],
+          "static": false,
+          "rva": "0x23383a0",
+          "prologue": "48895C2418564883EC60803D9293190F00488BF20F29742450488BD90F28F275",
+          "description": "Shared typed player motion owner. Hold skips native Move including PerformMovement/ResolveOverlaps; velocity mode changes only this call input."
+        },
+        "azur.player.motion.set_ground": {
+          "type": "Lens.Gameplay.Modules.BigWorld.CharacterMovement.CharacterMovement",
+          "method": "set_constrainToGround",
+          "signature": "System.Void set_constrainToGround(System.Boolean)",
+          "returnType": "System.Void",
+          "parameterTypes": [
+            "System.Boolean"
+          ],
+          "static": false,
+          "rva": "0x23523e0",
+          "prologue": "48895C2408574883EC20803DA1F2170F000FB6DA488BF97513488D0D3075B40E"
+        },
+        "azur.player.position.live_tick": {
+          "type": "Azur.Gameplay.PlayerModule.MyPlayerPositionComponent",
+          "method": "OnMyPlayerLiveTick",
+          "signature": "System.Void OnMyPlayerLiveTick(System.Single)",
+          "returnType": "System.Void",
+          "parameterTypes": [
+            "System.Single"
+          ],
+          "static": false,
+          "rva": "0x4513200",
+          "prologue": "405557488D6C24B14881EC98000000803D8AD4FD0C00488BF90F29B424800000",
+          "description": "m_check gates only ground/navmesh recovery and transfer. Original tick ledger/report still runs; each hook call restores the previous flag in finally."
         }
       }
     }

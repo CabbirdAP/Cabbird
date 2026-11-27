@@ -33,6 +33,20 @@ std::vector<std::uintptr_t> ModuleMemoryService::ScanSection(
     return cabbird::mem::ScanSection(module, section_name, pattern, limit);
 }
 
+std::vector<std::uintptr_t> ModuleMemoryService::ScanSection(
+    const cabbird::mem::SectionInfo& section,
+    const cabbird::mem::Pattern& pattern,
+    std::size_t limit) const {
+    return cabbird::mem::ScanSection(section, pattern, limit);
+}
+
+std::vector<std::vector<std::uintptr_t>> ModuleMemoryService::ScanSectionBatch(
+    const cabbird::mem::SectionInfo& section,
+    std::span<const cabbird::mem::Pattern> patterns,
+    std::size_t limit) const {
+    return cabbird::mem::ScanSectionBatch(section, patterns, limit);
+}
+
 std::optional<std::uintptr_t> ModuleMemoryService::ResolveRipRelative(
     std::uintptr_t instruction,
     std::size_t displacement_offset,

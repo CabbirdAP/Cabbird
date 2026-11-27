@@ -205,6 +205,8 @@ public:
         if (timeout_worker_.joinable()) timeout_worker_.join();
     }
 
+    bool IsWorkerThread() const noexcept { return worker_.get_id() == std::this_thread::get_id(); }
+
     bool Post(
         const std::uint32_t affinity,
         const std::string& owner,
@@ -501,6 +503,10 @@ private:
 
 IpcRegistry::IpcRegistry(IpcPost post) : impl_(std::make_shared<Impl>(std::move(post))) {}
 IpcRegistry::~IpcRegistry() = default;
+
+bool IpcRegistry::IsWorkerThread() const noexcept {
+    return impl_ != nullptr && impl_->IsWorkerThread();
+}
 
 CabbirdStatusV1 IpcRegistry::RegisterEndpoint(
     const IpcPluginOwner& owner,

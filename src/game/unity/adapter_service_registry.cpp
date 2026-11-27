@@ -21,6 +21,9 @@ struct ServiceTableCallablePrefix {
 constexpr std::size_t kServiceTableCallablePrefixSize =
     offsetof(ServiceTableCallablePrefix, user) + sizeof(void*);
 
+// The manual-mapped Core cannot use the compiler's local-static TLS guard.
+AdapterServiceRegistry g_process_adapter_services;
+
 bool HasRetainedLifetime(
     const std::vector<std::shared_ptr<const void>>& retired,
     const std::shared_ptr<const void>& lifetime) noexcept {
@@ -154,8 +157,7 @@ void AdapterServiceRegistry::Clear() noexcept {
 }
 
 AdapterServiceRegistry& ProcessAdapterServices() noexcept {
-    static AdapterServiceRegistry registry;
-    return registry;
+    return g_process_adapter_services;
 }
 
 }  // namespace cabbird

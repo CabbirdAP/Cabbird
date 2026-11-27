@@ -1,0 +1,22 @@
+{
+  "schemaVersion": 1,
+  "locale": "zh-CN",
+  "messages": {
+    "window.title": "Unity 实体查看器",
+    "plugin.description": "读取宿主的实体与玩家快照，显示服务可用状态。",
+    "kind.player": "玩家",
+    "kind.monster": "怪物",
+    "kind.npc": "NPC",
+    "kind.world": "世界资源",
+    "kind.other": "未分类",
+    "services.entities.ready": "实体服务：可用",
+    "services.entities.missing": "实体服务：不可用",
+    "services.player.ready": "玩家服务：可用",
+    "services.player.missing": "玩家服务：不可用",
+    "player.missing": "玩家：没有实时快照",
+    "player.position": "玩家：{0}（{1}，{2}，{3}）",
+    "entities.summary": "实体：{0}，代次：{1}",
+    "entities.row": "[{0}] {1} {2} 米（{3}，{4}，{5}）{6}",
+    "entities.more": "……另有 {0} 个"
+  }
+}

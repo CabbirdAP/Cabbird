@@ -72,8 +72,8 @@ function Get-CabbirdSbomDependencies([string]$Component) {
     # Versions here are the pins in CMakeLists.txt's FetchContent block and the sources are
     # the same upstream tags NOTICE names.  They are listed per component because a
     # dependency belongs to the archive that actually contains its object code: the runtime
-    # statically links all five, cabbird-cli (Tools) links none of them, and the SDK is
-    # headers and CMake files only.
+    # statically links all five; cabbird-plugin uses JSON and schema validation;
+    # the SDK contains source contracts and headers.
     $all = @(
         [pscustomobject]@{
             Id = 'SPDXRef-Dependency-imgui'; Name = 'Dear ImGui'; Version = '1.91.9b'
@@ -98,6 +98,8 @@ function Get-CabbirdSbomDependencies([string]$Component) {
     )
     switch ($Component) {
         'Runtime' { return $all }
+        'Tools' { return @($all | Where-Object { $_.Id -in @(
+            'SPDXRef-Dependency-nlohmann-json', 'SPDXRef-Dependency-json-schema-validator') }) }
         default { return @() }
     }
 }

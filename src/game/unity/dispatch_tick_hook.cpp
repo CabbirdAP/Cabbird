@@ -30,9 +30,9 @@ constexpr std::string_view kLabel = "unity-playerloop-dispatch";
 // is only the handle used to fetch it.
 constexpr const char* kMethodKey = "unity.playerloop.dispatch";
 
-// The original dispatcher, captured by MinHook.  A file-scope pointer because the thunk is a
-// bare function: it has no object to reach through, and the process installs exactly one.
-void(__fastcall* g_original_dispatch)() = nullptr;
+// Static IL2CPP methods carry a hidden MethodInfo pointer even with zero C# parameters.
+using DispatchFunction = void(__fastcall*)(const void* method_info);
+std::atomic<DispatchFunction> g_original_dispatch;
 
 // Set only between install and removal.  The thunk reads it; `Start`/`Stop` write it.
 std::atomic<std::shared_ptr<const DispatchTickHook::Callback>> g_callback;
@@ -58,28 +58,23 @@ double MeasureDeltaSeconds() noexcept {
     return seconds > kMaxDeltaSeconds ? kMaxDeltaSeconds : seconds;
 }
 
-// THE THUNK.  ABI-neutral by construction.
-//
-// It declares no parameters and returns void, exactly like the dispatcher, so no argument
-// register is read, written or moved, and anything the caller placed in a register survives
-// untouched on its way to the original.  That matters because a static IL2CPP method receives
-// a hidden `MethodInfo*` in RCX whether or not C# declares it.
-//
-// The original is called directly rather than tail-called: the callback can throw, and that
-// must not unwind into the game.
-void __fastcall DispatchThunk() {
-    auto* const original = g_original_dispatch;
+// Forward the complete native ABI explicitly. Register preservation is not a promise
+// a zero-argument C++ thunk can make, especially in Debug builds.
+void __fastcall DispatchThunk(const void* method_info) {
+    const auto original = g_original_dispatch.load(std::memory_order_acquire);
     if (original == nullptr) return;
+    const auto callback = g_callback.load(std::memory_order_acquire);
 
     // The original runs FIRST.  It is what advances the game's own frame; making the game wait
     // on plugin work before its frame has run is how a plugin stall becomes a game stall.
     // Plugins observe a frame that has already happened.
-    original();
+    original(method_info);
+
+    // A frame admitted before Stop/Start must not observe the next generation's callback.
+    if (callback == nullptr || g_callback.load(std::memory_order_acquire) != callback) return;
 
     g_ticks.fetch_add(1, std::memory_order_relaxed);
 
-    const auto callback = g_callback.load(std::memory_order_acquire);
-    if (callback == nullptr) return;
     try {
         (*callback)(MeasureDeltaSeconds());
     } catch (...) {
@@ -120,7 +115,7 @@ public:
         if (hooks_ != nullptr) {
             static_cast<void>(hooks_->RemoveOwner(kOwner, kGeneration));
         }
-        g_original_dispatch = nullptr;
+        g_original_dispatch.store(nullptr, std::memory_order_release);
     }
 
     [[nodiscard]] bool Started() const noexcept {
@@ -169,12 +164,12 @@ private:
             hooks_.reset();
             return false;
         }
-        g_original_dispatch = reinterpret_cast<void(__fastcall*)()>(original);
+        g_original_dispatch.store(reinterpret_cast<DispatchFunction>(original), std::memory_order_release);
         if (!hooks_->EnableOwner(kOwner, kGeneration)) {
             error_ = "HookManager::EnableOwner failed for " + std::string(kMethodKey);
             static_cast<void>(hooks_->RemoveOwner(kOwner, kGeneration));
             hooks_.reset();
-            g_original_dispatch = nullptr;
+            g_original_dispatch.store(nullptr, std::memory_order_release);
             return false;
         }
         return true;

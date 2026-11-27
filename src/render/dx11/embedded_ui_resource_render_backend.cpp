@@ -4,6 +4,7 @@
 #include "embedded_host_internal.hpp"
 
 #include "cabbird/cabbird_ui_theme.hpp"
+#include "cabbird/platform_ui_layout.hpp"
 #include "cabbird/ui_resource_render_backend.hpp"
 
 #include <imgui.h>
@@ -44,6 +45,10 @@ constexpr std::uint64_t kUiTextureCacheBudgetBytes = 128ULL * 1024ULL * 1024ULL;
         return atlas.GetGlyphRangesJapanese();
     case cabbird::UiGlyphRange::ChineseFull:
         return atlas.GetGlyphRangesChineseFull();
+    case cabbird::UiGlyphRange::PrivateUse: {
+        static constexpr ImWchar kPrivateUse[]{0xE000, 0xF8FF, 0};
+        return kPrivateUse;
+    }
     case cabbird::UiGlyphRange::Default:
     case cabbird::UiGlyphRange::Latin:
     default:
@@ -176,6 +181,72 @@ public:
         }
     }
 
+    bool DrawTextureEx(
+        cabbird::UiResourceRegistry& registry,
+        const std::shared_ptr<cabbird::PluginScope>& scope,
+        const cabbird::UiResourceHandle handle,
+        const cabbird::UiTextureDrawRequest& request) noexcept override {
+        try {
+            if (scope == nullptr || !handle || ImGui::GetCurrentContext() == nullptr) return false;
+            const ImVec2 size(request.width, request.height);
+            if (!IsUsableDimension(size.x) || !IsUsableDimension(size.y)) return false;
+            const auto resource = registry.ResourceState(scope, handle);
+            if (!resource || resource->kind != cabbird::UiResourceKind::Texture ||
+                resource->resource_id == 0 || resource->state != cabbird::UiResourceState::Ready ||
+                resource->device_generation != device_generation_) {
+                return false;
+            }
+            const auto found = textures_.find(resource->resource_id);
+            if (found == textures_.end() || found->second.device_generation != device_generation_) {
+                return false;
+            }
+            const ImTextureID texture_id = reinterpret_cast<ImTextureID>(found->second.d3d11_view.Get());
+            if (texture_id == ImTextureID{}) return false;
+            ImDrawList* const draw_list = request.behind ? ImGui::GetBackgroundDrawList()
+                : request.on_top                            ? ImGui::GetForegroundDrawList()
+                                                            : ImGui::GetWindowDrawList();
+            if (draw_list == nullptr) return false;
+            TrackLease(found->second.leases, scope, handle);
+            const ImVec4 tint(
+                static_cast<float>(request.tint_rgba & 0xffU) / 255.0F,
+                static_cast<float>((request.tint_rgba >> 8U) & 0xffU) / 255.0F,
+                static_cast<float>((request.tint_rgba >> 16U) & 0xffU) / 255.0F,
+                static_cast<float>((request.tint_rgba >> 24U) & 0xffU) / 255.0F);
+            const ImU32 color = ImGui::ColorConvertFloat4ToU32(tint);
+            const ImVec2 origin = request.viewport_relative
+                ? ImGui::GetMainViewport()->Pos : ImVec2(0.0F, 0.0F);
+            if (request.rotation_degrees == 0.0F) {
+                const ImVec2 minimum(origin.x + request.x, origin.y + request.y);
+                const ImVec2 maximum(minimum.x + size.x, minimum.y + size.y);
+                const ImVec2 uv_min(request.uv0_x, request.uv0_y);
+                const ImVec2 uv_max(request.uv1_x, request.uv1_y);
+                if (request.rounding > 0.0F) {
+                    // A wallpaper is the shell body's own paint, so it carries the
+                    // same continuous corners the veil is drawn with; sampling it
+                    // square left the shell looking rectangular in game.
+                    draw_list->AddImageRounded(
+                        texture_id, minimum, maximum, uv_min, uv_max, color, request.rounding);
+                    return true;
+                }
+                draw_list->AddImage(texture_id, minimum, maximum, uv_min, uv_max, color);
+                return true;
+            }
+            const cabbird::PlatformUiStickerPlacement placement{
+                origin.x + request.x, origin.y + request.y, size.x, size.y, request.rotation_degrees,
+                request.uv0_x, request.uv0_y, request.uv1_x, request.uv1_y, 1.0F};
+            const cabbird::PlatformUiImageQuad quad =
+                cabbird::ComputePlatformUiImageQuad(placement);
+            draw_list->AddImageQuad(texture_id,
+                ImVec2(quad.x[0], quad.y[0]), ImVec2(quad.x[1], quad.y[1]),
+                ImVec2(quad.x[2], quad.y[2]), ImVec2(quad.x[3], quad.y[3]),
+                ImVec2(quad.u[0], quad.v[0]), ImVec2(quad.u[1], quad.v[1]),
+                ImVec2(quad.u[2], quad.v[2]), ImVec2(quad.u[3], quad.v[3]), color);
+            return true;
+        } catch (...) {
+            return false;
+        }
+    }
+
     void PrepareFont(
         cabbird::UiResourceRegistry& registry,
         const std::shared_ptr<cabbird::PluginScope>& scope,
@@ -209,18 +280,18 @@ public:
                 return;
             }
             // Copy the payload only for a new, stale, or missing atlas entry.
-            const auto state = registry.FontState(scope, handle);
+            auto state = registry.FontState(scope, handle);
             if (!state || state->resource.resource_id != resource_id ||
                 state->resource.state == cabbird::UiResourceState::Failed) {
                 return;
             }
-            const cabbird::UiFontRequest& request = state->request;
+            cabbird::UiFontRequest& request = state->request;
             if (request.encoded_bytes.empty()) return;
 
             if (found == fonts_.end()) {
                 FontEntry entry;
                 TrackLease(entry.leases, scope, handle);
-                entry.bytes = request.encoded_bytes;
+                entry.bytes = std::move(request.encoded_bytes);
                 entry.size_pixels = state->effective_size_pixels;
                 entry.glyph_range = request.glyph_range;
                 fonts_.emplace(resource_id, std::move(entry));
@@ -230,7 +301,7 @@ public:
                        found->second.glyph_range != request.glyph_range ||
                        state->resource.state != cabbird::UiResourceState::Ready ||
                        found->second.failed) {
-                found->second.bytes = request.encoded_bytes;
+                found->second.bytes = std::move(request.encoded_bytes);
                 found->second.size_pixels = state->effective_size_pixels;
                 found->second.glyph_range = request.glyph_range;
                 found->second.font = nullptr;
@@ -366,7 +437,8 @@ public:
     bool OnDeviceRebuilt(const std::uint64_t device_generation) noexcept override {
         if (device_generation == 0 || !CanTouchImGui()) return false;
         device_generation_ = device_generation;
-        font_atlas_dirty_ = true;
+        // A new backend uses the atlas already configured by its host.
+        // OnDeviceLost marks an existing generation dirty when rebuilding is needed.
         return true;
     }
 
@@ -568,7 +640,7 @@ private:
 
         ImGuiIO& io = ImGui::GetIO();
         ImGui_ImplDX11_InvalidateDeviceObjects();
-        static_cast<void>(ConfigureCabbirdUiFontAtlas(state_.root));
+        static_cast<void>(ConfigureCabbirdUiFontAtlasFromMemory(state_.root));
         bool device_objects_ready = true;
         for (auto& [resource_id, entry] : fonts_) {
             entry.font = nullptr;
@@ -591,6 +663,9 @@ private:
         const bool created = ImGui_ImplDX11_CreateDeviceObjects();
         if (!created) device_objects_ready = false;
         if (device_objects_ready) {
+            // Pixel data is redundant after upload. The retained font inputs
+            // still allow the next device generation to rebuild the atlas.
+            io.Fonts->ClearTexData();
             const std::uint64_t generation = registry.DeviceGeneration();
             device_generation_ = generation;
             for (auto& [resource_id, entry] : fonts_) {

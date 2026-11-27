@@ -66,6 +66,8 @@ AnalyzerConfig AnalyzerConfig::Load(const std::filesystem::path& path) {
         ReadBool(path, L"Platform", L"AttachToProcessWindow", true);
     result.platform_toggle_key = static_cast<unsigned>(
         ReadSize(path, L"Platform", L"ToggleKey", VK_INSERT));
+    result.platform_hide_all_key = static_cast<unsigned>(
+        ReadSize(path, L"Platform", L"HideAllKey", VK_DELETE));
     const std::string language =
         NarrowAscii(ReadWide(path, L"Platform", L"Language", L"auto"));
     const auto parsed_language = cabbird::ParseLanguagePreference(language);
@@ -86,8 +88,10 @@ AnalyzerConfig AnalyzerConfig::Load(const std::filesystem::path& path) {
         1, ReadSize(path, L"Performance", L"EntitySnapshotTickInterval", 1));
     result.entity_direct_position =
         ReadBool(path, L"Performance", L"DirectPositionCall", true);
-    result.actor_tick_interval = std::max<std::size_t>(
-        1, ReadSize(path, L"Performance", L"ActorSnapshotTickInterval", 60));
+    if (!ReadWide(path, L"Performance", L"ActorSnapshotTickInterval", L"").empty()) {
+        result.diagnostics.push_back({"Performance.ActorSnapshotTickInterval",
+            "removed: Unity uses EntitySnapshotTickInterval for entity-set sampling"});
+    }
     result.game_id = NarrowAscii(ReadWide(path, L"Profiles", L"Game", L"ap"));
     // `Profiles/Directory`, `LocalDirectory` and `ManagedDirectory` are gone with the upstream
     // BuildProfile layer they pointed at: those directories held per-game documents in a schema

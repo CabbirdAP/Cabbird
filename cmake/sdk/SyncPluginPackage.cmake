@@ -1,0 +1,33 @@
+# Synchronize the data owned by cabbird_add_plugin without touching its DLL or state.
+if(NOT IS_DIRECTORY "${CABBIRD_PACKAGE_SOURCE}" OR NOT CABBIRD_PACKAGE_DIRECTORY OR
+   NOT EXISTS "${CABBIRD_PACKAGE_MANIFEST}")
+    message(FATAL_ERROR "Plugin package synchronization requires source and destination directories")
+endif()
+file(MAKE_DIRECTORY "${CABBIRD_PACKAGE_DIRECTORY}")
+file(REAL_PATH "${CABBIRD_PACKAGE_SOURCE}" cabbird_source_root)
+file(REAL_PATH "${CABBIRD_PACKAGE_DIRECTORY}" cabbird_package_root)
+
+foreach(cabbird_resource IN ITEMS locales assets profile)
+    set(cabbird_source "${cabbird_source_root}/${cabbird_resource}")
+    set(cabbird_destination "${cabbird_package_root}/${cabbird_resource}")
+    # Resolve each recursive removal immediately before it runs. Resource names are
+    # fixed and the resolved target must remain a child of the intended package.
+    file(REAL_PATH "${cabbird_destination}" cabbird_resolved_destination)
+    cmake_path(IS_PREFIX cabbird_package_root "${cabbird_resolved_destination}" NORMALIZE cabbird_in_package)
+    if(NOT cabbird_in_package OR cabbird_resolved_destination STREQUAL cabbird_package_root)
+        message(FATAL_ERROR "Plugin resource destination escapes its package: ${cabbird_destination}")
+    endif()
+    file(REAL_PATH "${cabbird_source}" cabbird_resolved_source)
+    cmake_path(IS_PREFIX cabbird_resolved_destination "${cabbird_resolved_source}" NORMALIZE cabbird_contains_source)
+    cmake_path(IS_PREFIX cabbird_resolved_source "${cabbird_resolved_destination}" NORMALIZE cabbird_inside_source)
+    if(cabbird_contains_source OR cabbird_inside_source)
+        message(FATAL_ERROR "Plugin resource source and destination overlap: ${cabbird_resource}")
+    endif()
+    if(EXISTS "${cabbird_destination}" OR IS_SYMLINK "${cabbird_destination}")
+        file(REMOVE_RECURSE "${cabbird_destination}")
+    endif()
+    if(IS_DIRECTORY "${cabbird_source}")
+        file(COPY "${cabbird_source}" DESTINATION "${cabbird_package_root}")
+    endif()
+endforeach()
+file(COPY_FILE "${CABBIRD_PACKAGE_MANIFEST}" "${cabbird_package_root}/manifest.json" ONLY_IF_DIFFERENT)

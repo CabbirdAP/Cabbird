@@ -26,6 +26,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -68,6 +69,14 @@ std::vector<std::uintptr_t> ScanSection(
 std::vector<std::uintptr_t> ScanExecutableSections(
     const ModuleInfo& module,
     const Pattern& pattern,
+    std::size_t limit);
+std::vector<std::uintptr_t> ScanSection(
+    const SectionInfo& section,
+    const Pattern& pattern,
+    std::size_t limit);
+std::vector<std::vector<std::uintptr_t>> ScanSectionBatch(
+    const SectionInfo& section,
+    std::span<const Pattern> patterns,
     std::size_t limit);
 
 std::optional<std::uintptr_t> ResolveRipRelative(

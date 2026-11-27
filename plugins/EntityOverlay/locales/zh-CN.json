@@ -1,0 +1,32 @@
+{
+  "schemaVersion": 1,
+  "locale": "zh-CN",
+  "messages": {
+    "plugin.description": "通过游戏线程快照绘制实体方框与名称，并持久化分类、距离、样式和窗口设置。",
+    "window.title": "实体透视",
+    "settings.enabled": "启用实体透视",
+    "settings.boxes": "绘制方框",
+    "settings.labels": "绘制名称",
+    "settings.hide_unnamed": "隐藏无名称实体",
+    "settings.show_local": "显示受控玩家",
+    "kind.unknown": "未分类",
+    "kind.player": "玩家与角色",
+    "kind.monster": "怪物",
+    "kind.npc": "NPC",
+    "kind.world": "世界物件",
+    "settings.minimum_distance": "最小相机距离（米）",
+    "settings.maximum_distance": "最大相机距离（0 为不限）",
+    "settings.thickness": "方框线宽",
+    "settings.label_scale": "名称缩放",
+    "color.unknown": "未分类颜色",
+    "color.player": "玩家与角色颜色",
+    "color.monster": "怪物颜色",
+    "color.npc": "NPC 颜色",
+    "color.world": "世界物件颜色",
+    "color.label": "名称颜色",
+    "error.snapshot": "实体快照读取失败（状态 {0}）",
+    "error.save": "无法保存实体透视设置",
+    "error.services": "实体透视服务不可用",
+    "error.subscribe": "无法注册实体透视绘制"
+  }
+}

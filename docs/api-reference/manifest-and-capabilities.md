@@ -79,19 +79,19 @@ Schema 是 `additionalProperties: false`——多写一个字段就是 `SchemaVi
 
 **服务是你想要宿主提供的接口表；capability 是你请求被允许做的事。两者独立。**
 
-宿主认识 28 个 capability（`kKnownCapabilities`，`src/plugin/plugin_capability_policy.cpp`）：
+宿主认识的 capability（`kKnownCapabilities`，`src/plugin/plugin_capability_policy.cpp`）：
 
 ```
-unity-il2cpp   commands       configuration  diagnostics    ipc            game-events
+unity-il2cpp   unity-metadata commands       configuration  diagnostics    ipc            game-events
 interop-hook   interop-patch  interop-signature             memory-read    memory-write
 notifications  runtime-info   scheduler      storage        input          ui-font
 ui-texture     ui-window      unity-overlay  unity-entities unity-player-snapshot
-unity-player-teleport         unity-transform               unity-dump     ui
-json           websocket
+unity-player-teleport         unity-player-motion          unity-transform               unity-dump     ui
+json           websocket     web
 ```
 
 写了集合外的值 → `UnknownCapability` 审计，**不会被授予**，而且整个授权会被标记为不可执行。
-`websocket` 在列表里，但没有任何已发布的服务表对应它（见 [约定与总览](README.md)）。
+`websocket` 对应本机广播，`web` 对应带会话令牌的本机网页应用；它们都是与游戏无关的平台能力。
 `game-events` 现在也不对应任何服务表：它曾经是 `cabbird.unity.framework` /
 `.process-event` 的 capability，而那两个服务是从上游 UE5 搬来、本仓库从未发布的声明，
 已删除（见 [Unity 服务](unity-services.md)）。`on_update` 回调不经过 capability 检查，
@@ -103,11 +103,13 @@ json           websocket
 
 ### 服务 → capability 映射
 
-必需服务与 capability 之间有一张映射表（同文件 `kServiceCapabilities`，27 条）：
+必需服务与 capability 之间有一张映射表（同文件 `kServiceCapabilities`）：
 
 | 服务 | 要求的 capability |
 |---|---|
 | `cabbird.unity.il2cpp` | `unity-il2cpp` |
+| `cabbird.game-lifecycle` | `unity-il2cpp` |
+| `cabbird.unity.metadata` | `unity-metadata` |
 | `cabbird.config` / `cabbird.plugin-state` | `configuration` |
 | `cabbird.storage` | `storage` |
 | `cabbird.runtime-info` | `runtime-info` |
@@ -115,6 +117,7 @@ json           websocket
 | `cabbird.scheduler` | `scheduler` |
 | `cabbird.ipc` | `ipc` |
 | `cabbird.websocket` | `websocket` |
+| `cabbird.web` | `web` |
 | `cabbird.commands` | `commands` |
 | `cabbird.notifications` | `notifications` |
 | `cabbird.interop.signature` | `interop-signature` |
@@ -125,12 +128,13 @@ json           websocket
 | `cabbird.font` | `ui-font` |
 | `cabbird.texture` | `ui-texture` |
 | `cabbird.input` | `input` |
-| `cabbird.json` | `json` |
+| `cabbird.json` / `cabbird.profile` | `json` |
 | `cabbird.unity.overlay` | `unity-overlay` |
 | `cabbird.unity.entities` | `unity-entities` |
 | `cabbird.unity.dump` | `unity-dump` |
 | `cabbird.unity.player` | `unity-player-snapshot` |
 | `cabbird.unity.player-teleport` | `unity-player-teleport` |
+| `cabbird.unity.player-motion` | `unity-player-motion` |
 | `cabbird.unity.transform` | `unity-transform` |
 
 > [!NOTE]
@@ -164,7 +168,7 @@ json           websocket
 >
 > **改名是 manifest 可见的**：写 `unity-player` 的 manifest 会拿到 `UnknownCapability`
 > 审计 + 不可执行的授权，并且**查询不到** `cabbird.unity.player`。随包的三个 manifest
-> （`player_coords`、`player_teleport`、`entity_teleport`）已同步改名。
+> （`PlayerCoords`、`PlayerTeleport`、`EntityTeleport`）已同步改名。
 
 > [!NOTE]
 > **框架里只有两张表混了「读」和「写」，两者用同一套机制处理。**

@@ -1,0 +1,44 @@
+{
+  "schemaVersion": 1,
+  "game": "ap",
+  "module": "GameAssembly.dll",
+  "section": "il2cpp",
+  "contract": "watermark-uid-v1",
+  "layout": {},
+  "symbols": [
+    {
+      "name": "refreshUidText",
+      "candidates": [
+        {
+          "entry": "48 89 54 24 10 53 48 83 EC 30 80 3D 3E 5A FB 0D 00 48 8B D9 75 4F 48 8D 0D 93 C3 92 0D E8 9E D7 B8 FD 48 8D 0D 57 E5 AC 0D E8 92 D7 B8 FD 48 8D 0D 3B 62 8D 0D E8 86 D7 B8 FD 48 8D 0D 77 A4 B3",
+          "values": {
+            "rva": 55740096
+          }
+        }
+      ]
+    },
+    {
+      "name": "displayPlayerId",
+      "candidates": [
+        {
+          "entry": "40 53 48 83 EC 20 80 3D 4A 03 FB 0C 00 48 8B D9 75 13 48 8D 0D 1F E3 97 0C E8 D2 58 B7 FC C6 05 32 03 FB 0C 01 48 8B 15 0C E3 97 0C F6 42 53 20 74 0F 48 8B 42 60 48 8B CB 48 83 C4 20 5B 48 FF",
+          "values": {
+            "rva": 72615312
+          }
+        }
+      ]
+    },
+    {
+      "name": "watermarkToPlayerId",
+      "candidates": [
+        {
+          "entry": "40 53 48 83 EC 20 80 3D 4A 03 FB 0C 00 48 8B D9 75 13 48 8D 0D 1F E3 97 0C E8 D2 58 B7 FC C6 05 32 03 FB 0C 01 48 8B 15 0C E3 97 0C F6 42 53 20 74 0F 48 8B 42 60 48 8B CB 48 83 C4 20 5B 48 FF",
+          "values": {
+            "rva": 55740096
+          },
+          "callOffset": 210
+        }
+      ]
+    }
+  ]
+}

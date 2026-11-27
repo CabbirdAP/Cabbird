@@ -6,6 +6,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -26,6 +27,14 @@ public:
         const cabbird::mem::ModuleInfo& module,
         std::string_view section_name,
         const cabbird::mem::Pattern& pattern,
+        std::size_t limit) const;
+    [[nodiscard]] std::vector<std::uintptr_t> ScanSection(
+        const cabbird::mem::SectionInfo& section,
+        const cabbird::mem::Pattern& pattern,
+        std::size_t limit) const;
+    [[nodiscard]] std::vector<std::vector<std::uintptr_t>> ScanSectionBatch(
+        const cabbird::mem::SectionInfo& section,
+        std::span<const cabbird::mem::Pattern> patterns,
         std::size_t limit) const;
 
     [[nodiscard]] std::optional<std::uintptr_t> ResolveRipRelative(

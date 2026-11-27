@@ -55,7 +55,7 @@ std::string PreviewPaletteArgument() {
     const std::wstring command_line = GetCommandLineW();
     constexpr std::wstring_view prefix = L"--palette=";
     const std::size_t start = command_line.find(prefix);
-    if (start == std::wstring::npos) return "cabbirdhub";
+    if (start == std::wstring::npos) return "paper";
     const std::size_t value_start = start + prefix.size();
     const std::size_t value_end = command_line.find_first_of(L" \t\r\n", value_start);
     const std::wstring value = command_line.substr(
@@ -69,7 +69,7 @@ std::string PreviewPaletteArgument() {
             result.push_back(static_cast<char>(character));
         }
     }
-    return result.empty() ? "cabbirdhub" : result;
+    return result.empty() ? "paper" : result;
 }
 
 /* Cabbird addition; see the header comment.  Returns 0 when --frames is absent, meaning "run
@@ -118,8 +118,8 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
         diagnostics.performance_probe = [frame_limit, frames_drawn, exit_posted](
                                             cabbird::PlatformUiPerformanceStage stage,
                                             std::chrono::steady_clock::duration) {
-            // RefreshTotal is emitted exactly once per frame, after every other stage.
-            if (stage != cabbird::PlatformUiPerformanceStage::RefreshTotal) return;
+            // WindowPersist marks every completed UI frame, including cached snapshots.
+            if (stage != cabbird::PlatformUiPerformanceStage::WindowPersist) return;
             const int drawn = frames_drawn->fetch_add(1) + 1;
             bool expected = false;
             if (drawn >= frame_limit && exit_posted->compare_exchange_strong(expected, true)) {

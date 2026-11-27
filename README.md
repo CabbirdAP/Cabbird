@@ -6,13 +6,13 @@
 
 **稳定、灵活、开放的《蓝色星原: 旅谣》插件平台**
 
-<a href="https://discord.gg/tfeh8QQ9Vy"><img src="https://img.shields.io/badge/Discord-Join%20the%20community-5865F2?style=for-the-badge&logo=discord&logoColor=white" alt="Join the Anomaly Discord" /></a>
+<a href="https://discord.gg/tfeh8QQ9Vy"><img src="https://img.shields.io/badge/Discord-Join%20the%20community-5865F2?style=for-the-badge&logo=discord&logoColor=white" alt="Join the Cabbird Discord" /></a>
 
 <p align="center">
   <a href="docs/user-guide/README.md">用户文档</a> ·
-  <a href="docs/user-guide/quickstart.md">快速上手</a> ·
   <a href="docs/developer-guide/README.md">开发者文档</a> ·
-  <a href="docs/api-reference/README.md">API 参考</a>
+  <a href="docs/api-reference/README.md">API 参考</a> ·
+  <a href="docs/user-guide/quickstart.md">快速上手</a>
 </p>
 
 <p align="center">
@@ -20,6 +20,7 @@
   <img src="https://img.shields.io/badge/C%2B%2B-20-00599C?logo=cplusplus" alt="C++20" />
   <img src="https://img.shields.io/badge/plugin%20ABI-v1-success" alt="Plugin ABI v1" />
   <img src="https://img.shields.io/badge/Unity-2022.3%20IL2CPP-000000?logo=unity" alt="Unity 2022.3 IL2CPP" />
+  <a href="LICENSE"><img src="https://img.shields.io/badge/License-AGPL--3.0--only-blue" alt="License" /></a>
 </p>
 
 </div>
@@ -35,76 +36,63 @@
 
 ## 🧾 开源许可
 
-Cabbird 本体以 **GNU Affero General Public License v3（AGPL-3.0-only）** 发布，
-完整许可文本见仓库根目录的 [`LICENSE`](LICENSE)。
+本项目以 [**GNU Affero General Public License v3.0（AGPL-3.0-only）**](LICENSE) 分发，第三方组件及其各自的许可证见 [`NOTICE`](NOTICE) 与 `third_party/licenses/`。
 
 ## ✨ 功能介绍
 
-- 🚀 **一条命令构建**：`build.cmd` 走 CMake preset `windows-vs2022` →
-  `windows-relwithdebinfo` → 安装到 `.build\windows-vs2022\game-package\`。
-- 🪟 **游戏内管理界面**：宿主载入后按 `Insert`（`ToggleKey=45`）呼出界面，
-  在 **插件 / Unity 兼容性 / 诊断 / 设置** 四个路由里管理插件与查看状态。
-- 🔌 **实用内建插件**：随包提供实体 ESP、坐标显示、传送、IL2CPP Dump、自定义 UID、伤害重放、实体传送。
-- 🧩 **纯 C ABI v1 SDK**：`include/cabbird/sdk/` 全是 C 头文件，插件工程不需要宿主源码，
-  也不需要匹配 C++ ABI。
-- 🔄 **完整插件生命周期**：manifest schema v2 校验（含精确诊断码）、capability 授权、
-  代次化资源账本、热重载与安全卸载。
-- 🧬 **Unity / IL2CPP 适配**：Profile 把「签名 + 偏移」绑到具体 build；
-  未绑定时实体、玩家、变换服务按 `UNAVAILABLE` **降级**而不是崩溃。
-- 🛡️ **按能力授权**：读与写被拆成不同 capability——只想看坐标的插件不需要「能移动玩家」的权限。
-- 🧭 **状态与排错**：插件不兼容、依赖缺失、Profile 未就绪都会直接显示原因；
-  另有 `cabbird-cli.exe` 通过命名管道做命令行诊断。
-- 🖥️ **平台预览夹具**：`cabbird-platform-preview.exe` 在普通窗口里跑起完整宿主界面，
-  **不接触游戏**，是改界面的首选方式。
+- 🚀 **启动与附加**：启动器支持启动游戏后自动附加，也能直接附加到运行中的游戏，进程状态自动刷新。
+- 🪟 **游戏内管理界面**：按 `Insert` 管理插件、诊断与设置，按 `Delete` 隐藏或恢复全部界面；支持中英文、配色与自定义背景，默认使用 Paper。
+- 🔌 **实用内建插件**：坐标、实体透视、传送、移动速度、剧情工具与自由飞行等功能按需启用，设置自动保存。
+- 🌐 **第三方插件管理**：添加可信插件源，在游戏内浏览、安装和更新插件，支持停用与热重载。
+- 🧩 **开放插件框架**：提供面向 Unity / IL2CPP 的纯 C ABI v1 SDK，插件无需依赖宿主源码，并可使用网页 API 与 WebSocket 服务。
+- 🔍 **诊断与开发工具**：查看模块、内存与插件性能，使用 `cabbird-cli` 进行命令行诊断，使用 `cabbird-plugin` 校验和打包插件。
 
 ### 🔌 内建插件
 
-运行包默认安装以下插件（详见[内建插件](docs/user-guide/built-in-plugins.md)）。
-它们**默认全部处于停用状态**，需要你在界面的 **插件 > 已安装** 里手动启用：
+内建插件默认关闭，在 **插件 > 已安装** 中按需启用。主要插件如下，详细说明见[内建插件](docs/user-guide/built-in-plugins.md)。
 
 | 插件 | 作用 |
 | --- | --- |
-| **Entity Overlay** | 绘制实体边界框与标签 |
-| **Player Coordinates** | 显示本地玩家坐标与采样指标 |
-| **Player Teleport** | 传送本地玩家 |
-| **Entity Teleport** | 把任意实体搬到玩家处或指定坐标 |
-| **IL2CPP Dump** | 在会话内导出活体 IL2CPP 类型系统 |
-| **Custom UID** | 修改客户端界面上显示的 UID |
-| **Damage Replay** | 倍攻 |
+| **玩家坐标** | 显示当前受控玩家的世界坐标 |
+| **实体透视** | 绘制实体方框与名称，支持分类和距离筛选 |
+| **玩家传送** | 将当前受控玩家传送到指定坐标 |
+| **实体传送** | 将选中的实体移到玩家身边或指定坐标 |
+| **自定义 UID** | 自定义客户端界面上显示的 UID |
+| **Damage Replay** | 重放当前受控玩家发起的伤害 |
+| **移动速度** | 调整角色与坐骑的移动速度 |
+| **剧情工具** | 剧情跳过、自动播放与播放速度调整 |
+| **自由飞行** | 按镜头方向移动，自由升降与悬停 |
+| **无敌模式** | 通过管理页开关应用游戏原生无敌效果，无独立窗口 |
+| **IL2CPP 导出** | 导出类型、方法与元数据，仅在开发者模式下显示 |
 
 ### 🌐 第三方插件
 
-按 `Insert` 打开 **插件** 路由：
+按 `Insert` 打开 **插件**：
 
 | 页面 | 用来做什么 |
 | --- | --- |
-| **已安装** | 启用、停用、重载或卸载插件 |
 | **可用** | 浏览并安装插件 |
+| **更新** | 查看和安装插件的新版本 |
+| **已安装** | 启用、停用、重载或卸载插件 |
 | **第三方插件** | 添加、停用或移除插件源 |
 
-> [!IMPORTANT]
-> 随包的 `plugin-repositories.json` 是 **`enabled: false` 且 `repositories: []`**，
-> 即**默认关闭且不预置任何插件源**。要使用第三方插件，需要自己添加可信来源。
+第三方插件默认关闭，运行包不预置插件源。在 **插件 > 第三方插件** 中启用并添加可信的 HTTPS 插件源，配置保存在 `Cabbird\plugin-repositories.json`。详见[配置参考](docs/user-guide/configuration.md#4-plugin-repositoriesjson)。
 
 > [!WARNING]
-> 第三方插件是会在游戏进程中运行的**原生 DLL**，不是受限脚本。
-> 插件列表与插件包目前**没有发布者签名**；宿主会校验下载地址、ZIP 结构、manifest、
-> 版本、游戏与 API 是否匹配，但这些检查**不能证明插件本身安全**。
-> 只安装你信任的来源和作者提供的插件。
+> 第三方插件是运行在游戏进程中的原生 DLL。插件列表和插件包目前没有发布者签名；包结构与兼容性校验不能证明插件本身安全。只安装你信任的来源和作者提供的插件。
 
 ## 🚀 快速上手
 
 > [!NOTE]
-> 普通用户无需构建源码；开发者也建议先用**平台预览**确认界面能跑：
-> `.build\windows-vs2022\RelWithDebInfo\cabbird-platform-preview.exe --frames=120`
-> （预览是构建树里的开发夹具，不随包发布）。
+> 普通用户无需构建源码。完整解压运行包后，运行 `CabbirdLauncher.exe`；启动器需要管理员权限。不要只取出单个 EXE，也不要在压缩包里运行。
 
-1. 解压运行包，确认目录结构符合[安装与更新](docs/user-guide/installation.md)里的布局。
-2. 运行 `CabbirdLauncher.exe`。启动器**只有一种模式：附加（live-attach）**，
-   它会自提权（`runas`）并把 `Cabbird.Core.dll` 载入游戏进程。
-3. 像平时一样启动游戏，按 `Insert` 呼出管理界面。
-4. 使用内建插件：打开 **插件 > 已安装**，选中插件后启用。
-5. 界面没出现或插件不生效时，见[故障排查](docs/user-guide/troubleshooting.md)。
+1. 打开启动器的 **启动** 页，确认 **启动器目录** 指向官方 `launcher.exe` 所在目录，**游戏目录** 直接包含 `AzurPromilia.exe`。路径不对时用右侧按钮重新选择。
+2. 游戏尚未启动时，点 **启动并附加**；游戏已经运行时，点 **附加到运行中的进程**。启动器会自动刷新进程状态。
+3. 正常进入游戏，按 `Insert` 打开管理界面。
+4. 在 **插件 > 已安装** 中选中并启用插件；第三方插件从 **可用** 安装，再回到 **已安装** 启用。
+5. 按 `Delete` 可隐藏全部 Cabbird 界面，再按一次恢复，插件功能继续运行。
+
+安装布局与更新步骤见[安装与部署](docs/user-guide/installation.md)。
 
 从源码构建（开发者）：
 
@@ -112,58 +100,44 @@ Cabbird 本体以 **GNU Affero General Public License v3（AGPL-3.0-only）** �
 .\build.cmd
 ```
 
-> [!NOTE]
-> 请勿给 `cmake --build` 手动添加 `--parallel`：在当前 MSBuild 17.14 下它会让构建在
-> 输出任何有用信息之前就失败。`build.cmd` 已经固定了正确的调用方式，直接用即可。
+需要 Windows x64、Visual Studio 2022 C++ 工具链和 CMake 3.22+。`build.cmd` 使用 `windows-vs2022` 与 `windows-relwithdebinfo` 预设，产出运行包 `.build\windows-vs2022\game-package\`；`build.cmd package` 另外暂存 Tools 和 SDK，`build.cmd fixtures` 显式构建平台预览。详见[从源码构建](docs/developer-guide/building.md)。
 
 ## 📚 文档
 
 | 文档集 | 面向 | 内容 |
 | --- | --- | --- |
-| [📘 用户文档](docs/user-guide/README.md) | 使用者 | 安装、快速上手、内建插件、配置、故障排查 |
-| [🛠️ 开发者文档](docs/developer-guide/README.md) | 插件作者与框架贡献者 | 架构、构建、插件开发、贡献约定 |
-| [📑 API 参考](docs/api-reference/README.md) | 插件作者 | 完整的纯 C ABI v1：生命周期、全部服务表、manifest 与 capability |
+| [📘 用户文档](docs/user-guide/README.md) | 使用者 | 安装、内建与第三方插件、配置和故障排查 |
+| [🛠️ 开发者文档](docs/developer-guide/README.md) | 插件作者与框架贡献者 | 从源码构建、插件开发、架构和贡献流程 |
+| [📑 API 参考](docs/api-reference/README.md) | 插件作者 | 纯 C ABI v1：生命周期、服务表、Manifest 与 capability |
 
-其他：仓库 [`examples/`](examples/README.md) 内有四个独立 SDK 示例
-（C 插件、tick 计数、config 持久化、Unity world inspector）。
+项目级参考：[架构概览](docs/developer-guide/architecture.md)与 [`AGENTS.md`](AGENTS.md)。
 
 ## ❓ 常见问题
 
 > [!TIP]
 > 更多问题见[故障排查与 FAQ](docs/user-guide/troubleshooting.md)。
 
-- **按 `Insert` 没反应？** 改 `cabbird.ini` 的 `[Platform] ToggleKey`（Win32 虚拟键码，
-  默认 `45` = `VK_INSERT`）。文件位置取决于 `RuntimeSettingsRoot()`：
-  若 `<游戏目录>\Cabbird\` 下有 `Cabbird.Core.dll`，就用它；否则用启动器所在目录。
-- **界面出现了但插件不在列表里？** 确认插件是**含 `manifest.json` 的目录包**
-  （根级散放 DLL 不会被加载），并看界面显示的 manifest 诊断码。
-- **插件启用了但功能显示不可用？** 多半是 Profile 没绑上当前 build，或该服务在此 build 上
-  未发布。这属于**预期降级**，界面会显示原因。
-- **“可用”里什么都没有？** 因为随包没有预置插件源且总开关默认关闭，
-  需要自己添加可信来源（见上文第三方插件）。
-- **日志在哪？** `cabbird-runtime.log`、`cabbird-platform.log`、`cabbird-pipe-error.log`，
-  位置与更多排查手段见[故障排查](docs/user-guide/troubleshooting.md#1-先看日志)。
+- **按 `Insert` 没反应？** 在启动器 **设置 > 启动设置** 修改主窗口快捷键；若用 `Delete` 隐藏过全部界面，再按一次恢复。
+- **找不到 IL2CPP 导出？** 在游戏内 **设置 > 高级** 开启开发者模式。
+- **“可用”里没有插件？** 到 **插件 > 第三方插件** 启用并添加可信插件源，再刷新目录。
+- **插件加载失败？** 确认插件目录包含 `manifest.json` 和 `plugin.dll`；游戏更新后，依赖的 Profile 或服务可能需要重新适配，可在 **诊断** 中查看原因。
+- **日志在哪？** 运行包的 `Cabbird\logs\cabbird-runtime.jsonl` 记录宿主与插件日志，`Cabbird\cabbird-platform.log` 记录界面与渲染问题。
 
-## 💡 注意事项
+## 💻 开发指南
 
-- 仅支持 **Windows x64**；从源码构建需要 Visual Studio 2022（含 C++ 工具链）与 CMake 3.22+。
-- 构建配置类型为 **`Debug` / `RelWithDebInfo`**。
-- 插件必须以**目录包**形式安装：目录内含 `plugin.dll` 与 `manifest.json`，目录名与插件 id 无关。
-- 依赖「签名 + 偏移」绑定的功能在游戏更新后可能需要在 Profile 中重新绑定；
-  未绑定的服务会以 `UNAVAILABLE` 降级，界面会说明原因。
+- [从源码构建](docs/developer-guide/building.md) — 环境、构建预设、产物与发布打包
+- [架构概览](docs/developer-guide/architecture.md) — 模块边界、线程域与生命周期
+- [插件开发](docs/developer-guide/plugin-development.md) — SDK、Manifest、配置持久化与热重载
+- [贡献指南](docs/developer-guide/contributing.md) — 工作流、ABI 约定与验证要求
+
+仓库 [`examples/`](examples/README.md) 提供四个独立 SDK 示例：C 界面插件、Tick 计数、配置持久化和 Unity 实体检查。插件还可使用[本机网页 API](docs/api-reference/web.md)与 [WebSocket](docs/api-reference/websocket.md)连接外部界面。
 
 ## ❤️ 鸣谢
 
-Cabbird 在运行时或分发包中使用以下开源组件：
+运行时或分发包使用以下开源组件，许可证全文见 [`NOTICE`](NOTICE) 与 `third_party/licenses/`：
 
 - [Dear ImGui](https://github.com/ocornut/imgui) — 内嵌图形界面
-- [MinHook](https://github.com/TsudaKageyu/minhook) — 函数 hook 后端
-- [nlohmann/json](https://github.com/nlohmann/json) 与 [JSON schema validator](https://github.com/pboettch/json-schema-validator) — JSON 与 Schema 校验
+- [MinHook](https://github.com/TsudaKageyu/minhook)（含 Hacker Disassembler Engine 32/64）— 函数 hook 与指令长度解码
+- [nlohmann/json](https://github.com/nlohmann/json) 与 [JSON schema validator](https://github.com/pboettch/json-schema-validator) — JSON 解析与 Profile / Manifest Schema 校验
 - [Noto Sans CJK](https://github.com/notofonts/noto-cjk) — 中英文 UI 字体
-- [miniz](https://github.com/richgel999/miniz) — 压缩
-- [Anomaly](https://github.com/AnomalyNTE/Anomaly-Plugin-Template) — 作者的另一个项目；
-  Cabbird 的纯 C ABI v1 设计、服务表布局与文档分层参考了它的结构
-  （UE5 → Unity 的适配见[架构](docs/developer-guide/architecture.md)）
-
-以上组件**都不随源码入库**：构建时由 CMake 按固定版本从上游仓库动态下载，
-仓库内只保留它们的许可文本（`third_party/licenses/`）。
+- [miniz](https://github.com/richgel999/miniz) — 插件包 ZIP 解析

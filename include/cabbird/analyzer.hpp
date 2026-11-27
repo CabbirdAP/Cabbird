@@ -48,7 +48,8 @@ private:
         std::string_view encoding,
         std::string_view needle,
         std::size_t limit) const;
-    std::string UnrealJson() const;
+    std::string UnityProfileJson() const;
+    std::string PluginsJson() const;
 
     std::filesystem::path root_;
     AnalyzerConfig config_;

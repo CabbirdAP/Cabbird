@@ -16,6 +16,10 @@ namespace cabbird {
 // of a frame. ESP foreground drawing remains independent from this menu state.
 void SetHostUiMenusCollapsed(bool collapsed) noexcept;
 [[nodiscard]] bool HostUiMenusCollapsed() noexcept;
+// Independent from menu collapse: hide all host/plugin surfaces and overlays
+// without changing window visibility, locks, or the saved menu state.
+void SetHostUiAllHidden(bool hidden) noexcept;
+[[nodiscard]] bool HostUiAllHidden() noexcept;
 void RequestHostUiManagementExpansion() noexcept;
 [[nodiscard]] bool ConsumeHostUiManagementExpansionRequest() noexcept;
 [[nodiscard]] bool HostUiMenusCaptureMouse() noexcept;

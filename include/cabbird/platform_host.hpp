@@ -55,6 +55,9 @@ struct PlatformDiagnostics {
     std::string runtime_version{CABBIRD_SDK_VERSION_STRING};
     std::filesystem::path runtime_root;
     std::filesystem::path log_file;
+    // A native desktop host owns the client area; the embedded game shell is a
+    // movable overlay. RunPlatform selects this before creating the UI owner.
+    bool standalone_window{};
     std::function<cabbird::ServiceGraphSnapshot()> service_graph;
     std::function<std::string()> profile_json;
     std::function<cabbird::UnityCompatibilitySnapshot()> unity_compatibility;

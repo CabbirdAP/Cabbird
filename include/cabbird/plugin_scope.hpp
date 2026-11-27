@@ -64,6 +64,9 @@ enum class PluginResourceKind : std::uint8_t {
     /* Added for the Unity target. */
     UnityScene,
     Il2cppSubscription,
+    Web,
+    GameStopCleanup,
+    PlayerMotion,
 };
 
 const char* PluginResourceKindName(PluginResourceKind kind) noexcept;
@@ -98,6 +101,8 @@ public:
         std::string owner, std::uint64_t generation,
         PluginResourceKind kind, std::string label, Revoker revoker = {});
     bool Release(std::uint64_t token) noexcept;
+    bool Release(
+        std::string_view owner, std::uint64_t generation, std::uint64_t token) noexcept;
     /* Revoke everything owned by (owner, generation).  Returns how many were revoked. */
     std::size_t Revoke(std::string_view owner, std::uint64_t generation) noexcept;
     /* Staged shutdown: revoke everything except one category, so a resource can
@@ -113,6 +118,12 @@ private:
         PluginResourceRecord record;
         Revoker revoker;
     };
+    bool ReleaseMatching(
+        std::uint64_t token, std::optional<std::string_view> owner,
+        std::uint64_t generation) noexcept;
+    std::size_t RevokeMatching(
+        std::string_view owner, std::uint64_t generation,
+        std::optional<PluginResourceKind> preserved_kind) noexcept;
     mutable std::mutex mutex_;
     std::unordered_map<std::uint64_t, Entry> entries_;
     std::uint64_t next_token_{1};
@@ -156,8 +167,8 @@ public:
     /* Returns a lease only if the generation matches and callbacks are still being
      * accepted.  A null lease means "do not call into this plugin now". */
     [[nodiscard]] CallbackLease AcquireCallback(std::uint64_t generation) noexcept;
-    /* Freezes ordinary callback sources without waiting for callbacks already in
-     * flight.  A lifecycle lease can be acquired after BeginStop has drained those. */
+    /* Freezes ordinary callbacks and resource registration. A lifecycle lease is
+     * granted only after BeginStop has successfully drained existing callbacks. */
     bool FreezeCallbackSources() noexcept;
     [[nodiscard]] CallbackLease AcquireLifecycleLease(std::uint64_t generation) noexcept;
     /* Drains in-flight callbacks, up to `timeout`.  Returns false on timeout -- which

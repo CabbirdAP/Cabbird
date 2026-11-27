@@ -40,16 +40,16 @@ bool IsReady(ServiceState state) noexcept {
     return state == ServiceState::Ready || state == ServiceState::Degraded;
 }
 
-ThreadLocalScalar<const void*> g_service_start_callback_owner;
+ThreadLocalScalar<const void*> g_service_callback_owner;
 
-class ServiceStartCallbackScope final {
+class ServiceCallbackScope final {
 public:
-    explicit ServiceStartCallbackScope(const void* owner) noexcept
-        : previous_(g_service_start_callback_owner.Get()) {
-        g_service_start_callback_owner.Set(owner);
+    explicit ServiceCallbackScope(const void* owner) noexcept
+        : previous_(g_service_callback_owner.Get()) {
+        g_service_callback_owner.Set(owner);
     }
 
-    ~ServiceStartCallbackScope() { g_service_start_callback_owner.Set(previous_); }
+    ~ServiceCallbackScope() { g_service_callback_owner.Set(previous_); }
 
 private:
     const void* previous_{};
@@ -234,12 +234,13 @@ public:
         }
     }
 
-    DWORD StartAll(std::stop_token external_stop_token) noexcept {
-        return StartSelected(std::nullopt, external_stop_token);
+    DWORD StartAll(std::stop_token external_stop_token, const WaitPump& wait_pump) noexcept {
+        return StartSelected(std::nullopt, external_stop_token, wait_pump);
     }
 
     DWORD StartService(
-        std::string_view service_id, std::stop_token external_stop_token) noexcept {
+        std::string_view service_id, std::stop_token external_stop_token,
+        const WaitPump& wait_pump) noexcept {
         try {
             std::optional<std::size_t> requested;
             {
@@ -252,7 +253,7 @@ public:
                 }
             }
             if (!requested) return ERROR_NOT_FOUND;
-            return StartSelected(requested, external_stop_token);
+            return StartSelected(requested, external_stop_token, wait_pump);
         } catch (...) {
             return ExceptionError();
         }
@@ -260,7 +261,7 @@ public:
 
     DWORD WaitForAsync(std::stop_token external_stop_token) noexcept {
         try {
-            if (g_service_start_callback_owner.Get() == this) return ERROR_BUSY;
+            if (g_service_callback_owner.Get() == this) return ERROR_BUSY;
             std::stop_callback external_stop_callback(
                 external_stop_token, [this] { stop_source_.request_stop(); });
             std::unique_lock lock(mutex_);
@@ -282,15 +283,15 @@ public:
         stop_source_.request_stop();
     }
 
-    void StopAll() noexcept {
+    DWORD StopAll(const WaitPump& wait_pump = {}) noexcept {
         stop_source_.request_stop();
-        if (g_service_start_callback_owner.Get() == this) return;
-        const DWORD begin_error = BeginOperation();
-        if (begin_error != ERROR_SUCCESS) return;
+        if (g_service_callback_owner.Get() == this) return ERROR_BUSY;
+        const DWORD begin_error = BeginOperation(wait_pump);
+        if (begin_error != ERROR_SUCCESS) return begin_error;
         OperationEnd operation_end(*this);
 
         JoinStartupThread();
-        StopStartedServices();
+        DWORD result = StopStartedServices();
         try {
             std::scoped_lock lock(mutex_);
             for (Node& node : nodes_) {
@@ -300,7 +301,9 @@ public:
                 }
             }
         } catch (...) {
+            if (result == ERROR_SUCCESS) result = ExceptionError();
         }
+        return result;
     }
 
     ServiceGraphSnapshot Snapshot() const {
@@ -421,13 +424,23 @@ private:
         Impl& owner_;
     };
 
-    DWORD BeginOperation() noexcept {
+    DWORD BeginOperation(const WaitPump& wait_pump = {}) noexcept {
         try {
-            if (g_service_start_callback_owner.Get() == this) return ERROR_BUSY;
+            if (g_service_callback_owner.Get() == this) return ERROR_BUSY;
             std::unique_lock lock(mutex_);
             const std::thread::id current_thread = std::this_thread::get_id();
             if (operation_active_ && operation_thread_ == current_thread) return ERROR_BUSY;
-            operation_condition_.wait(lock, [this] { return !operation_active_; });
+            while (operation_active_) {
+                if (wait_pump) {
+                    lock.unlock();
+                    wait_pump();
+                    lock.lock();
+                    operation_condition_.wait_for(lock, std::chrono::milliseconds(1),
+                        [this] { return !operation_active_; });
+                } else {
+                    operation_condition_.wait(lock, [this] { return !operation_active_; });
+                }
+            }
             operation_active_ = true;
             operation_thread_ = current_thread;
             return ERROR_SUCCESS;
@@ -540,8 +553,9 @@ private:
     }
 
     DWORD StartSelected(
-        std::optional<std::size_t> requested, std::stop_token external_stop_token) noexcept {
-        const DWORD begin_error = BeginOperation();
+        std::optional<std::size_t> requested, std::stop_token external_stop_token,
+        const WaitPump& wait_pump) noexcept {
+        const DWORD begin_error = BeginOperation(wait_pump);
         if (begin_error != ERROR_SUCCESS) return begin_error;
         bool operation_transferred{};
         try {
@@ -600,9 +614,19 @@ private:
             }
 
             std::unique_lock lock(mutex_);
-            startup_condition_.wait(lock, [this] {
+            const auto completed = [this] {
                 return blocking_startup_complete_ || async_startup_complete_;
-            });
+            };
+            while (!completed()) {
+                if (wait_pump) {
+                    lock.unlock();
+                    wait_pump();
+                    lock.lock();
+                    startup_condition_.wait_for(lock, std::chrono::milliseconds(1), completed);
+                } else {
+                    startup_condition_.wait(lock, completed);
+                }
+            }
             return blocking_startup_complete_
                 ? blocking_startup_error_
                 : async_startup_error_;
@@ -779,18 +803,22 @@ private:
     }
 
     StartResult InvokeStart(std::size_t index) noexcept {
-        ServiceStartCallbackScope callback_scope(this);
         const auto start_time = std::chrono::steady_clock::now();
         DWORD error = ERROR_SUCCESS;
         const ServiceDescriptor descriptor = [&] {
             std::scoped_lock lock(mutex_);
             return nodes_[index].descriptor;
         }();
-        const auto callback = [this, index](std::stop_token token) -> DWORD {
+        const auto dispatch_started = std::chrono::steady_clock::now();
+        const auto callback = [this, index, dispatch_started](std::stop_token token) -> DWORD {
+            ServiceCallbackScope callback_scope(this);
             const auto thread_id = static_cast<std::uint64_t>(GetCurrentThreadId());
             {
                 std::scoped_lock lock(mutex_);
                 nodes_[index].start_thread_id = thread_id;
+                nodes_[index].start_queue_delay =
+                    std::chrono::duration_cast<std::chrono::microseconds>(
+                        std::chrono::steady_clock::now() - dispatch_started);
             }
             try {
                 return nodes_[index].descriptor.start(token);
@@ -799,14 +827,9 @@ private:
             }
         };
         try {
-            const auto dispatch_started = std::chrono::steady_clock::now();
             if (affinity_executors_.start && descriptor.affinity != ServiceAffinity::Any) {
                 error = affinity_executors_.start(
                     descriptor.affinity, callback, stop_source_.get_token());
-                std::scoped_lock lock(mutex_);
-                nodes_[index].start_queue_delay =
-                    std::chrono::duration_cast<std::chrono::microseconds>(
-                        dispatch_started - start_time);
             } else {
                 error = callback(stop_source_.get_token());
                 std::scoped_lock lock(mutex_);
@@ -1044,7 +1067,8 @@ private:
         if (last_error_ == ERROR_SUCCESS) last_error_ = ERROR_CANCELLED;
     }
 
-    void StopStartedServices() noexcept {
+    DWORD StopStartedServices() noexcept {
+        DWORD result = ERROR_SUCCESS;
         for (auto position = topological_order_.rbegin();
              position != topological_order_.rend(); ++position) {
             const std::size_t index = *position;
@@ -1063,11 +1087,15 @@ private:
                 return nodes_[index].descriptor;
             }();
             std::atomic<DWORD> callback_error{ERROR_SUCCESS};
-            const auto callback = [this, index, &callback_error] {
+            const auto callback = [this, index, stop_started, &callback_error] {
+                ServiceCallbackScope callback_scope(this);
                 {
                     std::scoped_lock lock(mutex_);
                     nodes_[index].stop_thread_id =
                         static_cast<std::uint64_t>(GetCurrentThreadId());
+                    nodes_[index].stop_queue_delay =
+                        std::chrono::duration_cast<std::chrono::microseconds>(
+                            std::chrono::steady_clock::now() - stop_started);
                 }
                 try {
                     nodes_[index].descriptor.stop();
@@ -1078,21 +1106,15 @@ private:
             try {
                 if (affinity_executors_.stop && descriptor.affinity != ServiceAffinity::Any) {
                     affinity_executors_.stop(descriptor.affinity, callback);
-                    std::scoped_lock lock(mutex_);
-                    nodes_[index].stop_queue_delay =
-                        std::chrono::duration_cast<std::chrono::microseconds>(
-                            std::chrono::steady_clock::now() - stop_started);
-                    error = callback_error.load(std::memory_order_acquire);
                 } else {
-                    descriptor.stop();
+                    callback();
                     std::scoped_lock lock(mutex_);
                     nodes_[index].affinity_bypassed =
                         nodes_[index].affinity_bypassed ||
                         (descriptor.affinity != ServiceAffinity::Any &&
                          !affinity_executors_.stop);
-                    nodes_[index].stop_thread_id =
-                        static_cast<std::uint64_t>(GetCurrentThreadId());
                 }
+                error = callback_error.load(std::memory_order_acquire);
             } catch (...) {
                 error = ExceptionError();
             }
@@ -1103,6 +1125,7 @@ private:
                     node.state = ServiceState::Stopped;
                 } else {
                     node.state = ServiceState::Failed;
+                    if (result == ERROR_SUCCESS) result = error;
                     if (node.error == ERROR_SUCCESS) node.error = error;
                     node.failure_chain = {node.descriptor.id};
                     failures_.push_back({node.descriptor.id, error, {}});
@@ -1110,6 +1133,7 @@ private:
                 }
             }
         }
+        return result;
     }
 
     mutable std::mutex mutex_;
@@ -1153,13 +1177,13 @@ DWORD ServiceGraph::Build() noexcept {
     return impl_->Build();
 }
 
-DWORD ServiceGraph::StartAll(std::stop_token stop_token) noexcept {
-    return impl_->StartAll(stop_token);
+DWORD ServiceGraph::StartAll(std::stop_token stop_token, WaitPump wait_pump) noexcept {
+    return impl_->StartAll(stop_token, wait_pump);
 }
 
 DWORD ServiceGraph::StartService(
-    std::string_view service_id, std::stop_token stop_token) noexcept {
-    return impl_->StartService(service_id, stop_token);
+    std::string_view service_id, std::stop_token stop_token, WaitPump wait_pump) noexcept {
+    return impl_->StartService(service_id, stop_token, wait_pump);
 }
 
 DWORD ServiceGraph::WaitForAsync(std::stop_token stop_token) noexcept {
@@ -1170,8 +1194,8 @@ void ServiceGraph::CancelStartup() noexcept {
     impl_->CancelStartup();
 }
 
-void ServiceGraph::StopAll() noexcept {
-    impl_->StopAll();
+DWORD ServiceGraph::StopAll(WaitPump wait_pump) noexcept {
+    return impl_->StopAll(wait_pump);
 }
 
 ServiceGraphSnapshot ServiceGraph::Snapshot() const {

@@ -1,0 +1,14 @@
+{
+  "schemaVersion": 1,
+  "locale": "zh-CN",
+  "messages": {
+    "window.title": "剧情工具",
+    "plugin.description": "解锁游戏原生跳过按钮，自动跳过剧情或使用对话自动播放，并将剧情播放速度设为 1～9 倍；分支选择和剧情锁由游戏控制，停止时在游戏域恢复速度。",
+    "settings.enabled": "启用剧情工具",
+    "settings.unlock": "解锁游戏原生跳过按钮",
+    "settings.auto": "使用游戏自身的对话自动播放",
+    "settings.speed-enabled": "覆盖剧情播放速度",
+    "settings.speed": "剧情播放速度（倍）",
+    "settings.auto-skip": "自动跳过剧情"
+  }
+}

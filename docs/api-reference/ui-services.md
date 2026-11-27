@@ -16,7 +16,7 @@
 
 `CabbirdUiServiceV1` 里的每个控件都由**宿主**用**宿主的主题**绘制。
 插件不交换任何 C++ UI 类型，也拿不到主题常量，所以插件的窗口看起来就是宿主的一部分。
-这不是约定，是接口形状决定的：表里没有一条入口能改颜色、圆角或间距。
+表里没有修改宿主控件主题或间距的入口；`overlay_glass` 的颜色、圆角等描述只作用于本次独立覆盖层绘制。
 
 > [!IMPORTANT]
 > 绘制回调只在**当前 `on_draw`** 内有效，除非某条入口的注释另有说明。
@@ -31,7 +31,7 @@
 `separator`、`begin_child`、`end_child`
 
 **基本控件**：`text`、`button`、`button_enabled`、`checkbox`、`slider_float`、`input_uint32`、
-`input_double`、`input_text`、`color_edit4`、`text_link`、`combo`
+`input_double`、`input_text`、`color_edit4`、`text_link`
 
 **容器**：`begin_table`、`table_next_row`、`table_next_column`、`end_table`、
 `begin_menu`、`end_menu`、`open_popup`、`begin_popup_modal`、`end_popup`、
@@ -41,8 +41,41 @@
 
 **世界空间绘制**：`draw_entity_bbox`、`draw_entity_box3d`、`draw_entity_label`
 
-`combo` 是 Cabbird 追加的（上游 UE5 插件的枚举选择多用自由文本输入框），
-它被追加在末尾，所以上游前缀保持逐字节一致。
+本版 UI 表采用 Anomaly 3.1.2 的完整规范顺序，仅替换产品前缀：共 56 个函数入口，
+Windows x64 下 `text_wrapped` 位于偏移 336，完整表为 464 字节。
+旧 Cabbird 表中的 `combo` 已移除；这是一次破坏性迁移，插件必须使用本版 SDK 重新编译，
+不能将旧表按原字段布局直接使用。ABI 快照记录当前规范布局。
+
+| 可选入口 | 合同 |
+|---|---|
+| `text_wrapped` | 使用宿主字体，在可用内容宽度内换行 |
+| `begin_child_auto_fit_y` | 子区域高度随内容增长，受父区域或 `max_height` 限制；与 `end_child` 配对 |
+| `slider_float_enabled` | 保留宿主滑块样式，`enabled == 0` 时禁用交互 |
+| `set_next_item_width` | 设置下一个输入控件或滑块的宽度，负值保留右侧空间 |
+| `overlay_viewport_size` | 取得主视口像素尺寸 |
+| `overlay_glass` / `overlay_glass_ring_sector` | 绘制宿主玻璃材质，返回 1；材质不可用或减少透明效果开启时绘制实色回退并返回 0 |
+| `overlay_rect_filled` / `overlay_line` / `overlay_circle` / `overlay_ring_sector` | 绘制视口覆盖层几何图形 |
+| `overlay_measure_text` / `overlay_text` | 以宿主字体测量或绘制覆盖层文字，`font_size == 0` 使用当前字号 |
+| `draw_screen_primitives` | 在 `on_draw` 内批量绘制位于宿主插件窗口下方的屏幕图元 |
+| `checkbox_square` | 方形复选框，值变化时返回 1 |
+| `button_selected` | 带选中状态和禁用状态的按钮；标签可换行，高度为 0 时按内容确定 |
+
+访问每个可选尾字段前，必须同时检查 `struct_size` 和函数指针，不能要求旧宿主提供新表的 `sizeof`：
+
+```c
+if (ui->struct_size >= offsetof(CabbirdUiServiceV1, text_wrapped) + sizeof(ui->text_wrapped)
+    && ui->text_wrapped != NULL) {
+    ui->text_wrapped(ui->user, message);
+}
+```
+
+覆盖层坐标以主视口左上角为原点，单位为像素，无需先开窗口；通常绘制在所有窗口上方。
+角度使用弧度，零指向右侧，正方向顺时针。`overlay_glass_ring_sector` 的角跨度必须在 0 与 π 之间。
+`CabbirdUiGlassStyleV1` 必须设置 `struct_size`；`scale` 之后的 `opacity`、`refraction_scale`
+按其描述尺寸可选读取。`tint_rgba` 的 alpha 为 0 时保留材质自身的着色。
+`draw_screen_primitives` 使用 `CabbirdUiScreenPrimitiveV1`：线的 `width/height` 是第二个端点，
+矩形是尺寸，圆的 `width` 是半径；它与前述前景覆盖层不同，绘制顺序位于插件窗口下方。
+Unity overlay 产出回调运行在 Game 域，不能调用这一 UI 表的 Render 绘制入口。
 
 ## 3. 标志位
 
@@ -50,6 +83,7 @@
 |---|---|
 | `CabbirdUiFrameStateV1` | `NONE`、`ITEM_HOVERED`、`WINDOW_FOCUSED`、`ITEM_ACTIVE`、`WANT_CAPTURE_MOUSE`、`WANT_CAPTURE_KEYBOARD`、`WANT_TEXT_INPUT` |
 | `CabbirdUiTextInputFlagsV1` | 见头文件；控制输入框的行为 |
+| `CabbirdUiChildFlagsV1` | `NONE`、`AUTO_RESIZE_Y` |
 | `CabbirdUiTableFlagsV1` / `CabbirdUiTabBarFlagsV1` / `CabbirdUiTabItemFlagsV1` | 容器行为 |
 | `CabbirdEspBoxFlagsV1` | `NONE`、`OUTLINE` |
 | `CabbirdWindowFlagsV1` | `NONE`、`NO_SAVED_SETTINGS`、`NO_COLLAPSE` |
@@ -135,7 +169,7 @@ typedef struct CabbirdEspCameraV1 {
 
 | 项 | 位置 |
 |---|---|
-| `CabbirdUiServiceV1` 的宿主实现 | `include/cabbird/cabbird_ui_service.hpp`、`src/ui/` |
+| `CabbirdUiServiceV1` 的宿主实现 | `include/cabbird/host_ui_service.hpp`、`src/ui/host_ui_service.cpp` |
 | 窗口/字体/纹理/输入 的宿主实现 | `src/ui/ui_resource_registry.cpp` 等 |
 | 界面能跑 | 用 `cabbird-platform-preview.exe` 在**不接触游戏进程**的情况下看到完整宿主界面（见[快速上手](../user-guide/quickstart.md#1-不碰游戏先看一眼界面推荐)） |
 

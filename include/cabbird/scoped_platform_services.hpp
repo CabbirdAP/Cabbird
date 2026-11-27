@@ -4,6 +4,7 @@
 #include "cabbird/plugin_scope.hpp"
 #include "cabbird/sdk/services/interop.h"
 #include "cabbird/sdk/services/platform.h"
+#include "cabbird/sdk/services/game_lifecycle.h"
 
 #include <chrono>
 #include <cstddef>
@@ -12,6 +13,7 @@
 #include <memory>
 #include <string>
 #include <string_view>
+#include <vector>
 
 namespace cabbird {
 
@@ -47,6 +49,12 @@ enum class ScopedPlatformRevokePhase : std::uint8_t {
     Final,
 };
 
+struct ScopedGameStopCleanup final {
+    std::shared_ptr<PluginScope> scope;
+    CabbirdGameStopCleanupV1 callback{};
+    void* callback_user{};
+};
+
 // Host-owned service implementation for one PluginManager.  The SDK tables are
 // per-plugin views, but their records live here so a resource can be revoked by
 // the PluginScope ledger before an old DLL generation is released.
@@ -62,6 +70,7 @@ public:
         std::shared_ptr<ResourceLedger> ledger,
         std::unique_ptr<HookBackend> hook_backend);
     ~ScopedPlatformServices();
+    [[nodiscard]] bool IsWorkerThread() const noexcept;
 
     ScopedPlatformServices(const ScopedPlatformServices&) = delete;
     ScopedPlatformServices& operator=(const ScopedPlatformServices&) = delete;
@@ -139,6 +148,16 @@ public:
     [[nodiscard]] CabbirdStatusV1 CancelTask(
         const ScopedPluginServiceOwner& owner, CabbirdGenerationHandleV1 handle) noexcept;
 
+    [[nodiscard]] CabbirdStatusV1 RegisterGameStopCleanup(
+        const ScopedPluginServiceOwner& owner, CabbirdGameStopCleanupV1 callback,
+        void* callback_user, CabbirdGenerationHandleV1* handle) noexcept;
+    [[nodiscard]] CabbirdStatusV1 UnregisterGameStopCleanup(
+        const ScopedPluginServiceOwner& owner, CabbirdGenerationHandleV1 handle) noexcept;
+    // Only after Freeze + BeginStop. Copied records keep the generation alive
+    // independently of the manager while a timed-out Game invocation completes.
+    [[nodiscard]] std::vector<ScopedGameStopCleanup> GameStopCleanups(
+        const ScopedPluginServiceOwner& owner) const;
+
     [[nodiscard]] CabbirdStatusV1 RegisterCommand(
         const ScopedPluginServiceOwner& owner,
         std::string_view name,
@@ -170,7 +189,23 @@ public:
         std::string_view module_name,
         std::string_view section_name,
         std::string_view pattern,
-        std::uintptr_t* address) noexcept;
+        std::uintptr_t* address,
+        bool allow_recovery_io = true) noexcept;
+    [[nodiscard]] CabbirdStatusV1 ResolveSignatures(
+        const ScopedPluginServiceOwner& owner,
+        std::string_view module_name,
+        std::string_view section_name,
+        const CabbirdStringViewV1* patterns,
+        std::uint32_t count,
+        std::uint32_t* status_codes,
+        std::uintptr_t* addresses,
+        bool allow_recovery_io = true) noexcept;
+    [[nodiscard]] CabbirdStatusV1 ResolveSignatureLayout(
+        const ScopedPluginServiceOwner& owner,
+        const CabbirdSignatureLayoutRequestV2* request,
+        std::uintptr_t* addresses, std::uint32_t address_count,
+        std::uint32_t* offsets, std::uint32_t offset_count,
+        bool allow_recovery_io = true) noexcept;
     [[nodiscard]] CabbirdStatusV1 CreateHook(
         const ScopedPluginServiceOwner& owner,
         const CabbirdHookRequestV1* request,
@@ -195,8 +230,8 @@ public:
         const ScopedPluginServiceOwner& owner, CabbirdGenerationHandleV1 handle) noexcept;
 
     // Stops tracked hooks before releasing their outer scope records. PreStop
-    // retains Config schemas so an on_stop lifecycle callback can persist its
-    // final settings; Final revokes every remaining scoped resource before
+    // retains Game cleanup registrations and Config schemas for the drained
+    // lifecycle restoration/final save; Final revokes the remaining resources before
     // on_unload. A failed hook drain/removal leaves its record intact so the
     // caller can quarantine the generation instead of unmapping its DLL.
     [[nodiscard]] bool RevokeScope(

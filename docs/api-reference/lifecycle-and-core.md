@@ -3,6 +3,7 @@
 头文件：[`include/cabbird/sdk/plugin.h`](../../include/cabbird/sdk/plugin.h)、
 [`services/core.h`](../../include/cabbird/sdk/services/core.h)、
 [`services/plugin_state.h`](../../include/cabbird/sdk/services/plugin_state.h)、
+[`services/game_lifecycle.h`](../../include/cabbird/sdk/services/game_lifecycle.h)、
 [`base.h`](../../include/cabbird/sdk/base.h)
 
 ## 1. 握手
@@ -59,7 +60,7 @@ CabbirdStatusV1 (CABBIRD_CALL *query_service)(
     uint32_t minimum_version, const void** service);
 ```
 
-成功时 `*service` 非空且**在整个进程生命周期内有效**；失败时状态码是 `UNAVAILABLE`
+成功时 `*service` 非空且在当前插件 generation 的有效生命周期内可用；失败时状态码是 `UNAVAILABLE`
 （这个 build 没有）或 `NOT_FOUND`（从来没有过），`*service` 为 null。
 
 ## 3. 回调顺序
@@ -72,17 +73,26 @@ on_load -> on_start -> [on_update / on_draw]* -> on_stop -> on_unload -> FreeLib
 |---|---|---|
 | `on_load(const CabbirdHostApiV1* host, void** plugin_context)` | Lifecycle | 查服务、写自己的上下文指针。**返回非 OK 会中止加载，此时 `on_unload` 不会被调用。** |
 | `on_start(void* plugin_context)` | Lifecycle | 资源就绪后开始工作 |
-| `on_update(void* plugin_context, double delta_seconds)` | **Game** | 跑在游戏帧里。不建线程、不阻塞。IL2CPP 只在这里用 |
+| `on_update(void* plugin_context, double delta_seconds)` | **Game** | 跑在游戏帧里。不建线程、不阻塞。普通 IL2CPP 调用在这里进行 |
 | `on_draw(void* plugin_context, const CabbirdUiServiceV1* ui)` | **Render** | 在 `Present` 里。只画。见 README 的禁止清单 |
-| `on_stop(void* plugin_context, uint32_t deadline_milliseconds)` | Lifecycle | 有**软预算**；到点没停，宿主照样硬撤销资源 |
-| `on_unload(void* plugin_context)` | Lifecycle | 之后宿主撤销全部资源、等回调排空，然后才 `FreeLibrary` |
+| `on_stop(void* plugin_context, uint32_t deadline_milliseconds)` | Lifecycle | 普通回调先冻结并排空，再持生命周期租约调用；截止时间是停止预算，不能授权释放仍在执行的 DLL |
+| `on_unload(void* plugin_context)` | Lifecycle | 只与成功的 `on_load` 配对；资源和回调安全撤销后才能调用，随后才允许卸载 DLL |
 
 > [!IMPORTANT]
-> `on_stop` 之后宿主会**撤销插件注册的每一项资源并等待在飞回调排空**，然后才 `FreeLibrary`。
-> 插件自己起线程、并让它在 `on_unload` 之后回调 = 未定义行为。
-> 这正是 scope 账本要替规范插件排除、替不规范插件**可检测**的那件事。
+> 资源撤销失败或 drain 超时时，该 generation 进入 quarantine，DLL 与包快照保持可达，
+> 不调用仍不安全的卸载路径。失败的激活同样先冻结、取消排队任务、排空与撤资源；
+> `on_start` 失败但 `on_load` 已成功时，回滚会配对 `on_unload`。安全回滚后的服务等待重试使用新 Scope，
+> 并重新打开 Dispatcher 代次入口；旧 Scope 仍被冻结。
 
 `on_draw` 拿到的 `CabbirdUiServiceV1*` 只在当前回调内有效（见 [UI 服务](ui-services.md)）。
+
+需要在停用时恢复游戏状态的插件，在 `on_load` / `on_start` 通过 `cabbird.game-lifecycle` v1
+注册 `register_stop_cleanup(user, callback, callback_user, *handle)`，要求 `unity-il2cpp` capability。
+句柄由 Scope 拥有，`unregister_stop_cleanup` 只撤销注册，不代替恢复。
+宿主冻结普通回调、停止 Hook 并排空在途回调后，按注册逆序在 Game 域持生命周期租约执行清理，
+之后才撤销其他资源并调用 `on_stop`。清理可以同步使用 `cabbird.unity.il2cpp::with_runtime`，
+不能做磁盘 I/O，也不能把托管调用移到 Lifecycle `on_stop`。无 Game 帧、超时或恢复失败时保留
+DLL、上下文与 generation，进入 quarantine。该服务独立版本化，不改变插件描述符的字段顺序。
 
 ## 4. `cabbird.core`（永远可解析）
 
@@ -95,8 +105,8 @@ on_load -> on_start -> [on_update / on_draw]* -> on_stop -> on_unload -> FreeLib
 | `log` | `(user, level, message)` | level 见 `CabbirdCoreLogLevelV1`：`TRACE`/`INFO`/`WARNING`/`ERROR` |
 | `read_memory` | `(user, address, CabbirdMutableByteSpanV1 destination)` | 范围未提交或不可读时返回 `UNAVAILABLE`，**不会**触发访问违例 |
 | `write_memory` | `(user, address, CabbirdByteSpanV1 source)` | 仅当范围内每一页**已经可写**才写；要改代码页请用 `patch_memory` |
-| `patch_memory` | 同上 | 需要时改保护、写、再恢复。**hook/patch 路径**，可被 capability 策略单独门禁 |
 | `plugin_directory` | `(user, char* dest, size_t* inout_size)` | 写入插件加载目录（NUL 结尾），`*inout_size` 为所需大小（含终止符）；缓冲不足返回 `BUFFER_TOO_SMALL` 且不写 |
+| `patch_memory` | 与 `write_memory` 相同 | 需要时改保护、写、再恢复。**hook/patch 路径**，可被 capability 策略单独门禁 |
 | `module_base` | `(user, module_name) -> uintptr_t` | 按名取已加载模块基址，未加载返回 0。Unity 运行时与游戏程序集是不同模块，插件常需两者 |
 | `last_status` | `(user) -> CabbirdStatusV1` | 取本线程最近一次状态；两个字段都是借用视图 |
 
@@ -119,16 +129,18 @@ on_load -> on_start -> [on_update / on_draw]* -> on_stop -> on_unload -> FreeLib
 
 ```
 冻结回调源（不再接受新回调）
+停止 Hook 与排队任务
 排空已在栈上的回调
+在 Game 域运行已注册的停止清理
 逆序撤销每一项资源
 -> 到这一步 FreeLibrary 才安全
 ```
 
 对插件作者的可操作结论：
 
-- 所有资源在 `on_stop` 之前撤销（或者让宿主在 `on_stop` 之后替你撤销）；
+- 让每项宿主资源登记到当前 Scope；停止阶段不能再注册新资源，宿主按资源依赖与注册反序撤销；
 - 回调里要进入可能被撤销的代码时，先取回调租约（例如 `cabbird.interop.hook` 的
   `begin_callback` / `end_callback`）——否则宿主的 drain 会在你的代码还在栈上时报成功，
   紧接着的 `FreeLibrary` 就是崩溃；
-- 线程局部状态不要用 `thread_local` 以外的假设：以内存映像载入的模块**没有静态 TLS**，
-  宿主为此提供了 FLS 方案（`include/cabbird/thread_local_value.hpp`）。
+- 手工映射的 Core 不使用 loader-managed 静态 TLS；宿主内部使用 FLS。插件只消费 SDK，
+  不能包含宿主 `thread_local_value.hpp` 或其他内部头文件。

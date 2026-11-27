@@ -1,31 +1,7 @@
-/* cabbird/runtime_dispatchers.hpp -- the four thread domains.
- *
- * Ported from anomaly/runtime_dispatchers.hpp.  This is the piece that decides, for every
- * piece of work in the process, WHICH THREAD runs it, and it is the direct answer to the
- * crash class this project already hit once:
- *
- *   Boehm GC: "Collecting from unknown thread"
- *
- * That happens when a thread the engine does not know about touches managed objects.  So
- * the four domains are not four threads -- they are four policies:
- *
- *   Lifecycle : a real thread, spawned here.  Startup/shutdown, service order. NEVER
- *               touches game objects; that is what makes spawning it safe.
- *   Worker    : N real threads, spawned here.  Blocking work -- file IO, asset carving,
- *               parsing.  Also never touches game objects.
- *   Game      : NO THREAD.  PumpGame() is called from the game's own tick, on the game's
- *               own thread.  Work that touches managed objects goes here.
- *   Render    : NO THREAD.  PumpRender() is called from Present, on the render thread.
- *
- * The consequence to keep in mind at every call site: posting to Game or Render does NOT
- * make anything happen on its own.  Somebody must pump.  A task posted to Game in a build
- * with no tick hook installed will sit in the queue forever, and that is by design -- the
- * alternative is inventing a thread and crashing the GC.
- *
- * The second half of this file is about a different failure mode: lifetime across a
- * timeout.  Invoke() runs a callback on a domain and waits, bounded.  If it times out, the
- * callback may ALREADY be running.  Everything named Invocation* below exists to make that
- * case safe, and the invariant is documented where it is enforced.
+/* Four execution domains: Lifecycle and Worker own host threads; Game and Render
+ * borrow engine/presenter threads through explicit pumps. Managed Unity objects may
+ * only be accessed on Game. Invoke owns queued callbacks across bounded waits;
+ * service start/stop uses WaitForRunning to preserve synchronous lifetime boundaries.
  */
 #pragma once
 
@@ -53,6 +29,13 @@ enum class ExecutionDomain : std::uint8_t {
     Worker,
     Game,
     Render,
+};
+
+enum class InvocationTimeoutPolicy {
+    ReturnWhileRunning,
+    // Queued work can time out, but a running callback must finish before returning.
+    // Service lifecycle callbacks use this so teardown cannot race a late start/stop.
+    WaitForRunning,
 };
 
 const char* ExecutionDomainName(ExecutionDomain domain) noexcept;
@@ -131,11 +114,14 @@ public:
      * Returns ERROR_SUCCESS, or one of ERROR_TIMEOUT / ERROR_CANCELLED / ERROR_NOT_READY /
      * ERROR_INVALID_FUNCTION / ERROR_INVALID_PARAMETER / ERROR_UNHANDLED_EXCEPTION.
      *
-     * ERROR_TIMEOUT does NOT mean "did not run".  See DrainInvocations. */
+     * With ReturnWhileRunning, ERROR_TIMEOUT does NOT mean "did not run"; see
+     * DrainInvocations. WaitForRunning cancels queued work at the deadline, then
+     * waits for completion if the callback has already entered its domain. */
     [[nodiscard]] DWORD Invoke(
         ExecutionDomain domain,
         Callback callback,
-        std::chrono::milliseconds timeout = std::chrono::seconds(30));
+        std::chrono::milliseconds timeout = std::chrono::seconds(30),
+        InvocationTimeoutPolicy timeout_policy = InvocationTimeoutPolicy::ReturnWhileRunning);
 
     /* Waits until no invocation is in flight.
      *
@@ -165,6 +151,11 @@ public:
 
     /* Lifecycle's thread body.  Blocks until stop is requested. */
     void RunLifecycle(std::stop_token stop_token) noexcept;
+
+    /* Services can borrow the bound Lifecycle thread while startup or shutdown
+     * waits for the graph coordinator. Call only from that thread. */
+    [[nodiscard]] std::size_t PumpLifecycle(
+        std::size_t max_callbacks = (std::numeric_limits<std::size_t>::max)()) noexcept;
 
     /* Pumped by the caller's thread.  See IsPumpedDomain. */
     [[nodiscard]] std::size_t PumpGame(

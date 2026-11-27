@@ -1,0 +1,61 @@
+{
+  "schemaVersion": 2,
+  "id": "cabbird.entity-overlay",
+  "name": "Entity Overlay",
+  "author": "Cabbird",
+  "license": "AGPL-3.0-only",
+  "version": "1.0.0",
+  "description": "Draw entity boxes and names from Game-domain snapshots with persisted category, distance, style and window settings.",
+  "entry": "plugin.dll",
+  "api": {
+    "major": 1,
+    "minMinor": 0,
+    "maxMinor": 0
+  },
+  "games": [
+    "ap"
+  ],
+  "builds": [
+    "ap-*"
+  ],
+  "loadPhase": "game-ready",
+  "services": [
+    {
+      "id": "cabbird.core",
+      "minVersion": 1
+    },
+    {
+      "id": "cabbird.ui",
+      "minVersion": 1
+    },
+    {
+      "id": "cabbird.config",
+      "minVersion": 1
+    },
+    {
+      "id": "cabbird.unity.overlay",
+      "minVersion": 1,
+      "optional": true
+    },
+    {
+      "id": "cabbird.unity.entities",
+      "minVersion": 1,
+      "optional": true
+    },
+    {
+      "id": "cabbird.scheduler",
+      "minVersion": 1
+    },
+    {
+      "id": "cabbird.localization",
+      "minVersion": 1
+    }
+  ],
+  "capabilities": [
+    "ui",
+    "configuration",
+    "unity-overlay",
+    "unity-entities",
+    "scheduler"
+  ]
+}

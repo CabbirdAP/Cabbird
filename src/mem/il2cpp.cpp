@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstring>
 #include <mutex>
 #include <sstream>
@@ -17,7 +18,8 @@ Layout g_layout{};
 std::wstring g_assembly_path;
 std::string g_last_error;
 std::mutex g_init_mutex;
-bool g_ready{};
+// Publishes the immutable API table and layout to Game/Worker readers together.
+std::atomic<bool> g_ready{};
 
 // Resolve one export into a like-named Api member.  The field names are the
 // export names verbatim precisely so this stays a one-liner.
@@ -209,7 +211,7 @@ void AttemptInitialize(std::wstring_view assembly_name) {
                 static_cast<std::size_t>(g_api.il2cpp_offset_of_array_bounds_in_array_object_header());
         }
 
-        g_ready = true;
+        g_ready.store(true, std::memory_order_release);
 }
 
 }  // namespace
@@ -221,7 +223,7 @@ bool Initialize(std::wstring_view assembly_name) {
     // latch would turn that early failure into a permanent one; retrying is
     // cheap and is the whole point of a probe that polls for the runtime.
     std::lock_guard<std::mutex> lock(g_init_mutex);
-    if (g_ready) {
+    if (g_ready.load(std::memory_order_acquire)) {
         return true;
     }
     // Clear per-attempt state so a retry cannot leave a stale module handle or
@@ -229,14 +231,17 @@ bool Initialize(std::wstring_view assembly_name) {
     g_api = Api{};
     g_last_error.clear();
     AttemptInitialize(assembly_name);
-    return g_ready;
+    return g_ready.load(std::memory_order_acquire);
 }
 
-bool Ready() { return g_ready; }
+bool Ready() { return g_ready.load(std::memory_order_acquire); }
 const Api& Functions() { return g_api; }
 const Layout& Constants() { return g_layout; }
 const std::wstring& AssemblyPath() { return g_assembly_path; }
-const std::string& LastError() { return g_last_error; }
+std::string LastError() {
+    std::lock_guard<std::mutex> lock(g_init_mutex);
+    return g_last_error;
+}
 
 // ---------------------------------------------------------------------------
 // ThreadScope
@@ -285,104 +290,45 @@ ThreadState* ThreadStateForCurrentThread() {
     return state;
 }
 
-bool IsCurrentThreadVmThread() {
-    // `il2cpp_is_vm_thread` takes the thread object and returns the answer; it
-    // does not take an out-parameter.  Asking for the current thread first is
-    // what makes an unattached thread answer "no" instead of being dereferenced
-    // as if it were a real Il2CppThread.
-    if (g_api.il2cpp_thread_current == nullptr || g_api.il2cpp_is_vm_thread == nullptr) {
-        return false;
-    }
-    Il2CppThread* current = g_api.il2cpp_thread_current();
-    if (current == nullptr) {
-        return false;
-    }
-    return g_api.il2cpp_is_vm_thread(current);
-}
-
 }  // namespace
 
 ThreadScope::ThreadScope() {
-    if (!g_ready) {
-        return;
-    }
-    ThreadState* state = ThreadStateForCurrentThread();
-    if (state == nullptr) {
-        return;
-    }
-    thread_state_ = state;
-    if (state->depth++ > 0) {
-        // Already attached by an outer scope on this thread.
-        attached_ = state->attached_here;
-        owns_ = false;
-        return;
-    }
-    if (IsCurrentThreadVmThread()) {
-        // A thread the runtime already knows (Unity's main thread, a job thread).
-        // Detaching it would be fatal, so leave it strictly alone.
+    if (!g_ready || g_api.il2cpp_thread_current == nullptr ||
+        g_api.il2cpp_domain_get == nullptr || g_api.il2cpp_thread_attach == nullptr) return;
+    auto* state = ThreadStateForCurrentThread();
+    if (state == nullptr) return;
+    if (state->depth != 0) {
+        ++state->depth;
+        thread_state_ = state;
         attached_ = true;
-        owns_ = false;
-        state->attached_here = false;
         return;
     }
-    // CRITICAL: the domain is null until IL2CPP finishes initialising.  Calling
-    // il2cpp_thread_attach(nullptr) at that point is a hard crash, and we are
-    // routinely running before the runtime is up.  Report "not attached" so the
-    // caller can retry instead of taking the game down.
-    Il2CppDomain* domain =
-        g_api.il2cpp_domain_get != nullptr ? g_api.il2cpp_domain_get() : nullptr;
-    if (domain == nullptr) {
-        --state->depth;
-        attached_ = false;
-        owns_ = false;
+    // Any already attached thread belongs to its original owner, including Unity
+    // main/job threads and workers attached by another library.
+    auto* thread = g_api.il2cpp_thread_current();
+    if (thread != nullptr) {
         state->attached_here = false;
-        return;
+    } else {
+        auto* domain = g_api.il2cpp_domain_get();
+        if (domain == nullptr || g_api.il2cpp_thread_detach == nullptr) return;
+        thread = g_api.il2cpp_thread_attach(domain);
+        if (thread == nullptr) return;
+        state->attached_here = true;
     }
-    g_api.il2cpp_thread_attach(domain);
-    // Record the THREAD the runtime handed back.  detach() needs it; passing the
-    // domain instead is what produced "Collecting from unknown thread".
-    state->attached_thread = g_api.il2cpp_thread_current != nullptr
-        ? g_api.il2cpp_thread_current()
-        : nullptr;
-    // ...and then REQUIRE it, because "attach was called" and "this thread is attached"
-    // are different facts and only the second one is what the rest of the facade relies on.
-    //
-    // `il2cpp_thread_attach` CAN return null (the runtime does it while the domain is null,
-    // i.e. before IL2CPP finishes initialising).  Ignoring the return value and setting
-    // `attached_ = true; owns_ = true` unconditionally means a scope over a thread the
-    // runtime never accepted reports itself as attached, and its destructor then hands
-    // a null thread to `il2cpp_thread_detach`.  The destructor guards against the null, so
-    // this is not a crash -- it is a lie, and a lie of exactly the kind this file
-    // keeps writing notes about: a caller reads `attached()` and believes it may now touch
-    // managed objects.
-    if (state->attached_thread == nullptr) {
-        --state->depth;
-        attached_ = false;
-        owns_ = false;
-        state->attached_here = false;
-        return;
-    }
+    state->attached_thread = thread;
+    state->depth = 1;
+    thread_state_ = state;
     attached_ = true;
-    owns_ = true;
-    state->attached_here = true;
 }
 
 ThreadScope::~ThreadScope() {
-    auto* const state = static_cast<ThreadState*>(thread_state_);
-    if (state == nullptr) {
-        return;
-    }
+    auto* state = static_cast<ThreadState*>(thread_state_);
+    if (state == nullptr) return;
     thread_state_ = nullptr;
-    if (state->depth > 0) {
-        --state->depth;
-    }
-    if (state->depth == 0 && owns_ && state->attached_here &&
-        g_api.il2cpp_thread_detach != nullptr && state->attached_thread != nullptr) {
-        // The THREAD OBJECT, never the domain.  See the note in the header.
-        g_api.il2cpp_thread_detach(state->attached_thread);
-        state->attached_thread = nullptr;
-        state->attached_here = false;
-    }
+    if (--state->depth != 0) return;
+    if (state->attached_here) g_api.il2cpp_thread_detach(state->attached_thread);
+    state->attached_thread = nullptr;
+    state->attached_here = false;
 }
 
 // ---------------------------------------------------------------------------
@@ -390,12 +336,16 @@ ThreadScope::~ThreadScope() {
 // ---------------------------------------------------------------------------
 
 Il2CppImage* FindImage(std::string_view assembly_name) {
-    if (!g_ready) {
+    if (!Ready() || g_api.il2cpp_domain_get == nullptr ||
+        g_api.il2cpp_domain_get_assemblies == nullptr ||
+        g_api.il2cpp_assembly_get_image == nullptr || g_api.il2cpp_image_get_name == nullptr) {
         return nullptr;
     }
+    const auto* domain = g_api.il2cpp_domain_get();
+    if (domain == nullptr) return nullptr;
     std::size_t count = 0;
     const Il2CppAssembly** assemblies =
-        g_api.il2cpp_domain_get_assemblies(g_api.il2cpp_domain_get(), &count);
+        g_api.il2cpp_domain_get_assemblies(domain, &count);
     if (assemblies == nullptr) {
         return nullptr;
     }
@@ -437,6 +387,29 @@ Il2CppClass* FindClass(
     return g_api.il2cpp_class_from_name(image, namespace_buffer.c_str(), name_buffer.c_str());
 }
 
+Il2CppClass* FindClassAnyImage(std::string_view namespaze, std::string_view name) {
+    if (!g_ready || g_api.il2cpp_domain_get == nullptr ||
+        g_api.il2cpp_domain_get_assemblies == nullptr ||
+        g_api.il2cpp_assembly_get_image == nullptr || g_api.il2cpp_class_from_name == nullptr) {
+        return nullptr;
+    }
+    const auto* domain = g_api.il2cpp_domain_get();
+    if (domain == nullptr) return nullptr;
+    std::size_t count = 0;
+    const auto* assemblies = g_api.il2cpp_domain_get_assemblies(domain, &count);
+    if (assemblies == nullptr) return nullptr;
+    const std::string namespace_buffer{namespaze};
+    const std::string name_buffer{name};
+    for (std::size_t index = 0; index < count; ++index) {
+        if (assemblies[index] == nullptr) continue;
+        const auto* image = g_api.il2cpp_assembly_get_image(assemblies[index]);
+        if (image == nullptr) continue;
+        if (auto* klass = g_api.il2cpp_class_from_name(
+                image, namespace_buffer.c_str(), name_buffer.c_str())) return klass;
+    }
+    return nullptr;
+}
+
 std::string ClassName(const Il2CppClass* klass) {
     if (klass == nullptr) {
         return "<null>";
@@ -456,14 +429,19 @@ std::string TypeName(const Il2CppType* type) {
     if (type == nullptr) {
         return "<null>";
     }
+    if (!Ready() || g_api.il2cpp_type_get_name == nullptr || g_api.il2cpp_free == nullptr)
+        return "<unnamed>";
     const char* name = g_api.il2cpp_type_get_name(type);
-    return name != nullptr ? name : "<unnamed>";
+    if (name == nullptr) return "<unnamed>";
+    struct OwnedName {
+        const char* value;
+        ~OwnedName() { g_api.il2cpp_free(const_cast<char*>(value)); }
+    } owned{name};
+    return std::string(name);
 }
 
-FieldInfo* FindField(Il2CppClass* klass, std::string_view field_name) {
-    if (!g_ready || klass == nullptr) {
-        return nullptr;
-    }
+namespace {
+FieldInfo* FindFieldInHierarchy(Il2CppClass* klass, std::string_view field_name) {
     const std::string name{field_name};
     // il2cpp_class_get_field_from_name only looks at this class, so walk up.
     for (Il2CppClass* cursor = klass; cursor != nullptr;
@@ -474,6 +452,13 @@ FieldInfo* FindField(Il2CppClass* klass, std::string_view field_name) {
     }
     return nullptr;
 }
+}  // namespace
+
+FieldInfo* FindField(Il2CppClass* klass, std::string_view field_name) {
+    if (!Ready() || g_api.il2cpp_class_get_parent == nullptr ||
+        g_api.il2cpp_class_get_field_from_name == nullptr) return nullptr;
+    return FindFieldInHierarchy(klass, field_name);
+}
 
 std::optional<std::size_t> FieldOffset(Il2CppClass* klass, std::string_view field_name) {
     FieldInfo* field = FindField(klass, field_name);
@@ -481,6 +466,46 @@ std::optional<std::size_t> FieldOffset(Il2CppClass* klass, std::string_view fiel
         return std::nullopt;
     }
     return static_cast<std::size_t>(g_api.il2cpp_field_get_offset(field));
+}
+
+InstanceFieldResolution ResolveInstanceField(
+    Il2CppClass* klass, std::string_view field_name, std::size_t field_size) {
+    InstanceFieldResolution result;
+    if (!Ready() || g_api.il2cpp_class_get_parent == nullptr ||
+        g_api.il2cpp_class_get_field_from_name == nullptr ||
+        g_api.il2cpp_field_get_offset == nullptr || g_api.il2cpp_field_get_flags == nullptr ||
+        g_api.il2cpp_field_get_type == nullptr || g_api.il2cpp_class_from_type == nullptr ||
+        g_api.il2cpp_class_is_valuetype == nullptr || g_api.il2cpp_class_value_size == nullptr ||
+        g_api.il2cpp_class_instance_size == nullptr || g_layout.object_header_size == 0) return result;
+    result.metadata_available = true;
+    if (field_size == 0) return result;
+    auto* field = FindFieldInHierarchy(klass, field_name);
+    constexpr std::uint32_t kStaticFieldFlag = 0x10;
+    if (field == nullptr || (g_api.il2cpp_field_get_flags(field) & kStaticFieldFlag) != 0)
+        return result;
+    auto* type = g_api.il2cpp_field_get_type(field);
+    auto* field_class = type ? g_api.il2cpp_class_from_type(type) : nullptr;
+    if (field_class == nullptr) return result;
+    if (g_api.il2cpp_class_is_valuetype(field_class)) {
+        std::uint32_t alignment = 0;
+        const auto value_size = g_api.il2cpp_class_value_size(field_class, &alignment);
+        if (value_size <= 0 || static_cast<std::size_t>(value_size) != field_size) return result;
+    } else if (field_size != sizeof(void*)) {
+        return result;
+    }
+    const auto offset = g_api.il2cpp_field_get_offset(field);
+    const auto instance_size = g_api.il2cpp_class_instance_size(klass);
+    if (instance_size <= 0 || offset < g_layout.object_header_size ||
+        offset > static_cast<std::size_t>(instance_size) ||
+        field_size > static_cast<std::size_t>(instance_size) - offset) return result;
+    result.offset = offset;
+    result.type = type;
+    return result;
+}
+
+std::optional<std::size_t> InstanceFieldOffset(
+    Il2CppClass* klass, std::string_view field_name, std::size_t field_size) {
+    return ResolveInstanceField(klass, field_name, field_size).offset;
 }
 
 std::optional<std::uintptr_t> StaticFieldAddress(Il2CppClass* klass, std::string_view field_name) {
@@ -542,21 +567,12 @@ std::optional<std::string> ReadString(const Il2CppObject* string_object) {
         }
         const char16_t* chars =
             g_api.il2cpp_string_chars(const_cast<Il2CppObject*>(string_object));
+        if (chars == nullptr && length != 0) return std::nullopt;
         return Utf16ToUtf8(chars, static_cast<std::size_t>(length));
     }
-    // Fallback: read the layout directly.  `length` is the second field of
-    // Il2CppString and has been at +0x10 on every x64 IL2CPP build to date.
-    const auto address = reinterpret_cast<std::uintptr_t>(string_object);
-    const auto length = cabbird::mem::Read<std::int32_t>(address + 0x10);
-    if (!length || *length < 0 || *length > (1 << 22)) {
-        return std::nullopt;
-    }
-    std::vector<char16_t> buffer(static_cast<std::size_t>(*length));
-    if (!cabbird::mem::ReadMemoryInto(address + 0x14, buffer.data(),
-                                  buffer.size() * sizeof(char16_t))) {
-        return std::nullopt;
-    }
-    return Utf16ToUtf8(buffer.data(), buffer.size());
+    // Missing accessors are unavailable metadata, not permission to guess the
+    // object header or string layout of a different Unity build.
+    return std::nullopt;
 }
 
 std::optional<std::string> ReadStringField(const Il2CppObject* object, std::size_t offset) {
@@ -578,11 +594,16 @@ std::optional<std::string> ReadStringField(const Il2CppObject* object, std::size
 std::string DescribeRuntime() {
     std::ostringstream out;
     if (!g_ready) {
-        out << "il2cpp=unavailable (" << g_last_error << ')';
+        out << "il2cpp=unavailable (" << LastError() << ')';
         return out.str();
     }
     ThreadScope scope;
+    if (!scope.attached()) return "il2cpp=ready diagnostics=unavailable (thread is not attached)";
+    if (g_api.il2cpp_domain_get_assemblies == nullptr ||
+        g_api.il2cpp_assembly_get_image == nullptr || g_api.il2cpp_image_get_class_count == nullptr)
+        return "il2cpp=ready diagnostics=unavailable (image enumeration APIs are missing)";
     Il2CppDomain* domain = g_api.il2cpp_domain_get();
+    if (domain == nullptr) return "il2cpp=ready diagnostics=unavailable (domain is not ready)";
     std::size_t assembly_count = 0;
     const Il2CppAssembly** assemblies = g_api.il2cpp_domain_get_assemblies(domain, &assembly_count);
     out << "il2cpp=ready domain=" << static_cast<const void*>(domain)

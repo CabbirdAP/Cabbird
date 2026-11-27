@@ -18,6 +18,15 @@ namespace {
 
 std::atomic_uint64_t g_next_generation{1};
 
+ExecutionDomain DomainForAffinity(ServiceAffinity affinity) noexcept {
+    switch (affinity) {
+        case ServiceAffinity::Lifecycle: return ExecutionDomain::Lifecycle;
+        case ServiceAffinity::Game: return ExecutionDomain::Game;
+        case ServiceAffinity::Render: return ExecutionDomain::Render;
+        default: return ExecutionDomain::Worker;
+    }
+}
+
 DWORD ExceptionError() noexcept {
     try {
         throw;
@@ -49,36 +58,33 @@ public:
                     std::function<DWORD(std::stop_token)> callback,
                     std::stop_token stop_token) -> DWORD {
                     if (!callback) return ERROR_INVALID_FUNCTION;
-                    if (affinity == ServiceAffinity::Lifecycle ||
-                        affinity == ServiceAffinity::Any) {
+                    if (affinity == ServiceAffinity::Any) {
                         return callback(stop_token);
                     }
-                    const ExecutionDomain domain = affinity == ServiceAffinity::Game
-                        ? ExecutionDomain::Game
-                        : affinity == ServiceAffinity::Render
-                            ? ExecutionDomain::Render
-                            : ExecutionDomain::Worker;
+                    const ExecutionDomain domain = DomainForAffinity(affinity);
                     DWORD result = ERROR_SUCCESS;
                     const DWORD invoke_result = dispatchers_.Invoke(
                         domain,
-                        [&] { result = callback(stop_token); },
-                        std::chrono::seconds(30));
+                        [callback = std::move(callback), stop_token, &result] {
+                            result = callback(stop_token);
+                        },
+                        std::chrono::seconds(30), InvocationTimeoutPolicy::WaitForRunning);
                     return invoke_result == ERROR_SUCCESS ? result : invoke_result;
                 },
                 [this](ServiceAffinity affinity, std::function<void()> callback) {
                     if (!callback) return;
-                    if (affinity == ServiceAffinity::Lifecycle ||
-                        affinity == ServiceAffinity::Any) {
+                    if (affinity == ServiceAffinity::Any) {
                         callback();
                         return;
                     }
-                    const ExecutionDomain domain = affinity == ServiceAffinity::Game
-                        ? ExecutionDomain::Game
-                        : affinity == ServiceAffinity::Render
-                            ? ExecutionDomain::Render
-                            : ExecutionDomain::Worker;
-                    static_cast<void>(dispatchers_.Invoke(
-                        domain, std::move(callback), std::chrono::seconds(30)));
+                    const ExecutionDomain domain = DomainForAffinity(affinity);
+                    const DWORD result = dispatchers_.Invoke(
+                        domain, std::move(callback), std::chrono::seconds(30),
+                        InvocationTimeoutPolicy::WaitForRunning);
+                    if (result != ERROR_SUCCESS) {
+                        throw std::system_error(
+                            static_cast<int>(result), std::system_category());
+                    }
                 }});
         }
         if (start_context_.external_stop_event == nullptr) return;
@@ -289,6 +295,7 @@ private:
         }
         for (std::size_t index = 0; index < options_.workers.size(); ++index) {
             if (stop_requested_.load()) break;
+            active_worker_count_.fetch_add(1, std::memory_order_relaxed);
             try {
                 active_workers_.emplace_back([this, index](std::stop_token stop_token) {
                     DWORD result = ERROR_SUCCESS;
@@ -302,12 +309,19 @@ private:
                     } catch (...) {
                         result = ExceptionError();
                     }
-                    if (result != ERROR_SUCCESS && !stop_token.stop_requested() &&
-                        !stop_requested_.load()) {
-                        ReportFailure(result);
+                    if (result != ERROR_SUCCESS) {
+                        if (!stop_token.stop_requested() && !stop_requested_.load()) {
+                            ReportFailure(result);
+                        } else if (result != ERROR_CANCELLED && result != ERROR_OPERATION_ABORTED) {
+                            DWORD expected = ERROR_SUCCESS;
+                            static_cast<void>(last_error_.compare_exchange_strong(expected, result));
+                        }
                     }
+                    active_worker_count_.fetch_sub(1, std::memory_order_release);
+                    state_condition_.notify_all();
                 });
             } catch (...) {
+                active_worker_count_.fetch_sub(1, std::memory_order_release);
                 ReportFailure(ExceptionError());
                 break;
             }
@@ -356,19 +370,61 @@ private:
         }
     }
 
-    void StopServiceAsyncMonitor() noexcept {
-        service_async_monitor_thread_.request_stop();
-        JoinThread(service_async_monitor_thread_);
-    }
-
     void StopWorkers() noexcept {
         for (auto worker = active_workers_.rbegin(); worker != active_workers_.rend(); ++worker) {
             worker->request_stop();
+        }
+        const auto started = std::chrono::steady_clock::now();
+        while (active_worker_count_.load(std::memory_order_acquire) != 0) {
+            // A worker can finish its shutdown on Lifecycle. Keep that domain
+            // available before joining the thread that is awaiting its callback.
+            static_cast<void>(dispatchers_.PumpLifecycle());
+            std::unique_lock lock(state_mutex_);
+            state_condition_.wait_for(lock, std::chrono::milliseconds(10), [this] {
+                return active_worker_count_.load(std::memory_order_acquire) == 0;
+            });
+            const auto waited = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - started);
+            if (waited >= options_.plugin_stop_timeout &&
+                active_worker_count_.load(std::memory_order_acquire) != 0) {
+                DWORD expected = ERROR_SUCCESS;
+                static_cast<void>(last_error_.compare_exchange_strong(expected, ERROR_TIMEOUT));
+            }
         }
         for (auto worker = active_workers_.rbegin(); worker != active_workers_.rend(); ++worker) {
             JoinThread(*worker);
         }
         active_workers_.clear();
+    }
+
+    void DrainCallbackLifetimes() noexcept {
+        const auto started = std::chrono::steady_clock::now();
+        const auto record_timeout = [this, started] {
+            const auto waited = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - started);
+            if (waited < options_.plugin_stop_timeout) return;
+            DWORD expected = ERROR_SUCCESS;
+            static_cast<void>(last_error_.compare_exchange_strong(expected, ERROR_TIMEOUT));
+        };
+        // A deadline reports slow shutdown; it cannot make destruction safe while
+        // callbacks still use service state. Each drain sleeps on its completion
+        // condition, then gives Lifecycle work a turn to break cross-domain waits.
+        const auto wait_for_drain = [&](const auto& drain) {
+            if (drain(std::chrono::milliseconds::zero())) return;
+            for (;;) {
+                record_timeout();
+                static_cast<void>(dispatchers_.PumpLifecycle());
+                const bool drained = drain(std::chrono::milliseconds(10));
+                record_timeout();
+                if (drained) return;
+            }
+        };
+        wait_for_drain([this](std::chrono::milliseconds timeout) {
+            return dispatchers_.DrainExternalWork(timeout);
+        });
+        wait_for_drain([this](std::chrono::milliseconds timeout) {
+            return dispatchers_.DrainInvocations(timeout);
+        });
     }
 
     void Lifecycle(std::stop_token lifecycle_stop_token) noexcept {
@@ -386,7 +442,9 @@ private:
                     result = options_.services->Build();
                 }
                 if (result == ERROR_SUCCESS && options_.services) {
-                    result = options_.services->StartAll();
+                    result = options_.services->StartAll(lifecycle_stop_token, [this] {
+                        static_cast<void>(dispatchers_.PumpLifecycle());
+                    });
                 }
             } catch (...) {
                 result = ExceptionError();
@@ -411,19 +469,11 @@ private:
 
         SetState(CABBIRD_RUNTIME_STATE_STOPPING_PLUGINS);
         StopWorkers();
-        StopServiceAsyncMonitor();
-        // Lifecycle affinity work queued before the stop request cannot be
-        // pumped after RunLifecycle returns. Cancel those stale invocations
-        // while keeping admission open for service stop callbacks below.
+        service_async_monitor_thread_.request_stop();
+        // Cancel stale affinity requests while preserving admission for startup
+        // completion and service stop callbacks, which still need Lifecycle.
         dispatchers_.CancelQueuedInvocations();
-        static_cast<void>(dispatchers_.DrainExternalWork(options_.plugin_stop_timeout));
-        // A bounded Invoke may have returned after its callback entered
-        // Running. Establish the callback lifetime boundary before plugin
-        // generations and their captured state begin to tear down.
-        if (!dispatchers_.DrainInvocations(options_.plugin_stop_timeout)) {
-            DWORD expected = ERROR_SUCCESS;
-            static_cast<void>(last_error_.compare_exchange_strong(expected, ERROR_TIMEOUT));
-        }
+        DrainCallbackLifetimes();
         if (options_.stop_plugins) {
             try {
                 const DWORD result = options_.stop_plugins(options_.plugin_stop_timeout);
@@ -438,7 +488,16 @@ private:
             }
         }
         SetState(CABBIRD_RUNTIME_STATE_STOPPING_SERVICES);
-        if (options_.services) options_.services->StopAll();
+        if (options_.services) {
+            const DWORD result = options_.services->StopAll([this] {
+                static_cast<void>(dispatchers_.PumpLifecycle());
+            });
+            if (result != ERROR_SUCCESS) {
+                DWORD expected = ERROR_SUCCESS;
+                static_cast<void>(last_error_.compare_exchange_strong(expected, result));
+            }
+        }
+        JoinThread(service_async_monitor_thread_);
         dispatchers_.RequestStop();
         dispatchers_.JoinWorkers();
         if (initialization_started && options_.shutdown) {
@@ -475,6 +534,7 @@ private:
     std::jthread external_stop_thread_;
     std::jthread service_async_monitor_thread_;
     std::vector<std::jthread> active_workers_;
+    std::atomic_size_t active_worker_count_{};
 
     std::mutex start_mutex_;
     std::mutex join_mutex_;
