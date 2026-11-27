@@ -61,8 +61,8 @@ constexpr float kLaunchActionRowHeight = 62.0f;
 constexpr float kLauncherBaseFontPixels = 13.0f;
 constexpr float kLauncherFontScale = 20.0f / kLauncherBaseFontPixels;
 constexpr std::array kLauncherFontScales{2.00f};
-constexpr std::array<char32_t, 8> kLauncherIcons{
-    0xe838, 0xe72c, 0xe768, 0xe73e, 0xe7ba, 0xe711, 0xe8b7, 0xe8e5};
+constexpr std::array<char32_t, 7> kLauncherIcons{
+    0xe838, 0xe72c, 0xe768, 0xe73e, 0xe7ba, 0xe711, 0xe8b7};
 constexpr float kDefaultDpi = 96.0f;
 
 ImVec4 ThemeColor(const unitymem::CabbirdUiColor& color) noexcept {
@@ -458,7 +458,7 @@ public:
     void LaunchAndAttach() {
         Queue(cabbird::MessageId::LauncherStatusLaunchingAttach, [this] {
             const auto launcher = LauncherExecutable();
-            const auto selected = ResolveAttachRuntime();
+            const auto selected = ResolveLaunchRuntime();
             if (!selected.Ok()) {
                 PublishRuntimeFailure(selected);
                 return;
@@ -485,32 +485,6 @@ public:
                 state_.message = MakeLauncherMessage(
                     cabbird::MessageId::LauncherStatusLaunchAttachFailed, {error},
                     result.mapping.message);
-                state_.message_kind = MessageKind::Error;
-            }
-        });
-    }
-
-    void AttachToProcess(const DWORD process_id) {
-        Queue(cabbird::MessageId::LauncherStatusAttachingProcess, [this, process_id] {
-            const auto runtime = ResolveAttachRuntime();
-            if (!runtime.Ok()) { PublishRuntimeFailure(runtime); return; }
-            cabbird::launcher::ManualMapOptions options;
-            options.process_id = process_id;
-            options.core_path = runtime.core_path;
-            options.runtime_root = runtime.runtime_root;
-            options.log_directory = runtime.runtime_root / L"logs";
-            const auto result = cabbird::launcher::ManualMapRuntimeCore(options);
-            if (result.Ok()) RefreshProcessesImpl(ProcessAnnounce::Never);
-            std::scoped_lock lock(state_mutex_);
-            if (result.Ok()) {
-                state_.attached_process = process_id;
-                const std::string pid = std::to_string(process_id);
-                state_.message = MakeLauncherMessage(cabbird::MessageId::LauncherStatusProcessAttached, {pid});
-                state_.message_kind = MessageKind::Success;
-            } else {
-                const std::string error = std::to_string(result.win32_error);
-                state_.message = MakeLauncherMessage(cabbird::MessageId::LauncherStatusProcessAttachFailed,
-                    {error}, result.message);
                 state_.message_kind = MessageKind::Error;
             }
         });
@@ -665,7 +639,7 @@ private:
             state_.message_kind = MessageKind::Success;
     }
 
-    [[nodiscard]] cabbird::RuntimeLaunchResult ResolveAttachRuntime() const {
+    [[nodiscard]] cabbird::RuntimeLaunchResult ResolveLaunchRuntime() const {
         auto bundled = cabbird::ResolveRuntimeLaunch({runtime_directory_});
         if (bundled.Ok()) return bundled;
         auto installed = cabbird::ResolveRuntimeLaunch({GameDirectory() / L"Cabbird"});
@@ -924,7 +898,7 @@ private:
                     !PathsEqual(process.executable_path.parent_path(), game_directory);
             });
         }
-        const auto runtime = ResolveAttachRuntime();
+        const auto runtime = ResolveLaunchRuntime();
         const bool core_available = runtime.Ok();
         std::scoped_lock lock(state_mutex_);
         const bool had_processes = !state_.processes.empty();
@@ -956,7 +930,7 @@ private:
             const std::string pid = std::to_string(state_.attached_process != 0
                 ? state_.attached_process : state_.processes.front().process_id);
             state_.message = MakeLauncherMessage(state_.attached_process != 0
-                ? cabbird::MessageId::LauncherStatusProcessAttached
+                ? cabbird::MessageId::LauncherStatusLaunchAttached
                 : cabbird::MessageId::LauncherStatusProcessFound, {pid});
             state_.message_kind = MessageKind::Neutral;
         }
@@ -1559,7 +1533,6 @@ struct LauncherActions final {
     std::function<void(std::filesystem::path)> select_launcher_executable;
     std::function<void()> refresh_processes;
     std::function<void()> launch_and_attach;
-    std::function<void(DWORD)> attach_to_process;
     std::function<void(std::uint32_t)> set_toggle_key;
     std::function<void(std::string)> set_theme;
     std::function<void(const unitymem::CabbirdUiCustomColors&)> set_custom_colors;
@@ -1577,7 +1550,6 @@ LauncherActions ActionsFor(LauncherController& controller) {
         [&controller](std::filesystem::path path) { controller.SelectLauncherExecutable(std::move(path)); },
         [&controller] { controller.RefreshProcesses(); },
         [&controller] { controller.LaunchAndAttach(); },
-        [&controller](DWORD process) { controller.AttachToProcess(process); },
         [&controller](std::uint32_t key) { controller.SetToggleKey(key); },
         [&controller](std::string theme) { controller.SetTheme(std::move(theme)); },
         [&controller](const unitymem::CabbirdUiCustomColors& colors) { controller.SetCustomColors(colors); },
@@ -1746,21 +1718,19 @@ bool LauncherMessageVisible(const LauncherSnapshot& snapshot) noexcept {
     return snapshot.busy || snapshot.message_kind != MessageKind::Neutral;
 }
 
-DWORD DrawProcessOverview(const LauncherActions& actions, const LauncherSnapshot& snapshot,
+void DrawProcessOverview(const LauncherActions& actions, const LauncherSnapshot& snapshot,
     const cabbird::Translator& translator) {
     ImGui::Dummy(Scale(0.0f, 14.0f)); ImGui::Separator(); ImGui::Dummy(Scale(0.0f, 12.0f));
     const float status_anchor = ImGui::GetCursorPosY();
     ImGui::TextColored(LauncherMutedInk(), "%s", Text(translator, cabbird::MessageId::LauncherSectionProcesses));
-    const auto target = std::find_if(snapshot.processes.begin(), snapshot.processes.end(),
-        [](const auto& process) { return process.Compatible(); });
-    const DWORD target_id = target == snapshot.processes.end() ? 0 : target->process_id;
+    const DWORD detected_process = snapshot.processes.empty() ? 0 : snapshot.processes.front().process_id;
     const std::string process_id = std::to_string(snapshot.attached_process != 0
-        ? snapshot.attached_process : target_id);
+        ? snapshot.attached_process : detected_process);
     const std::string status = LauncherMessageVisible(snapshot) ? RenderMessage(translator, snapshot.message)
         : !snapshot.core_available ? std::string(Text(translator, cabbird::MessageId::LauncherStatusCoreUnavailable))
         : snapshot.processes.empty() ? std::string(Text(translator, cabbird::MessageId::LauncherStatusNoProcesses))
         : Format(translator, snapshot.attached_process != 0
-            ? cabbird::MessageId::LauncherStatusProcessAttached : cabbird::MessageId::LauncherStatusProcessFound, {process_id});
+            ? cabbird::MessageId::LauncherStatusLaunchAttached : cabbird::MessageId::LauncherStatusProcessFound, {process_id});
     const auto ink = snapshot.message_kind == MessageKind::Error ? ThemeColor(unitymem::CabbirdUiTheme().danger)
         : snapshot.message_kind == MessageKind::Success ? ThemeColor(unitymem::CabbirdUiTheme().success) : LauncherMutedInk();
     const float status_y = ImGui::GetCursorPosY();
@@ -1786,7 +1756,6 @@ DWORD DrawProcessOverview(const LauncherActions& actions, const LauncherSnapshot
     }
     if (status_changed) previous_status = status;
     previous_extent = extent;
-    return target_id;
 }
 
 void DrawLaunchMode(HWND window, const LauncherActions& actions, const LauncherSnapshot& snapshot,
@@ -1800,20 +1769,13 @@ void DrawLaunchMode(HWND window, const LauncherActions& actions, const LauncherS
         ImGuiChildFlags_AlwaysUseWindowPadding, ImGuiWindowFlags_NoBackground);
     ImGui::PopStyleVar();
     DrawLauncherPaths(window, actions, snapshot, translator);
-    const DWORD selected_process = DrawProcessOverview(actions, snapshot, translator);
+    DrawProcessOverview(actions, snapshot, translator);
     ImGui::EndChild();
-    const bool can_attach = !snapshot.busy && snapshot.core_available && selected_process != 0 && selected_process != snapshot.attached_process;
     const bool can_launch = !snapshot.busy && snapshot.core_available && !snapshot.launcher_executable.empty() && snapshot.processes.empty();
-    const char* attach_label = Text(translator, cabbird::MessageId::LauncherAttachExisting);
     const char* launch_label = Text(translator, cabbird::MessageId::LauncherLaunchAttach);
-    const float attach_width = std::max(200.0f, CommandButtonWidth(0xe8e5, attach_label));
     const float launch_width = std::max(240.0f, CommandButtonWidth(0xe768, launch_label));
-    const float total = Scale(attach_width + launch_width + 14.0f);
     ImGui::SetCursorPosY(action_y);
-    ImGui::SetCursorPosX(std::max(ImGui::GetCursorPosX(), ImGui::GetContentRegionMax().x - total));
-    if (CommandButton("attach-existing", 0xe8e5, attach_label, false, can_attach,
-            {attach_width, kLaunchActionRowHeight})) actions.attach_to_process(selected_process);
-    ImGui::SameLine(0.0f, Scale(14.0f));
+    ImGui::SetCursorPosX(std::max(ImGui::GetCursorPosX(), ImGui::GetContentRegionMax().x - Scale(launch_width)));
     if (CommandButton("launch-attach-core", 0xe768, launch_label, true, can_launch,
             {launch_width, kLaunchActionRowHeight})) actions.launch_and_attach();
 }
