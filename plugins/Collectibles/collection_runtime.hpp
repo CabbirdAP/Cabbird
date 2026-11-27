@@ -15,7 +15,6 @@
 #include <string>
 #include <sstream>
 #include <map>
-#include <set>
 #include <unordered_set>
 #include <vector>
 
@@ -705,35 +704,6 @@ public:
             const auto& api = runtime.Functions();
             const auto actionName = runtime.TypeName(api.il2cpp_class_get_type(klass));
             details << " action=" << actionName;
-            // Read-only: the unit behind a hit-collection action decides whether a hit can be issued
-            // from here at all, so describe its callable surface once per session.
-            if (actionName.ends_with(".HitCollectionAction") &&
-                describedActions_.insert("unit:BreakableItem").second) {
-                if (auto* unit = runtime.FindClassAnyImage("Azur.Gameplay.Units.World", "BreakableItem")) {
-                    details << " unitMethods=[";
-                    void* unitIterator{};
-                    std::uint32_t unitShown{};
-                    while (const auto* method = api.il2cpp_class_get_methods(unit, &unitIterator)) {
-                        const auto* methodName = api.il2cpp_method_get_name(method);
-                        if (!methodName) continue;
-                        if (unitShown == 40) { details << ",..."; break; }
-                        if (unitShown) details << ',';
-                        ++unitShown;
-                        std::uint32_t implementation{};
-                        const bool isStatic =
-                            (api.il2cpp_method_get_flags(method, &implementation) & 0x10u) != 0;
-                        details << (isStatic ? "static " : "instance ")
-                                << runtime.TypeName(api.il2cpp_method_get_return_type(method)) << ' '
-                                << methodName << '(';
-                        for (std::uint32_t index{}; index < api.il2cpp_method_get_param_count(method); ++index) {
-                            if (index) details << ',';
-                            details << runtime.TypeName(api.il2cpp_method_get_param(method, index));
-                        }
-                        details << ')';
-                    }
-                    details << ']';
-                }
-            }
             bool enabled{}, canTrigger{};
             if (!Value(runtime, Get(Call::Enabled), interaction, nullptr, enabled) || !Value(runtime, Get(Call::CanTrigger), interaction, nullptr, canTrigger))
                 return finish(InteractionState::Unavailable, "native readiness query failed");
@@ -750,16 +720,13 @@ public:
                     Object* unit{};
                     auto mapId = target.mapId;
                     void* unitArgs[]{&mapId};
-                    const char* unitStep = "no-getter";
                     for (const char* getter : {"GetBreakableItem", "GetBreakableItemByGuid"}) {
                         const auto* getUnit = Member(runtime, action, getter, {"System.Int32"},
                             "Azur.Gameplay.Units.World.BreakableItem");
                         if (!getUnit) continue;
-                        unitStep = "getter-null-unit";
                         if (!Invoke(runtime, getUnit, action, unitArgs, unit) || !unit) continue;
                         const auto* destroy = Member(runtime, unit, "OnDamageToDestroy", {"UnityEngine.Vector3"});
-                        if (!destroy) { unitStep = "no-destroy-method"; continue; }
-                        unitStep = "invoke-failed";
+                        if (!destroy) continue;
                         Vector3 point{};
                         point.x = static_cast<float>(target.position[0]);
                         point.y = static_cast<float>(target.position[1]);
@@ -773,7 +740,7 @@ public:
                                 "hit dispatched; awaiting server completion");
                         }
                     }
-                    details << " reason=experimental hit unavailable step=" << unitStep;
+                    details << " reason=hit dispatch unavailable";
                 }
                 unsupported = true;
                 if (actionName.ends_with(".RandomChestAction")) { consumption = true; details << " reason=random chest reward requires user confirmation"; }
@@ -781,61 +748,6 @@ public:
                 else if (actionName.ends_with(".ChestEnemyAction") || actionName.ends_with(".DungeonChestAction") || actionName.ends_with(".SuYaDungeonChestAction") || actionName.ends_with(".WorldBossChestAction"))
                     details << " reason=combat or dungeon reward action is not automatic";
                 else details << " reason=action has no supported automatic pickup contract";
-                // Read-only, once per class: the callable surface decides whether this action can
-                // ever be automated, and its name alone says nothing about that.
-                if (describedActions_.insert(std::string(actionName)).second) {
-                    details << " classMethods=[";
-                    void* iterator{};
-                    std::uint32_t shown{};
-                    while (const auto* method = api.il2cpp_class_get_methods(klass, &iterator)) {
-                        const auto* methodName = api.il2cpp_method_get_name(method);
-                        if (!methodName) continue;
-                        if (shown == 24) { details << ",..."; break; }
-                        if (shown) details << ',';
-                        ++shown;
-                        std::uint32_t implementation{};
-                        const bool isStatic =
-                            (api.il2cpp_method_get_flags(method, &implementation) & 0x10u) != 0;
-                        details << (isStatic ? "static " : "instance ")
-                                << runtime.TypeName(api.il2cpp_method_get_return_type(method)) << ' '
-                                << methodName << '(';
-                        for (std::uint32_t index{}; index < api.il2cpp_method_get_param_count(method); ++index) {
-                            if (index) details << ',';
-                            details << runtime.TypeName(api.il2cpp_method_get_param(method, index));
-                        }
-                        details << ')';
-                    }
-                    details << ']';
-                    // The unit the action collects from decides whether a hit can even be issued
-                    // from here; describe it once as well (read-only).
-                    if (actionName.ends_with(".HitCollectionAction") &&
-                        describedActions_.insert("unit:BreakableItem").second) {
-                        if (auto* unit = runtime.FindClassAnyImage("Azur.Gameplay.Units.World", "BreakableItem")) {
-                            details << " unitMethods=[";
-                            void* unitIterator{};
-                            std::uint32_t unitShown{};
-                            while (const auto* method = api.il2cpp_class_get_methods(unit, &unitIterator)) {
-                                const auto* methodName = api.il2cpp_method_get_name(method);
-                                if (!methodName) continue;
-                                if (unitShown == 32) { details << ",..."; break; }
-                                if (unitShown) details << ',';
-                                ++unitShown;
-                                std::uint32_t implementation{};
-                                const bool isStatic =
-                                    (api.il2cpp_method_get_flags(method, &implementation) & 0x10u) != 0;
-                                details << (isStatic ? "static " : "instance ")
-                                        << runtime.TypeName(api.il2cpp_method_get_return_type(method)) << ' '
-                                        << methodName << '(';
-                                for (std::uint32_t index{}; index < api.il2cpp_method_get_param_count(method); ++index) {
-                                    if (index) details << ',';
-                                    details << runtime.TypeName(api.il2cpp_method_get_param(method, index));
-                                }
-                                details << ')';
-                            }
-                            details << ']';
-                        }
-                    }
-                }
                 continue;
             }
             // Default actions carry the graph's SetInteractionAction callback.
@@ -1283,8 +1195,6 @@ private:
     mutable std::string failure_;
     mutable std::string interactionDetails_;
     mutable bool lastHitCollection_{};
-    // Unsupported action classes already described once, so the log stays readable.
-    mutable std::set<std::string> describedActions_;
     mutable CabbirdIl2CppGCHandleV1 puzzleGraphs_{}, puzzleNodes_{}, puzzleSelected_{}, puzzleSelectedGraph_{}, puzzleOwner_{};
     mutable std::vector<CabbirdIl2CppGCHandleV1> puzzleChildren_;
     mutable std::unordered_set<std::uintptr_t> puzzleVisited_;

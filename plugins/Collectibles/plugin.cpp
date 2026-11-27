@@ -592,15 +592,7 @@ void CABBIRD_CALL Update(void* raw, double) noexcept {
         auto& c = *static_cast<Context*>(raw);
         if (!c.active.load()) return;
         const auto command = c.command.exchange(Command::None);
-        if (command != Command::None && c.core && c.core->log) {
-            const std::string detail = "command=" + std::to_string(static_cast<int>(command)) +
-                " phase=" + std::to_string(static_cast<int>(c.game.phase)) +
-                " scanValid=" + std::to_string(c.game.scanValid ? 1 : 0) +
-                " queue=" + std::to_string(c.queue.size()) +
-                " visited=" + std::to_string(c.game.visited) +
-                " total=" + std::to_string(c.game.total);
-            c.core->log(c.core->user, CABBIRD_CORE_LOG_LEVEL_V1_INFO, StringView(detail));
-        }
+
         if (command == Command::Stop) {
             c.hold.End();
             const bool released = c.collector.CancelScan(c.il2cpp);
