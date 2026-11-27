@@ -27,9 +27,12 @@ using Method = CabbirdMethodInfoV1;
 using Field = CabbirdFieldInfoV1;
 struct Vector3 { float x{}, y{}, z{}; };
 enum class CompletionState { Unknown, Incomplete, Complete, Unavailable };
-enum class RouteState { AlreadyComplete, Queued, Moving, Waiting, Interacting, Complete, Skipped, UnknownTimeout, Unsupported, InteractionTimeout, Stopped, Failed, NotSpawned };
+enum class RouteState { AlreadyComplete, Queued, Moving, Waiting, Interacting, Complete, Skipped, UnknownTimeout, Unsupported, InteractionTimeout, Stopped, Failed, NotSpawned, Filtered };
 enum class PresenceState { MayLoad, NotSpawned, Unavailable };
-struct TargetPresence { CompletionState completion{CompletionState::Unavailable}; PresenceState presence{PresenceState::Unavailable}; };
+struct TargetPresence { CompletionState completion{CompletionState::Unavailable}; PresenceState presence{PresenceState::Unavailable};
+    // A failed native read is not the same as "this target is unavailable": the route can retry
+    // or skip one target instead of ending the whole run.
+    bool transient{}; };
 enum class PickupKind { None, Collection, Book, Special };
 struct Target {
     std::int32_t mapId{};
@@ -549,12 +552,15 @@ public:
     bool RewardConfirmed() const { return receipt_.Confirmed(); }
     std::string RewardDetails() const { return receipt_.Details(); }
     bool StopReceipt() { return receipt_.Stop(); }
-    CompletionState Completion(const Runtime& runtime, const Target& target) const {
+    CompletionState Completion(const Runtime& runtime, const Target& target, bool* transient = nullptr) const {
+        if (transient) *transient = false;
         Object *world{}, *map{}, *local{}, *manager{};
         if (!WorldState(runtime, world, map, local, manager)) return CompletionState::Unavailable;
         std::int32_t current{};
         if (!Value(runtime, Get(Call::WorldId), world, nullptr, current) || current != worldId_) return CompletionState::Unavailable;
-        return ServerCompletion(runtime, map, target.mapId);
+        const auto state = ServerCompletion(runtime, map, target.mapId);
+        if (state == CompletionState::Unavailable && transient) *transient = true;
+        return state;
     }
     TargetPresence ProbeTarget(const Runtime& runtime, Target& target) const {
         Object *world{}, *map{}, *local{}, *manager{};
@@ -563,29 +569,33 @@ public:
         if (!Value(runtime, Get(Call::WorldId), world, nullptr, current) || current != worldId_) return {};
         bool noData{};
         TargetPresence result{ServerCompletion(runtime, map, id, &noData)};
-        if (result.completion == CompletionState::Unavailable) return result;
+        const auto transientFailure = [&] {
+            result.transient = true;
+            return result;
+        };
+        if (result.completion == CompletionState::Unavailable) return transientFailure();
         Object *unit{}, *instance{}; bool active{}, disposed{}, hierarchy{}, logic{}, view{};
         void* parameters[]{&id};
         if (!Value(runtime, Get(Call::ObjectActive), map, parameters, active) ||
-            !Invoke(runtime, Get(Call::MapUnit), manager, parameters, unit)) return result;
+            !Invoke(runtime, Get(Call::MapUnit), manager, parameters, unit)) return transientFailure();
         if (unit) {
             std::int32_t actual{};
             if (!Value(runtime, Get(Call::UnitMapId), unit, nullptr, actual) || actual != id ||
-                !Value(runtime, Get(Call::UnitDisposed), unit, nullptr, disposed)) return result;
-            if (!disposed && !Invoke(runtime, Get(Call::UnitInstance), unit, nullptr, instance)) return result;
+                !Value(runtime, Get(Call::UnitDisposed), unit, nullptr, disposed)) return transientFailure();
+            if (!disposed && !Invoke(runtime, Get(Call::UnitInstance), unit, nullptr, instance)) return transientFailure();
             if (!disposed) {
                 if (!Value(runtime, Get(Call::UnitLogicActive), unit, nullptr, logic) ||
-                    !Value(runtime, Get(Call::UnitViewActive), unit, nullptr, view)) return result;
+                    !Value(runtime, Get(Call::UnitViewActive), unit, nullptr, view)) return transientFailure();
                 Object* scene{}; runtime.Functions().il2cpp_field_get_value(unit, unitScene_, &scene);
                 if (scene) {
                     Object *transform{}, *gameObject{}; bool found{}; void* transformArgs[]{&transform};
-                    if (!Value(runtime, Get(Call::SceneTransform), scene, transformArgs, found)) return result;
+                    if (!Value(runtime, Get(Call::SceneTransform), scene, transformArgs, found)) return transientFailure();
                     if (found && transform) {
                         if (!Invoke(runtime, Get(Call::ComponentObject), transform, nullptr, gameObject) || !gameObject ||
-                            !Value(runtime, Get(Call::ObjectHierarchyActive), gameObject, nullptr, hierarchy)) return result;
+                            !Value(runtime, Get(Call::ObjectHierarchyActive), gameObject, nullptr, hierarchy)) return transientFailure();
                         if (hierarchy && view) {
                             Vector3 position{}; void* positionArgs[]{&position};
-                            if (!Value(runtime, Get(Call::ScenePosition), scene, positionArgs, found)) return result;
+                            if (!Value(runtime, Get(Call::ScenePosition), scene, positionArgs, found)) return transientFailure();
                             if (found && ValidPosition(position)) { target.position = {position.x, position.y, position.z}; target.livePosition = true; }
                         }
                     }
