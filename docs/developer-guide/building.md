@@ -117,5 +117,7 @@ pwsh -NoProfile -File tools/package_release.ps1 `
 ```
 
 脚本生成 runtime / sdk / tools / symbols 归档、SPDX SBOM、校验和与发布清单。
+标签 workflow 将 runtime、sdk、tools 归档发布到 GitHub Release；symbols 单独保存在 Actions 的
+`cabbird-symbols-windows-x64` artifact 中。
 CI 使用相同的 configure、build 和安装入口；tag 通过 `CABBIRD_RELEASE_VERSION` 生成
 树内及已安装的版本头，无需手改源码头文件。

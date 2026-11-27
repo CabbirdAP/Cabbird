@@ -65,7 +65,13 @@ jobs:
             .build/release/Cabbird-*-runtime.zip
             .build/release/Cabbird-*-sdk.zip
             .build/release/Cabbird-*-tools.zip
-            .build/release/Cabbird-*-symbols.zip
+          if-no-files-found: error
+      - name: Upload debug symbols
+        if: github.ref_type == 'tag'
+        uses: actions/upload-artifact@v4
+        with:
+          name: cabbird-symbols-windows-x64
+          path: .build/release/Cabbird-*-symbols.zip
           if-no-files-found: error
   release:
     if: github.ref_type == 'tag'
@@ -108,14 +114,12 @@ jobs:
             .build/release/Cabbird-*-runtime.zip
             .build/release/Cabbird-*-sdk.zip
             .build/release/Cabbird-*-tools.zip
-            .build/release/Cabbird-*-symbols.zip
-      - name: Publish runtime, SDK, tools and symbols
+      - name: Publish runtime, SDK and tools
         uses: softprops/action-gh-release@v2
         with:
           files: |
             .build/release/Cabbird-*-runtime.zip
             .build/release/Cabbird-*-sdk.zip
             .build/release/Cabbird-*-tools.zip
-            .build/release/Cabbird-*-symbols.zip
           fail_on_unmatched_files: true
           body_path: CHANGES.md
