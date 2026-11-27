@@ -16,8 +16,10 @@
     {"id": "cabbird.ui", "minVersion": 1},
     {"id": "cabbird.window", "minVersion": 1},
     {"id": "cabbird.input", "minVersion": 1},
+    {"id": "cabbird.interop.hook", "minVersion": 1},
     {"id": "cabbird.unity.player-motion", "minVersion": 1},
     {"id": "cabbird.json", "minVersion": 1},
+    {"id": "cabbird.profile", "minVersion": 1},
     {"id": "cabbird.unity.il2cpp", "minVersion": 1},
     {"id": "cabbird.unity.metadata", "minVersion": 1},
     {"id": "cabbird.unity.player", "minVersion": 1},
@@ -26,5 +28,5 @@
     {"id": "cabbird.scheduler", "minVersion": 1},
     {"id": "cabbird.localization", "minVersion": 1}
   ],
-  "capabilities": ["ui", "ui-window", "input", "unity-player-motion", "json", "unity-il2cpp", "unity-metadata", "unity-player-snapshot", "configuration", "scheduler"]
+  "capabilities": ["ui", "ui-window", "input", "interop-hook", "memory-read", "unity-player-motion", "json", "unity-il2cpp", "unity-metadata", "unity-player-snapshot", "configuration", "scheduler"]
 }

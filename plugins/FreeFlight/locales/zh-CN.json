@@ -18,6 +18,11 @@
     "log.settings": "自由飞行：已保存的设置无效，已保留默认值",
     "log.save": "自由飞行：无法提交配置保存任务",
     "log.draw": "自由飞行：窗口回调失败",
-    "log.hotkey": "自由飞行：快捷键回调失败"
+    "log.hotkey": "自由飞行：快捷键回调失败",
+    "log.summon-profile": "自由飞行：坐骑召唤兼容资料不可用：{0}",
+    "log.summon-metadata": "自由飞行：飞行坐骑选择元数据与兼容资料不匹配",
+    "log.summon-hook": "自由飞行：无法安装飞行坐骑自动召唤拦截",
+    "log.summon-ready": "自由飞行：已安装飞行坐骑自动召唤拦截",
+    "log.summon-callback": "自由飞行：坐骑召唤回调失败"
   }
 }

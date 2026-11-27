@@ -2,6 +2,7 @@
 #include "cabbird/sdk/services/game_lifecycle.h"
 #include "cabbird/sdk/services/player_motion.h"
 #include "cabbird/sdk/services/unity_metadata.h"
+#include "cabbird/sdk/profile.hpp"
 
 #include <chrono>
 
@@ -42,22 +43,97 @@ struct Context {
     const CabbirdUiServiceV1* ui{};
     const CabbirdWindowServiceV1* windows{};
     const CabbirdInputServiceV1* input{};
+    const CabbirdHookServiceV1* hooks{};
     const CabbirdUnityPlayerServiceV1* player{};
     const CabbirdIl2CppServiceV1* il2cpp{};
     const CabbirdUnityMetadataServiceV1* metadata{};
     const CabbirdUnityPlayerMotionServiceV1* motion{};
     const CabbirdGameLifecycleServiceV1* lifecycle{};
     CabbirdGenerationHandleV1 window{}, cleanup{}, motionLease{}, hotkey{};
+    std::uintptr_t summonTarget{};
+    CabbirdGenerationHandleV1 summonHook{};
+    std::uintptr_t summonOriginal{};
+    std::chrono::steady_clock::time_point nextSummonBind{};
     std::uint64_t motionEntity{}; // Game-owned identity, not a retained Unity object.
     const Method *mainCamera{}, *componentTransform{}, *forward{}, *focused{};
     bool methodsReady{};
     std::chrono::steady_clock::time_point nextBind{};
 };
+std::atomic<Context*> g_summonContext{};
 void LogOnce(Context& c, unsigned bit, const char* key, const char* fallback) noexcept {
     try {
         if ((c.reported.fetch_or(bit) & bit) == 0)
             c.core->log(c.core->user, CABBIRD_CORE_LOG_LEVEL_V1_WARNING, StringView(c.text.Text(key, fallback)));
     } catch (...) {}
+}
+CabbirdStatusV1 LoadSummonTarget(Context& c, const CabbirdHostApiV1* host) {
+    const auto fail = [&](std::string_view reason) {
+        c.core->log(c.core->user, CABBIRD_CORE_LOG_LEVEL_V1_WARNING, StringView(Format(c.text,
+            "log.summon-profile", "Free Flight: mount summon compatibility is unavailable: {0}.", {reason})));
+        return Status(CABBIRD_STATUS_V1_UNAVAILABLE);
+    };
+    auto loaded = cabbird::sdk::LoadProfile(cabbird::sdk::Host(host), "compatibility.profile.json",
+        {"ap", "GameAssembly.dll", "il2cpp", "cabbird.free-flight.mount-selection.v1"});
+    if (!loaded) return fail(loaded.error());
+    const auto& profile = loaded.value();
+    const auto selection = cabbird::sdk::ResolveProfileSymbolRva(c.core, profile, "nextFlyableMount");
+    if (!selection) return fail(selection.error);
+    c.summonTarget = selection.address;
+    return Ok();
+}
+std::uint64_t CABBIRD_CALL SummonDetour(std::uintptr_t self, std::uintptr_t method) noexcept {
+    auto* c = g_summonContext.load(std::memory_order_acquire);
+    if (!c) return 0;
+    try {
+        CabbirdGenerationHandleV1 lease{};
+        if (!Succeeded(c->hooks->begin_callback(c->hooks->user, c->summonHook, &lease))) return 0;
+        struct Lease {
+            const CabbirdHookServiceV1* hooks; CabbirdGenerationHandleV1 handle;
+            ~Lease() { static_cast<void>(hooks->end_callback(hooks->user, handle)); }
+        } held{c->hooks, lease};
+        // Jump input and the long-press timer both stop before ReqRideMount
+        // when no automatic flying mount is selected. UI-selected IDs bypass this getter.
+        if (c->running.load() && c->enabled.load()) return 0;
+        return reinterpret_cast<std::uint64_t(CABBIRD_CALL*)(std::uintptr_t, std::uintptr_t)>(c->summonOriginal)(self, method);
+    } catch (...) { LogOnce(*c, 2048, "log.summon-callback", "Free Flight: the mount summon callback failed."); }
+    return 0;
+}
+bool EnsureSummonGuard(Context& c) {
+    if (c.summonHook.id) return true;
+    const auto now = std::chrono::steady_clock::now();
+    if (now < c.nextSummonBind) return false;
+    c.nextSummonBind = now + std::chrono::seconds(2);
+    const CabbirdUnityMethodRequestV1 method{sizeof(method), CABBIRD_UNITY_METHOD_V1_INSTANCE,
+        StringView("GameAssembly.dll"), StringView("Azur.Gameplay.PlayerModule.MountManager"),
+        StringView("GetNextFlyableMountID"), StringView("System.UInt64"), nullptr, 0};
+    CabbirdUnityMethodResultV1 result{sizeof(result)};
+    const auto metadata = c.metadata->resolve_method(c.metadata->user, &method, &result);
+    if (metadata.code == CABBIRD_STATUS_V1_NOT_FOUND || metadata.code == CABBIRD_STATUS_V1_UNAVAILABLE) return false;
+    if (!Succeeded(metadata) || result.address != c.summonTarget) {
+        LogOnce(c, 512, "log.summon-metadata", "Free Flight: flying mount selection metadata does not match its profile.");
+        return false;
+    }
+    const CabbirdHookRequestV1 request{sizeof(request), CABBIRD_HOOK_V1_FUNCTION, c.summonTarget,
+        reinterpret_cast<void*>(&SummonDetour), StringView("free-flight.auto-fly-mount")};
+    g_summonContext.store(&c, std::memory_order_release);
+    const auto status = c.hooks->create(c.hooks->user, &request, &c.summonOriginal, &c.summonHook);
+    if (Succeeded(status)) {
+        c.core->log(c.core->user, CABBIRD_CORE_LOG_LEVEL_V1_INFO, StringView(c.text.Text(
+            "log.summon-ready", "Free Flight: automatic flying mount selection guard installed.")));
+        return true;
+    }
+    g_summonContext.store(nullptr, std::memory_order_release);
+    LogOnce(c, 1024, "log.summon-hook", "Free Flight: the automatic flying mount guard could not be installed.");
+    return false;
+}
+bool ReleaseSummonGuard(Context& c) noexcept {
+    if (c.summonHook.id) {
+        const auto status = c.hooks->release(c.hooks->user, c.summonHook);
+        if (!Succeeded(status) && status.code != CABBIRD_STATUS_V1_NOT_FOUND) return false;
+        c.summonHook = {};
+    }
+    g_summonContext.store(nullptr, std::memory_order_release);
+    return true;
 }
 // Caller holds settingsMutex while callbacks are active. Queue only schedules Worker I/O.
 void SaveSettings(Context& c) {
@@ -241,6 +317,7 @@ void CABBIRD_CALL Update(void* raw, double) noexcept {
             !(player.flags & CABBIRD_UNITY_PLAYER_V1_VALID) || !player.entity_id) {
             static_cast<void>(ReleaseMotion(c)); return;
         }
+        if (!EnsureSummonGuard(c)) { static_cast<void>(ReleaseMotion(c)); return; }
         if (c.motionLease.id && c.motionEntity != player.entity_id && !ReleaseMotion(c)) return;
         CameraWork work{&c};
         if (!Succeeded(c.il2cpp->with_runtime(c.il2cpp->user, ReadCamera, &work))) {
@@ -279,12 +356,15 @@ CabbirdStatusV1 CABBIRD_CALL Load(const CabbirdHostApiV1* host, void** result) n
         c->ui = Query<CabbirdUiServiceV1>(host, CABBIRD_UI_SERVICE_V1_ID);
         c->windows = Query<CabbirdWindowServiceV1>(host, CABBIRD_WINDOW_SERVICE_V1_ID);
         c->input = Query<CabbirdInputServiceV1>(host, CABBIRD_INPUT_SERVICE_V1_ID);
+        c->hooks = Query<CabbirdHookServiceV1>(host, CABBIRD_HOOK_SERVICE_V1_ID);
         c->player = Query<CabbirdUnityPlayerServiceV1>(host, CABBIRD_UNITY_PLAYER_SERVICE_V1_ID);
         c->il2cpp = Query<CabbirdIl2CppServiceV1>(host, CABBIRD_IL2CPP_SERVICE_V1_ID);
         c->metadata = Query<CabbirdUnityMetadataServiceV1>(host, CABBIRD_UNITY_METADATA_SERVICE_V1_ID);
         c->motion = Query<CabbirdUnityPlayerMotionServiceV1>(host, CABBIRD_UNITY_PLAYER_MOTION_SERVICE_V1_ID);
         c->lifecycle = Query<CabbirdGameLifecycleServiceV1>(host, CABBIRD_GAME_LIFECYCLE_SERVICE_V1_ID);
-        if (!c->core || !c->core->log || !c->ui || !c->ui->checkbox || !c->ui->slider_float ||
+        if (!c->core || !c->core->log || !c->core->read_memory || !c->core->module_base ||
+            !c->hooks || !c->hooks->create || !c->hooks->release || !c->hooks->begin_callback || !c->hooks->end_callback ||
+            !c->ui || !c->ui->checkbox || !c->ui->slider_float ||
             !c->ui->button || !c->ui->text || !c->ui->frame_state ||
             !c->windows || !c->windows->register_window || !c->windows->release_window || !c->windows->state ||
             !c->windows->begin || !c->windows->end || !c->input || !c->input->snapshot ||
@@ -293,6 +373,8 @@ CabbirdStatusV1 CABBIRD_CALL Load(const CabbirdHostApiV1* host, void** result) n
             !c->metadata || !c->metadata->resolve_method || !c->motion || !c->motion->acquire ||
             !c->motion->update || !c->motion->release || !c->lifecycle ||
             !c->lifecycle->register_stop_cleanup || !c->lifecycle->unregister_stop_cleanup) return Status(CABBIRD_STATUS_V1_UNAVAILABLE);
+        const auto route = LoadSummonTarget(*c, host);
+        if (!Succeeded(route)) return route;
         const auto status = c->config.Bind(host, "free-flight-settings", Schema());
         if (!Succeeded(status)) return status;
         try {
@@ -329,6 +411,7 @@ CabbirdStatusV1 CABBIRD_CALL Stop(void* raw, std::uint32_t) noexcept {
     try {
         c.running.store(false);
         bool released = ReleaseMotion(c);
+        released = ReleaseSummonGuard(c) && released;
         const bool saved = c.config.Stop();
         const auto hotkey = BindHotkey(c, 0);
         released = released && Succeeded(hotkey);
