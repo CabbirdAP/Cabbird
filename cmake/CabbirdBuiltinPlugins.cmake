@@ -81,10 +81,13 @@ cabbird_add_plugin(Collectibles
 target_link_libraries(Collectibles PRIVATE nlohmann_json::nlohmann_json)
 
 cabbird_add_plugin(BetterPose
-    SOURCES plugins/BetterPose/plugin.cpp
+    SOURCES plugins/BetterPose/plugin.cpp plugins/BetterPose/mmd_retarget.cpp
     MANIFEST plugins/BetterPose/manifest.json
     PACKAGE_NAME BetterPose)
 target_link_libraries(BetterPose PRIVATE nlohmann_json::nlohmann_json)
+if(WIN32)
+    target_link_libraries(BetterPose PRIVATE ole32 shell32 uuid)
+endif()
 target_compile_options(BetterPose PRIVATE /utf-8)
 
 cabbird_add_plugin(CameraTools

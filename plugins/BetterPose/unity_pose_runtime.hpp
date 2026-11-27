@@ -92,6 +92,27 @@ struct BoneRenderData {
     IkChain ikChain{};
 };
 
+struct MmdUiSnapshot {
+    bool motionLoaded{};
+    bool playing{};
+    bool busyLoading{};
+    bool fileDialogBusy{};
+    double currentFrame{};
+    uint32_t frameCount{};
+    double fps{30.0};
+    uint32_t mappedBoneCount{};
+    uint32_t matchedMorphCount{};
+    uint32_t totalBlendShapes{};
+    int recommendedReference{0};
+    bool hasFootIk{};
+    bool hasLegD{};
+    std::string motionName;
+    bool cameraLoaded{};
+    bool cameraEnabled{};
+    uint32_t cameraKeyCount{};
+    std::string cameraName;
+};
+
 struct RenderSnapshot {
     uint64_t revision{};
     bool bound{};
@@ -110,6 +131,7 @@ struct RenderSnapshot {
     CameraProjection camera{};
     OrbitCameraState orbit{};
     bool orbitActive{};
+    MmdUiSnapshot mmd{};
     std::vector<BoneRenderData> bones;
     std::vector<TargetEntry> targets;
 };
@@ -123,6 +145,8 @@ using NativeCameraMat4Fn    = void (CABBIRD_CALL*)(CabbirdIl2CppObjectV1*, Unity
 using NativeCameraSetFovFn  = void (CABBIRD_CALL*)(CabbirdIl2CppObjectV1*, float, const CabbirdMethodInfoV1*);
 using NativeCameraGetFovFn  = float (CABBIRD_CALL*)(CabbirdIl2CppObjectV1*, const CabbirdMethodInfoV1*);
 using NativeCameraGetIntFn  = int32_t (CABBIRD_CALL*)(CabbirdIl2CppObjectV1*, const CabbirdMethodInfoV1*);
+using NativeSmrGetBlendFn   = float (CABBIRD_CALL*)(CabbirdIl2CppObjectV1*, int32_t, const CabbirdMethodInfoV1*);
+using NativeSmrSetBlendFn   = void (CABBIRD_CALL*)(CabbirdIl2CppObjectV1*, int32_t, float, const CabbirdMethodInfoV1*);
 using NativeAfterLateFn     = void (CABBIRD_CALL*)(const CabbirdMethodInfoV1*);
 
 // POD-only SEH leaf helpers for safe native calls on the Game thread.
@@ -224,6 +248,28 @@ inline bool CallCameraGetInt(NativeCameraGetIntFn fn, CabbirdIl2CppObjectV1* obj
     }
 }
 
+inline bool CallSmrGetBlend(NativeSmrGetBlendFn fn, CabbirdIl2CppObjectV1* obj,
+                            int32_t index, const CabbirdMethodInfoV1* mi, float& out) noexcept {
+    if (!fn || !obj || !mi) return false;
+    __try {
+        out = fn(obj, index, mi);
+        return std::isfinite(out);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+inline bool CallSmrSetBlend(NativeSmrSetBlendFn fn, CabbirdIl2CppObjectV1* obj,
+                            int32_t index, float value, const CabbirdMethodInfoV1* mi) noexcept {
+    if (!fn || !obj || !mi) return false;
+    __try {
+        fn(obj, index, value, mi);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
 }  // namespace seh
 
 struct UnityBindings {
@@ -256,6 +302,7 @@ struct UnityBindings {
     const Method* objFindObjectsOfType1{};
     const Method* compGetTransform{};
     const Method* compGetGameObject{};
+    const Method* goGetTransform{};
     const Method* goGetActiveInHierarchy{};
     const Method* goGetComponentsInChildren2{};
     const Method* goGetComponentsInChildren1{};
@@ -271,6 +318,9 @@ struct UnityBindings {
     const Method* tfSetLocalPosition{};
     const Method* tfGetLocalRotation{};
     const Method* tfSetLocalRotation{};
+    const Method* tfGetLocalScale{};
+    const Method* tfGetLocalToWorld{};
+    const Method* tfGetWorldToLocal{};
     const Method* tfGetParent{};
 
     const Method* smrGetBones{};
@@ -278,7 +328,11 @@ struct UnityBindings {
     const Method* smrGetSharedMesh{};
     const Method* smrGetUpdateWhenOffscreen{};
     const Method* smrSetUpdateWhenOffscreen{};
+    const Method* smrGetBlendShapeWeight{};
+    const Method* smrSetBlendShapeWeight{};
     const Method* meshGetBindposes{};
+    const Method* meshGetBlendShapeCount{};
+    const Method* meshGetBlendShapeName{};
 
     const Method* animGetSpeed{};
     const Method* animSetSpeed{};
@@ -322,11 +376,16 @@ struct UnityBindings {
     DirectEntry nativeCamGetPixelH{};
     DirectEntry nativeCamGetFov{};
     DirectEntry nativeCamSetFov{};
+    DirectEntry nativeSmrGetBlend{};
+    DirectEntry nativeSmrSetBlend{};
 
     std::uintptr_t afterLateUpdateAddress{};
     bool nativeDirectReady{};
     bool nativeDirectVerified{};
     bool nativeDirectRejected{};
+    bool nativeBlendReady{};
+    bool nativeBlendVerified{};
+    bool nativeBlendRejected{};
 
     bool IsUnityObjectAlive(const cabbird::sdk::il2cpp::Context& rt, Object* obj) const noexcept {
         if (!obj) return false;
@@ -486,6 +545,7 @@ struct UnityBindings {
         objGetName = ResolveVerifiedMethod(metadata, rt, "UnityEngine", "Object", "get_name", "System.String", {}, false);
         compGetTransform = ResolveVerifiedMethod(metadata, rt, "UnityEngine", "Component", "get_transform", "UnityEngine.Transform", {}, false);
         compGetGameObject = ResolveVerifiedMethod(metadata, rt, "UnityEngine", "Component", "get_gameObject", "UnityEngine.GameObject", {}, false);
+        goGetTransform = ResolveVerifiedMethod(metadata, rt, "UnityEngine", "GameObject", "get_transform", "UnityEngine.Transform", {}, false);
         goGetActiveInHierarchy = ResolveVerifiedMethod(metadata, rt, "UnityEngine", "GameObject", "get_activeInHierarchy", "System.Boolean", {}, false);
         behaviourGetEnabled = ResolveVerifiedMethod(metadata, rt, "UnityEngine", "Behaviour", "get_enabled", "System.Boolean", {}, false);
         behaviourSetEnabled = ResolveVerifiedMethod(metadata, rt, "UnityEngine", "Behaviour", "set_enabled", "System.Void", {"System.Boolean"}, false);
@@ -522,13 +582,20 @@ struct UnityBindings {
         // Clear transient bindError while resolving optional overloads.
         const std::string savedErr = bindError;
         camGetMain = ResolveVerifiedMethod(metadata, rt, "UnityEngine", "Camera", "get_main", "UnityEngine.Camera", {}, true);
+        tfGetLocalScale = ResolveVerifiedMethod(metadata, rt, "UnityEngine", "Transform", "get_localScale", "UnityEngine.Vector3", {}, false);
+        tfGetLocalToWorld = ResolveVerifiedMethod(metadata, rt, "UnityEngine", "Transform", "get_localToWorldMatrix", "UnityEngine.Matrix4x4", {}, false);
+        tfGetWorldToLocal = ResolveVerifiedMethod(metadata, rt, "UnityEngine", "Transform", "get_worldToLocalMatrix", "UnityEngine.Matrix4x4", {}, false);
         camGetFov = ResolveVerifiedMethod(metadata, rt, "UnityEngine", "Camera", "get_fieldOfView", "System.Single", {}, false);
         camSetFov = ResolveVerifiedMethod(metadata, rt, "UnityEngine", "Camera", "set_fieldOfView", "System.Void", {"System.Single"}, false);
         smrGetRootBone = ResolveVerifiedMethod(metadata, rt, "UnityEngine", "SkinnedMeshRenderer", "get_rootBone", "UnityEngine.Transform", {}, false);
         smrGetSharedMesh = ResolveVerifiedMethod(metadata, rt, "UnityEngine", "SkinnedMeshRenderer", "get_sharedMesh", "UnityEngine.Mesh", {}, false);
         smrGetUpdateWhenOffscreen = ResolveVerifiedMethod(metadata, rt, "UnityEngine", "SkinnedMeshRenderer", "get_updateWhenOffscreen", "System.Boolean", {}, false);
         smrSetUpdateWhenOffscreen = ResolveVerifiedMethod(metadata, rt, "UnityEngine", "SkinnedMeshRenderer", "set_updateWhenOffscreen", "System.Void", {"System.Boolean"}, false);
+        smrGetBlendShapeWeight = ResolveVerifiedMethod(metadata, rt, "UnityEngine", "SkinnedMeshRenderer", "GetBlendShapeWeight", "System.Single", {"System.Int32"}, false);
+        smrSetBlendShapeWeight = ResolveVerifiedMethod(metadata, rt, "UnityEngine", "SkinnedMeshRenderer", "SetBlendShapeWeight", "System.Void", {"System.Int32", "System.Single"}, false);
         meshGetBindposes = ResolveVerifiedMethod(metadata, rt, "UnityEngine", "Mesh", "get_bindposes", "UnityEngine.Matrix4x4[]", {}, false);
+        meshGetBlendShapeCount = ResolveVerifiedMethod(metadata, rt, "UnityEngine", "Mesh", "get_blendShapeCount", "System.Int32", {}, false);
+        meshGetBlendShapeName = ResolveVerifiedMethod(metadata, rt, "UnityEngine", "Mesh", "GetBlendShapeName", "System.String", {"System.Int32"}, false);
         animGetSpeed = ResolveVerifiedMethod(metadata, rt, "UnityEngine", "Animator", "get_speed", "System.Single", {}, false);
         animSetSpeed = ResolveVerifiedMethod(metadata, rt, "UnityEngine", "Animator", "set_speed", "System.Void", {"System.Single"}, false);
         objFindObjectsByType2 = ResolveVerifiedMethod(metadata, rt, "UnityEngine", "Object", "FindObjectsOfType", "UnityEngine.Object[]", {"System.Type", "System.Boolean"}, true);
@@ -619,6 +686,11 @@ struct UnityBindings {
             resolveDirect("UnityEngine", "Camera", "get_fieldOfView", "System.Single", {}, nativeCamGetFov) &&
             resolveDirect("UnityEngine", "Camera", "set_fieldOfView", "System.Void", {"System.Single"}, nativeCamSetFov);
         nativeDirectReady = okTf && okCam && hasCachedPtrOffset;
+
+        const bool okBlend =
+            resolveDirect("UnityEngine", "SkinnedMeshRenderer", "GetBlendShapeWeight", "System.Single", {"System.Int32"}, nativeSmrGetBlend) &&
+            resolveDirect("UnityEngine", "SkinnedMeshRenderer", "SetBlendShapeWeight", "System.Void", {"System.Int32", "System.Single"}, nativeSmrSetBlend);
+        nativeBlendReady = okBlend && hasCachedPtrOffset;
         bindError.clear();
 
         bound = true;
@@ -728,6 +800,27 @@ struct UnityBindings {
             return false;
         }
         nativeDirectVerified = true;
+        return true;
+    }
+
+    // Live self-check verifying native SkinnedMeshRenderer.GetBlendShapeWeight ABI against reflection.
+    bool VerifyBlendShapeNativeAbi(const cabbird::sdk::il2cpp::Context& rt, Object* smr) {
+        if (nativeBlendVerified) return true;
+        if (!nativeBlendReady || nativeBlendRejected || !smr || !smrGetBlendShapeWeight) return false;
+        int32_t idx = 0;
+        void* args[]{&idx};
+        float refVal = 0.f;
+        if (!InvokeValue(rt, smrGetBlendShapeWeight, smr, args, refVal) || !std::isfinite(refVal)) {
+            return false;
+        }
+        float natVal = 0.f;
+        if (!seh::CallSmrGetBlend(reinterpret_cast<NativeSmrGetBlendFn>(nativeSmrGetBlend.address),
+                                  smr, 0, nativeSmrGetBlend.method, natVal) ||
+            !(std::fabs(natVal - refVal) < 1e-2f)) {
+            nativeBlendRejected = true;
+            return false;
+        }
+        nativeBlendVerified = true;
         return true;
     }
 

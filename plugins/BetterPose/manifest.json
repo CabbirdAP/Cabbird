@@ -2,7 +2,7 @@
   "schemaVersion": 2,
   "id": "cabbird.better-pose",
   "name": "BetterPose",
-  "description": "Visual 3D skeleton pose editor for Unity characters: on-screen joint gizmos, direct bone dragging with optional 2-bone IK and anatomical limits, orbit camera, symmetry mirroring, undo/redo, and JSON pose import/export.",
+  "description": "Visual 3D skeleton pose editor and MMD motion player for Unity characters: on-screen joint gizmos, direct bone dragging with 2-bone IK and anatomical limits, orbit camera, symmetry mirroring, undo/redo, JSON pose import/export, and MMD VMD/VPD motion, facial BlendShape, and camera track playback.",
   "author": "Cabbird",
   "license": "AGPL-3.0-only",
   "version": "1.0.0",

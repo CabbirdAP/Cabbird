@@ -6,6 +6,9 @@
 #include "cabbird/sdk/services/unity_metadata.h"
 
 #include "joint_limits.hpp"
+#include "mmd_camera.hpp"
+#include "mmd_morph_map.hpp"
+#include "mmd_retarget.hpp"
 #include "orbit_camera.hpp"
 #include "pose_document.hpp"
 #include "pose_history.hpp"
@@ -14,6 +17,9 @@
 #include "rotation_gizmo.hpp"
 #include "skeleton_filter.hpp"
 #include "unity_pose_runtime.hpp"
+
+#include <shobjidl.h>
+#include <wrl/client.h>
 
 #include <algorithm>
 #include <array>
@@ -54,7 +60,8 @@ using Runtime = cabbird::sdk::il2cpp::Context;
 
 constexpr const char* kSettingsId = "better-pose-settings";
 constexpr float kWheelDeltaUnit = 120.f;
-constexpr float kJointPickRadiusMinPx = 12.f;
+constexpr float kJointPickRadiusMinPx = 10.f;
+constexpr float kJointStackTiePx = 3.f;
 constexpr float kJointDragThresholdPx = 4.f;
 constexpr float kGizmoDragThresholdPx = 1.5f;
 constexpr size_t kTargetsPerPage = 6;
@@ -82,16 +89,43 @@ struct Settings {
     std::string poseFilePath{"pose.json"};
     std::string skeletonFilePath{"skeleton.json"};
 
+    // Persisted MMD import, playback, and camera settings.
+    std::string mmdMotionPath{};
+    std::string mmdCameraPath{};
+    int mmdReferenceMode{0};
+    int mmdIkMode{0};
+    int mmdLoop{1};
+    float mmdSpeed{1.f};
+    int mmdHipOnPelvis{1};
+    int mmdFeetAnchor{0};
+    int mmdTargetLegIk{1};
+    int mmdApplyRoot{1};
+    int mmdLockPlanar{0};
+    int mmdPlayExpressions{1};
+    float mmdAmpMaster{1.f};
+    int mmdCamFollow{1};
+    int mmdCamAutoCut{1};
+    int mmdCamMirror{0};
+    float mmdCamDistScale{1.f};
+    float mmdCamFovOffset{0.f};
+    float mmdCamYawOffset{0.f};
+    float mmdCamOffsetY{0.f};
+
     bool operator==(const Settings&) const = default;
 };
 
-NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(Settings,
+NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(Settings,
     showSkeleton, bodyOnly, showFaceBones, showGizmo, showTooltip,
     enableLimbIk, lockLegPlane, enableJointLimits, jointRadius,
-    pauseAnim, animSpeed, orbitFov, poseFilePath, skeletonFilePath)
+    pauseAnim, animSpeed, orbitFov, poseFilePath, skeletonFilePath,
+    mmdMotionPath, mmdCameraPath, mmdReferenceMode, mmdIkMode, mmdLoop,
+    mmdSpeed, mmdHipOnPelvis, mmdFeetAnchor, mmdTargetLegIk, mmdApplyRoot,
+    mmdLockPlanar, mmdPlayExpressions, mmdAmpMaster, mmdCamFollow,
+    mmdCamAutoCut, mmdCamMirror, mmdCamDistScale, mmdCamFovOffset,
+    mmdCamYawOffset, mmdCamOffsetY)
 
 Json SettingsSchema() {
-    return ObjectSchema({
+    Json schema = ObjectSchema({
         {"showSkeleton", ToggleSchema()},
         {"bodyOnly", ToggleSchema()},
         {"showFaceBones", ToggleSchema()},
@@ -105,8 +139,35 @@ Json SettingsSchema() {
         {"animSpeed", NumberSchema(0.0, 3.0)},
         {"orbitFov", NumberSchema(15.0, 110.0)},
         {"poseFilePath", {{"type", "string"}, {"minLength", 1}, {"maxLength", 260}}},
-        {"skeletonFilePath", {{"type", "string"}, {"minLength", 1}, {"maxLength", 260}}}
+        {"skeletonFilePath", {{"type", "string"}, {"minLength", 1}, {"maxLength", 260}}},
+        {"mmdMotionPath", {{"type", "string"}, {"maxLength", 520}}},
+        {"mmdCameraPath", {{"type", "string"}, {"maxLength", 520}}},
+        {"mmdReferenceMode", {{"type", "integer"}, {"minimum", 0}, {"maximum", 2}}},
+        {"mmdIkMode", {{"type", "integer"}, {"minimum", 0}, {"maximum", 2}}},
+        {"mmdLoop", ToggleSchema()},
+        {"mmdSpeed", NumberSchema(0.05, 3.0)},
+        {"mmdHipOnPelvis", ToggleSchema()},
+        {"mmdFeetAnchor", ToggleSchema()},
+        {"mmdTargetLegIk", ToggleSchema()},
+        {"mmdApplyRoot", ToggleSchema()},
+        {"mmdLockPlanar", ToggleSchema()},
+        {"mmdPlayExpressions", ToggleSchema()},
+        {"mmdAmpMaster", NumberSchema(0.0, 2.0)},
+        {"mmdCamFollow", ToggleSchema()},
+        {"mmdCamAutoCut", ToggleSchema()},
+        {"mmdCamMirror", ToggleSchema()},
+        {"mmdCamDistScale", NumberSchema(0.1, 5.0)},
+        {"mmdCamFovOffset", NumberSchema(-60.0, 60.0)},
+        {"mmdCamYawOffset", NumberSchema(-180.0, 180.0)},
+        {"mmdCamOffsetY", NumberSchema(-3.0, 3.0)}
     });
+    // Keep only legacy keys required so pre-MMD saved configs upgrade cleanly without reset.
+    schema["required"] = Json::array({
+        "showSkeleton", "bodyOnly", "showFaceBones", "showGizmo", "showTooltip",
+        "enableLimbIk", "lockLegPlane", "enableJointLimits", "jointRadius",
+        "pauseAnim", "animSpeed", "orbitFov", "poseFilePath", "skeletonFilePath"
+    });
+    return schema;
 }
 
 bool ValidSettings(const Settings& s) {
@@ -116,7 +177,17 @@ bool ValidSettings(const Settings& s) {
            Range(s.jointRadius, 3.0, 14.0) && Toggle(s.pauseAnim) &&
            Range(s.animSpeed, 0.0, 3.0) && Range(s.orbitFov, 15.0, 110.0) &&
            !s.poseFilePath.empty() && s.poseFilePath.size() <= 260 &&
-           !s.skeletonFilePath.empty() && s.skeletonFilePath.size() <= 260;
+           !s.skeletonFilePath.empty() && s.skeletonFilePath.size() <= 260 &&
+           s.mmdMotionPath.size() <= 520 && s.mmdCameraPath.size() <= 520 &&
+           s.mmdReferenceMode >= 0 && s.mmdReferenceMode <= 2 &&
+           s.mmdIkMode >= 0 && s.mmdIkMode <= 2 &&
+           Toggle(s.mmdLoop) && Range(s.mmdSpeed, 0.05, 3.0) &&
+           Toggle(s.mmdHipOnPelvis) && Toggle(s.mmdFeetAnchor) && Toggle(s.mmdTargetLegIk) &&
+           Toggle(s.mmdApplyRoot) && Toggle(s.mmdLockPlanar) && Toggle(s.mmdPlayExpressions) &&
+           Range(s.mmdAmpMaster, 0.0, 2.0) &&
+           Toggle(s.mmdCamFollow) && Toggle(s.mmdCamAutoCut) && Toggle(s.mmdCamMirror) &&
+           Range(s.mmdCamDistScale, 0.1, 5.0) && Range(s.mmdCamFovOffset, -60.0, 60.0) &&
+           Range(s.mmdCamYawOffset, -180.0, 180.0) && Range(s.mmdCamOffsetY, -3.0, 3.0);
 }
 
 uint64_t NowMs() noexcept {
@@ -173,6 +244,20 @@ struct PendingCommands {
     bool wantPause{};
     bool hasSpeedEdit{};
     float wantSpeed{1.f};
+
+    // MMD motion & camera playback commands.
+    bool mmdTogglePlay{};
+    bool mmdSetPlaying{};
+    bool mmdWantPlaying{};
+    bool mmdStop{};
+    bool mmdUnload{};
+    bool mmdHasSeek{};
+    double mmdSeekFrame{};
+    bool mmdSyncSettings{};
+    bool mmdCamHasEnable{};
+    bool mmdCamWantEnable{};
+    bool mmdCamClear{};
+    bool mmdCamReanchor{};
 };
 
 // Active Game-thread skeleton bone entry (owns GC handle).
@@ -196,7 +281,16 @@ struct GameBone {
 
 struct SavedSmrState {
     CabbirdIl2CppGCHandleV1 smrHandle{};
+    Object* framePtr{};
     bool origUpdateWhenOffscreen{};
+    bool modified{};
+};
+
+struct GameBlendShape {
+    int smrIndex{-1};
+    int shapeIndex{-1};
+    std::string name;
+    float originalWeight{};
     bool modified{};
 };
 
@@ -219,7 +313,7 @@ struct DragState {
     int gizmoAxis{kGizmoAxisNone};
     Vec2 startMouse{};
     Vec2 lastMouse{};
-    Vec2 gizmoTangent{1.f, 0.f};
+    GizmoDragTracker gizmoDrag{};
     RootArrowPick rootArrowPick{};
     Vec3 dragPlanePoint{};
     Vec3 dragPlaneNormal{0.0, 0.0, 1.0};
@@ -243,11 +337,58 @@ struct DragState {
     Vec3 startPoleHint{};
 };
 
+enum class WorkerJobKind : int {
+    ExportPose = 0,
+    ImportPose,
+    ExportSkeleton,
+    BrowseMmdMotion,
+    LoadMmdMotion,
+    BrowseMmdCamera,
+    LoadMmdCamera
+};
+
 struct WorkerIoJob {
-    bool isImport{};
-    bool isSkeletonExport{};
+    WorkerJobKind kind{WorkerJobKind::ExportPose};
     std::string path;
     std::string jsonPayload;
+    int mmdReferenceMode{0};
+    mmd::RetargetOptions mmdOptions{};
+};
+
+struct PendingMmdMotionResult {
+    std::shared_ptr<mmd::LoadedMotion> motion;
+    std::vector<mmd::MorphBinding> morphBindings;
+    uint64_t builtForTargetId{};
+    size_t builtForBoneCount{};
+};
+
+struct PendingMmdCameraResult {
+    std::vector<mmd::VmdCameraKey> keys;
+    std::string displayName;
+};
+
+struct MmdPlaybackState {
+    std::shared_ptr<const mmd::LoadedMotion> motion;
+    std::vector<mmd::MorphBinding> morphBindings;
+    std::vector<float> morphWeightsBuf;
+    std::vector<uint8_t> morphTouchedBuf;
+    bool playing{};
+    double currentFrame{};
+    double camOnlyFrame{};
+    std::chrono::steady_clock::time_point lastTick{};
+    bool hasLastTick{};
+    bool loop{true};
+    float speed{1.f};
+    bool playExpressions{true};
+    mmd::MotionAmplitude amplitude{};
+    mmd::MotionTravel travel{};
+
+    std::vector<mmd::VmdCameraKey> cameraKeys;
+    std::string cameraDisplayName;
+    mmd::MmdCameraSettings camSettings{};
+    mmd::MmdCameraAnchor camAnchor{};
+    Vec3 lastAuthoredRootChar{};
+    Vec3 lastAppliedRootChar{};
 };
 
 struct Context {
@@ -255,6 +396,7 @@ struct Context {
 
     cabbird::sdk::Localizer text;
     ConfigStore config;
+    std::string pluginDir;
     std::string writableStateDir;
 
     const CabbirdCoreServiceV1* core{};
@@ -296,6 +438,18 @@ struct Context {
     std::mutex ioMutex;
     std::vector<WorkerIoJob> ioQueue;
 
+    // Cross-thread MMD Worker <-> Game <-> Render channels.
+    std::mutex mmdMutex;
+    uint64_t targetSkelTargetId{};
+    mmd::TargetSkeletonInput targetSkelForMmd;
+    std::vector<mmd::MorphTargetSlot> morphTargetSlotsForMmd;
+    std::optional<PendingMmdMotionResult> pendingMmdMotion;
+    std::optional<PendingMmdCameraResult> pendingMmdCamera;
+    std::optional<std::string> pickedMotionPath;
+    std::optional<std::string> pickedCameraPath;
+    std::atomic_bool mmdLoading{};
+    std::atomic_bool fileDialogOpen{};
+
     // Game-domain state (touched ONLY on Game thread).
     UnityBindings unity;
     std::chrono::steady_clock::time_point nextBindAttempt{};
@@ -312,11 +466,13 @@ struct Context {
     CabbirdIl2CppGCHandleV1 activePlayableAnimHandle{};
     CabbirdIl2CppGCHandleV1 activeAnimatorHandle{};
     std::vector<SavedSmrState> activeSmrs;
+    std::vector<GameBlendShape> blendShapes;
     std::vector<GameBone> bones;
     int rootBoneIndex{-1};
     Vec3 rootOffset{};
     Vec3 capturedRootLocalPos{};
     Quat rootParentWorldRot{Quat::Identity()};
+    Quat goToRootParentRot{Quat::Identity()};
     Vec3 rootForward{0.0, 0.0, 1.0};
     Vec3 rootRight{1.0, 0.0, 0.0};
     bool useBindBase{};
@@ -328,6 +484,8 @@ struct Context {
     float savedAnimatorSpeed{1.f};
     bool hasSavedAnimatorSpeed{};
 
+    MmdPlaybackState mmd;
+
     Object* frameCameraPtr{};
     Object* frameCameraTfPtr{};
     Object* frameRootParentTfPtr{};
@@ -335,6 +493,9 @@ struct Context {
 
     bool orbitEnabled{};
     OrbitCameraState orbit{};
+    OrbitCameraState savedOrbitInitial{};
+    bool hasSavedOrbitInitial{};
+    float lastViewportH{1080.f};
     CabbirdIl2CppGCHandleV1 disabledBrainHandle{};
     bool disabledBrainActive{};
     float savedCameraFov{45.f};
@@ -343,6 +504,7 @@ struct Context {
 
     // Render-thread UI & interaction state (touched ONLY in on_draw).
     RenderSnapshot renderSnap;
+    std::vector<uint32_t> boneDescendantCount;
     int selectedBone{-1};
     int hoveredBone{-1};
     int hoveredGizmoAxis{kGizmoAxisNone};
@@ -353,6 +515,8 @@ struct Context {
     char boneSearchBuf[128]{};
     char posePathBuf[260]{};
     char skeletonPathBuf[260]{};
+    char mmdMotionPathBuf[520]{};
+    char mmdCameraPathBuf[520]{};
     bool pathBufsInitialized{};
     bool showResetConfirm{};
     DragState drag;
@@ -364,6 +528,7 @@ struct Context {
     bool prevMiddleDown{};
     bool prevCtrlZ{};
     bool prevCtrlY{};
+    bool prevSpaceDown{};
     uint64_t lastInputSeq{};
     std::vector<CabbirdUiScreenPrimitiveV1> drawPrims;
     std::vector<GizmoScreenSegment> gizmoSegs;
@@ -434,7 +599,8 @@ bool IsClassOrSubclass(const Runtime& rt, CabbirdIl2CppClassV1* cls, CabbirdIl2C
     return false;
 }
 
-void RestoreOrbitCamera(Context& c, const Runtime& rt) {
+void ReleaseCameraTakeoverIfIdle(Context& c, const Runtime& rt) {
+    if (c.orbitEnabled || c.mmd.camSettings.enabled) return;
     const auto& api = rt.Functions();
     if (c.disabledBrainActive && c.disabledBrainHandle && c.unity.behaviourSetEnabled) {
         Object* brain = api.il2cpp_gchandle_get_target(c.disabledBrainHandle);
@@ -459,14 +625,78 @@ void RestoreOrbitCamera(Context& c, const Runtime& rt) {
     }
     FreeHandle(api, c.modifiedCameraHandle);
     c.hasSavedCameraFov = false;
+}
+
+void EnsureCameraTakeover(Context& c, const Runtime& rt, Object* cam) {
+    if (!cam || !c.unity.IsUnityObjectAlive(rt, cam)) return;
+    const auto& api = rt.Functions();
+    // Always disable CinemachineBrain while Orbit Camera or MMD Camera owns MainCamera, because
+    // Cinemachine can update in LateUpdate/onPreCull after RunAfterLateUpdate and overwrite our writes.
+    if (!c.disabledBrainActive && c.unity.cinemachineBrainTypeHandle && c.unity.goGetComponent1 &&
+        c.unity.behaviourGetEnabled && c.unity.behaviourSetEnabled) {
+        Object* camGo = nullptr;
+        if (rt.Invoke(c.unity.compGetGameObject, cam, nullptr, &camGo) && camGo) {
+            Object* brainType = api.il2cpp_gchandle_get_target(c.unity.cinemachineBrainTypeHandle);
+            Object* brain = nullptr;
+            void* args[]{brainType};
+            if (brainType && rt.Invoke(c.unity.goGetComponent1, camGo, args, &brain) && brain &&
+                c.unity.IsUnityObjectAlive(rt, brain)) {
+                bool wasEnabled = false;
+                if (UnityBindings::InvokeValue(rt, c.unity.behaviourGetEnabled, brain, nullptr, wasEnabled) && wasEnabled) {
+                    bool disable = false;
+                    void* setArgs[]{&disable};
+                    Object* ret = nullptr;
+                    if (rt.Invoke(c.unity.behaviourSetEnabled, brain, setArgs, &ret)) {
+                        c.disabledBrainHandle = api.il2cpp_gchandle_new(brain, false);
+                        c.disabledBrainActive = true;
+                    }
+                }
+            }
+        }
+    }
+    if (!c.hasSavedCameraFov && c.unity.camGetFov) {
+        float fov = 45.f;
+        if (UnityBindings::InvokeValue(rt, c.unity.camGetFov, cam, nullptr, fov) && std::isfinite(fov)) {
+            c.savedCameraFov = fov;
+            c.hasSavedCameraFov = true;
+            FreeHandle(api, c.modifiedCameraHandle);
+            c.modifiedCameraHandle = api.il2cpp_gchandle_new(cam, false);
+        }
+    }
+}
+
+void RestoreOrbitCamera(Context& c, const Runtime& rt) {
+    c.hasSavedOrbitInitial = false;
     c.orbit.initialized = false;
     c.orbitEnabled = false;
+    ReleaseCameraTakeoverIfIdle(c, rt);
+}
+
+void RestoreBlendShapes(Context& c, const Runtime& rt) {
+    if (!c.unity.smrSetBlendShapeWeight || c.blendShapes.empty()) return;
+    const auto& api = rt.Functions();
+    for (auto& bs : c.blendShapes) {
+        if (!bs.modified) continue;
+        if (bs.smrIndex < 0 || static_cast<size_t>(bs.smrIndex) >= c.activeSmrs.size()) continue;
+        Object* smr = c.activeSmrs[static_cast<size_t>(bs.smrIndex)].smrHandle
+                          ? api.il2cpp_gchandle_get_target(c.activeSmrs[static_cast<size_t>(bs.smrIndex)].smrHandle)
+                          : nullptr;
+        if (smr && c.unity.IsUnityObjectAlive(rt, smr)) {
+            int32_t idx = bs.shapeIndex;
+            float w = bs.originalWeight;
+            void* args[]{&idx, &w};
+            Object* ret = nullptr;
+            rt.Invoke(c.unity.smrSetBlendShapeWeight, smr, args, &ret);
+        }
+        bs.modified = false;
+    }
 }
 
 void RestoreActiveAnimationAndBones(Context& c, const Runtime& rt, bool restoreBones) {
     const auto& api = rt.Functions();
 
     if (restoreBones) {
+        RestoreBlendShapes(c, rt);
         for (size_t i = 0; i < c.bones.size(); ++i) {
             auto& b = c.bones[i];
             if (!b.transformHandle) continue;
@@ -527,6 +757,12 @@ void ClearActiveSkeleton(Context& c, const Runtime& rt, bool restoreState) {
     if (restoreState) {
         RestoreActiveAnimationAndBones(c, rt, true);
     }
+    c.mmd.motion.reset();
+    c.mmd.morphBindings.clear();
+    c.mmd.playing = false;
+    c.mmd.currentFrame = 0.0;
+    c.mmd.camAnchor.valid = false;
+    c.blendShapes.clear();
     for (auto& b : c.bones) FreeHandle(api, b.transformHandle);
     c.bones.clear();
     for (auto& s : c.activeSmrs) FreeHandle(api, s.smrHandle);
@@ -536,8 +772,15 @@ void ClearActiveSkeleton(Context& c, const Runtime& rt, bool restoreState) {
     FreeHandle(api, c.activeAnimatorHandle);
     c.rootBoneIndex = -1;
     c.rootOffset = {};
+    c.goToRootParentRot = Quat::Identity();
     c.frameTargetAlive = false;
     c.frameRootParentTfPtr = nullptr;
+    {
+        std::scoped_lock lock(c.mmdMutex);
+        c.targetSkelTargetId = 0;
+        c.targetSkelForMmd = {};
+        c.morphTargetSlotsForMmd.clear();
+    }
 }
 
 void ClearTargetList(Context& c, const CabbirdIl2CppApiV1& api) noexcept {
@@ -817,9 +1060,57 @@ bool LoadSkeletonFromTarget(Context& c, const Runtime& rt, const TargetEntry& ta
     const auto smrs = GetChildSkinnedMeshes(c, rt, go);
     if (smrs.empty()) return false;
 
+    Object* goTransform = nullptr;
+    if (c.unity.goGetTransform) {
+        rt.Invoke(c.unity.goGetTransform, go, nullptr, &goTransform);
+    }
+    const auto goTfKey = reinterpret_cast<std::uintptr_t>(goTransform);
+
+    auto readLocalToWorld = [&](Object* tf) -> Mat4 {
+        if (!tf || !c.unity.IsUnityObjectAlive(rt, tf)) return Mat4::Identity();
+        if (c.unity.tfGetLocalToWorld) {
+            UnityMat4 raw{};
+            if (UnityBindings::InvokeValue(rt, c.unity.tfGetLocalToWorld, tf, nullptr, raw)) {
+                const Mat4 m = Mat4::FromUnityColumnMajor(raw.m);
+                if (m.IsFinite()) return m;
+            }
+        }
+        UnityVec3 p{};
+        UnityQuat r{};
+        UnityBindings::InvokeValue(rt, c.unity.tfGetPosition, tf, nullptr, p);
+        UnityBindings::InvokeValue(rt, c.unity.tfGetRotation, tf, nullptr, r);
+        return Mat4::FromTrs(FromUnity(p), FromUnity(r));
+    };
+
+    Mat4 goWorldToLocal = Mat4::Identity();
+    if (goTransform && c.unity.IsUnityObjectAlive(rt, goTransform)) {
+        bool okW2L = false;
+        if (c.unity.tfGetWorldToLocal) {
+            UnityMat4 raw{};
+            if (UnityBindings::InvokeValue(rt, c.unity.tfGetWorldToLocal, goTransform, nullptr, raw)) {
+                const Mat4 m = Mat4::FromUnityColumnMajor(raw.m);
+                if (m.IsFinite()) {
+                    goWorldToLocal = m;
+                    okW2L = true;
+                }
+            }
+        }
+        if (!okW2L) {
+            Mat4 inv;
+            if (readLocalToWorld(goTransform).Inverse(inv)) goWorldToLocal = inv;
+        }
+    }
+
     std::vector<Object*> rawBones;
     std::unordered_map<std::uintptr_t, size_t> ptrToRaw;
-    std::unordered_map<std::uintptr_t, Mat4> ptrBindPose;
+    struct RawSmrBindData {
+        Object* smrTf{};
+        Mat4 smrInGo{};
+        std::vector<std::pair<std::uintptr_t, Mat4>> entries;
+    };
+    std::vector<RawSmrBindData> rawSmrBinds;
+    std::unordered_set<std::uintptr_t> smrAncestors;
+    if (goTfKey) smrAncestors.insert(goTfKey);
 
     auto registerBone = [&](Object* tf) -> size_t {
         const auto key = reinterpret_cast<std::uintptr_t>(tf);
@@ -834,6 +1125,23 @@ bool LoadSkeletonFromTarget(Context& c, const Runtime& rt, const TargetEntry& ta
     size_t maxSmrBones = 0;
 
     for (Object* smr : smrs) {
+        Object* smrTf = nullptr;
+        if (rt.Invoke(c.unity.compGetTransform, smr, nullptr, &smrTf) && smrTf &&
+            c.unity.IsUnityObjectAlive(rt, smrTf)) {
+            Object* cur = smrTf;
+            for (int depth = 0; cur && depth < 16; ++depth) {
+                const auto k = reinterpret_cast<std::uintptr_t>(cur);
+                smrAncestors.insert(k);
+                if (k == goTfKey) break;
+                Object* par = nullptr;
+                if (!rt.Invoke(c.unity.tfGetParent, cur, nullptr, &par) || !par ||
+                    !c.unity.IsUnityObjectAlive(rt, par)) {
+                    break;
+                }
+                cur = par;
+            }
+        }
+
         Object* bonesArr = nullptr;
         if (!rt.Invoke(c.unity.smrGetBones, smr, nullptr, &bonesArr) || !bonesArr) continue;
         const uint32_t boneLen = std::min(api.il2cpp_array_length(bonesArr), 1024u);
@@ -859,31 +1167,31 @@ bool LoadSkeletonFromTarget(Context& c, const Runtime& rt, const TargetEntry& ta
             }
         }
 
+        RawSmrBindData smrData;
+        smrData.smrTf = smrTf;
+        smrData.smrInGo = Mat4::Multiply(goWorldToLocal, readLocalToWorld(smrTf));
+
         for (uint32_t i = 0; i < boneLen; ++i) {
             Object* tf = nullptr;
             if (!rt.ArrayReferenceAt(bonesArr, i, &tf) || !tf || !c.unity.IsUnityObjectAlive(rt, tf)) continue;
             registerBone(tf);
             if (bindArr && i < bindLen) {
-                const auto key = reinterpret_cast<std::uintptr_t>(tf);
-                if (ptrBindPose.find(key) == ptrBindPose.end()) {
-                    UnityMat4 rawM{};
-                    const auto addr = reinterpret_cast<std::uintptr_t>(bindArr) + elemBase +
-                                      static_cast<size_t>(i) * sizeof(UnityMat4);
-                    if (seh::ReadMat4(addr, rawM)) {
-                        const Mat4 m = Mat4::FromUnityColumnMajor(rawM.m);
-                        if (m.IsFinite()) ptrBindPose.emplace(key, m);
+                UnityMat4 rawM{};
+                const auto addr = reinterpret_cast<std::uintptr_t>(bindArr) + elemBase +
+                                  static_cast<size_t>(i) * sizeof(UnityMat4);
+                if (seh::ReadMat4(addr, rawM)) {
+                    const Mat4 m = Mat4::FromUnityColumnMajor(rawM.m);
+                    if (m.IsFinite()) {
+                        smrData.entries.emplace_back(reinterpret_cast<std::uintptr_t>(tf), m);
                     }
                 }
             }
         }
+        if (!smrData.entries.empty()) rawSmrBinds.push_back(std::move(smrData));
     }
 
     if (preferredRootBone) registerBone(preferredRootBone);
     if (rawBones.empty()) return false;
-
-    Object* goTransform = nullptr;
-    rt.Invoke(c.unity.compGetTransform, go, nullptr, &goTransform);
-    const auto goTfKey = reinterpret_cast<std::uintptr_t>(goTransform);
 
     const size_t initialCount = rawBones.size();
     for (size_t i = 0; i < initialCount; ++i) {
@@ -907,6 +1215,23 @@ bool LoadSkeletonFromTarget(Context& c, const Runtime& rt, const TargetEntry& ta
         }
         if (reachedExisting) {
             for (Object* bridge : chain) registerBone(bridge);
+        }
+    }
+
+    // Also include unskinned skeleton-branch root ancestors (e.g. Bip001/Root above Pelvis) that are
+    // strictly below the SMR/Model container so animated root containers are straightened in Bind Pose.
+    if (preferredRootBone) {
+        Object* cur = preferredRootBone;
+        for (int hops = 0; cur && hops < 4; ++hops) {
+            Object* parent = nullptr;
+            if (!rt.Invoke(c.unity.tfGetParent, cur, nullptr, &parent) || !parent ||
+                !c.unity.IsUnityObjectAlive(rt, parent)) {
+                break;
+            }
+            const auto pKey = reinterpret_cast<std::uintptr_t>(parent);
+            if (smrAncestors.count(pKey) != 0) break;
+            registerBone(parent);
+            cur = parent;
         }
     }
 
@@ -964,6 +1289,7 @@ bool LoadSkeletonFromTarget(Context& c, const Runtime& rt, const TargetEntry& ta
     for (Object* smr : smrs) {
         SavedSmrState st;
         st.smrHandle = api.il2cpp_gchandle_new(smr, false);
+        st.framePtr = smr;
         if (c.unity.smrGetUpdateWhenOffscreen && c.unity.smrSetUpdateWhenOffscreen) {
             bool orig = false;
             if (UnityBindings::InvokeValue(rt, c.unity.smrGetUpdateWhenOffscreen, smr, nullptr, orig)) {
@@ -978,16 +1304,49 @@ bool LoadSkeletonFromTarget(Context& c, const Runtime& rt, const TargetEntry& ta
                 }
             }
         }
+        const int smrIdx = static_cast<int>(c.activeSmrs.size());
         c.activeSmrs.push_back(st);
+
+        // Discover facial/body BlendShapes on this SkinnedMeshRenderer for MMD morph playback.
+        if (c.unity.smrGetSharedMesh && c.unity.meshGetBlendShapeCount && c.unity.meshGetBlendShapeName &&
+            c.unity.smrGetBlendShapeWeight && c.unity.smrSetBlendShapeWeight) {
+            Object* mesh = nullptr;
+            if (rt.Invoke(c.unity.smrGetSharedMesh, smr, nullptr, &mesh) && mesh &&
+                c.unity.IsUnityObjectAlive(rt, mesh)) {
+                int32_t bsCount = 0;
+                if (UnityBindings::InvokeValue(rt, c.unity.meshGetBlendShapeCount, mesh, nullptr, bsCount) &&
+                    bsCount > 0) {
+                    if (!c.unity.nativeBlendVerified && !c.unity.nativeBlendRejected) {
+                        c.unity.VerifyBlendShapeNativeAbi(rt, smr);
+                    }
+                    const int32_t capped = std::min<int32_t>(bsCount, 512);
+                    for (int32_t si = 0; si < capped; ++si) {
+                        int32_t idxArg = si;
+                        void* nameArgs[]{&idxArg};
+                        Object* nameObj = nullptr;
+                        if (!rt.Invoke(c.unity.meshGetBlendShapeName, mesh, nameArgs, &nameObj) || !nameObj) {
+                            continue;
+                        }
+                        std::string bsName = rt.ReadString(nameObj).value_or(std::string{});
+                        if (bsName.empty()) continue;
+                        float initWeight = 0.f;
+                        UnityBindings::InvokeValue(rt, c.unity.smrGetBlendShapeWeight, smr, nameArgs, initWeight);
+                        if (!std::isfinite(initWeight)) initWeight = 0.f;
+                        c.blendShapes.push_back({smrIdx, si, std::move(bsName), initWeight, false});
+                    }
+                }
+            }
+        }
     }
 
     c.bones.resize(count);
     std::vector<int> parents(count, -1);
     std::vector<std::string> names(count);
+    std::vector<Vec3> capturedLocalPos(count);
+    std::vector<Vec3> capturedLocalScale(count, Vec3{1.0, 1.0, 1.0});
     std::vector<Vec3> restWorldPos(count);
     std::vector<Quat> restWorldRot(count, Quat::Identity());
-    std::vector<Mat4> bindPoses(count);
-    std::vector<bool> hasBindPose(count, false);
+    std::vector<Mat4> rootParentInGo(count, Mat4::Identity());
 
     int preferredRootSorted = -1;
     int firstRootSorted = -1;
@@ -1002,31 +1361,46 @@ bool LoadSkeletonFromTarget(Context& c, const Runtime& rt, const TargetEntry& ta
         const int rp = rawParent[order[i]];
         b.parent = (rp >= 0) ? rawToSorted[static_cast<size_t>(rp)] : -1;
 
-        UnityVec3 lp{}, wp{};
+        UnityVec3 lp{}, wp{}, ls{1.f, 1.f, 1.f};
         UnityQuat lr{}, wr{};
         if (UnityBindings::InvokeValue(rt, c.unity.tfGetLocalPosition, tf, nullptr, lp)) b.capturedLocalPos = FromUnity(lp);
         if (UnityBindings::InvokeValue(rt, c.unity.tfGetLocalRotation, tf, nullptr, lr)) b.capturedLocalRot = FromUnity(lr);
         if (UnityBindings::InvokeValue(rt, c.unity.tfGetPosition, tf, nullptr, wp)) b.restWorldPos = FromUnity(wp);
         if (UnityBindings::InvokeValue(rt, c.unity.tfGetRotation, tf, nullptr, wr)) b.restWorldRot = FromUnity(wr);
+        if (c.unity.tfGetLocalScale && UnityBindings::InvokeValue(rt, c.unity.tfGetLocalScale, tf, nullptr, ls)) {
+            const Vec3 s = FromUnity(ls);
+            if (s.IsFinite() && s.x > 1e-5 && s.y > 1e-5 && s.z > 1e-5) capturedLocalScale[i] = s;
+        }
+
+        if (b.parent < 0) {
+            Object* extParent = nullptr;
+            if (rt.Invoke(c.unity.tfGetParent, tf, nullptr, &extParent) && extParent &&
+                c.unity.IsUnityObjectAlive(rt, extParent)) {
+                rootParentInGo[i] = Mat4::Multiply(goWorldToLocal, readLocalToWorld(extParent));
+            }
+        }
 
         b.isFaceBone = IsFaceBoneName(b.name);
         b.isBodyBone = IsBodyBoneName(b.name, false);
 
         parents[i] = b.parent;
         names[i] = b.name;
+        capturedLocalPos[i] = b.capturedLocalPos;
         restWorldPos[i] = b.restWorldPos;
         restWorldRot[i] = b.restWorldRot;
 
-        const auto bpIt = ptrBindPose.find(reinterpret_cast<std::uintptr_t>(tf));
-        if (bpIt != ptrBindPose.end()) {
-            bindPoses[i] = bpIt->second;
-            hasBindPose[i] = true;
-        }
         if (tf == preferredRootBone) preferredRootSorted = static_cast<int>(i);
         if (b.parent < 0 && firstRootSorted < 0) firstRootSorted = static_cast<int>(i);
     }
 
-    c.rootBoneIndex = (preferredRootSorted >= 0) ? preferredRootSorted : (firstRootSorted >= 0 ? firstRootSorted : 0);
+    // Prefer top-most skeleton root (so moving/resetting root owns the whole skeleton cleanly).
+    int topRootSorted = preferredRootSorted;
+    if (topRootSorted >= 0) {
+        while (c.bones[static_cast<size_t>(topRootSorted)].parent >= 0) {
+            topRootSorted = c.bones[static_cast<size_t>(topRootSorted)].parent;
+        }
+    }
+    c.rootBoneIndex = (topRootSorted >= 0) ? topRootSorted : (firstRootSorted >= 0 ? firstRootSorted : 0);
     c.capturedRootLocalPos = c.bones[static_cast<size_t>(c.rootBoneIndex)].capturedLocalPos;
     c.rootOffset = {};
 
@@ -1040,15 +1414,96 @@ bool LoadSkeletonFromTarget(Context& c, const Runtime& rt, const TargetEntry& ta
     c.rootForward = charWorldRot.Rotate({0.0, 0.0, 1.0}).Normalized({0.0, 0.0, 1.0});
     c.rootRight = charWorldRot.Rotate({1.0, 0.0, 0.0}).Normalized({1.0, 0.0, 0.0});
 
+    c.goToRootParentRot = Quat::Identity();
+    if (c.rootBoneIndex >= 0 && static_cast<size_t>(c.rootBoneIndex) < count) {
+        Object* rootTf = c.bones[static_cast<size_t>(c.rootBoneIndex)].framePtr;
+        if (rootTf) {
+            Object* rootParentTf = nullptr;
+            if (rt.Invoke(c.unity.tfGetParent, rootTf, nullptr, &rootParentTf) && rootParentTf &&
+                c.unity.IsUnityObjectAlive(rt, rootParentTf)) {
+                UnityQuat pr{};
+                if (UnityBindings::InvokeValue(rt, c.unity.tfGetRotation, rootParentTf, nullptr, pr)) {
+                    c.rootParentWorldRot = FromUnity(pr);
+                    c.goToRootParentRot = (charWorldRot.Inverse() * c.rootParentWorldRot).Normalized();
+                }
+            }
+        }
+    }
+
+    // Build per-SMR bindpose sets indexed by sorted bone index and compute unified bind transforms.
+    std::vector<SmrBindPoseSet> smrSets;
+    smrSets.reserve(rawSmrBinds.size());
+    for (const auto& rs : rawSmrBinds) {
+        SmrBindPoseSet set;
+        set.smrInGo = rs.smrInGo;
+        // Detect if this SMR transform is parented under an animated skeleton bone.
+        Object* cur = rs.smrTf;
+        for (int depth = 0; cur && depth < 16; ++depth) {
+            const auto k = reinterpret_cast<std::uintptr_t>(cur);
+            if (ptrToRaw.find(k) != ptrToRaw.end()) {
+                set.smrUnderBone = true;
+                break;
+            }
+            if (k == goTfKey) break;
+            Object* par = nullptr;
+            if (!rt.Invoke(c.unity.tfGetParent, cur, nullptr, &par) || !par ||
+                !c.unity.IsUnityObjectAlive(rt, par)) {
+                break;
+            }
+            cur = par;
+        }
+        set.entries.reserve(rs.entries.size());
+        for (const auto& [tfKey, mat] : rs.entries) {
+            const auto it = ptrToRaw.find(tfKey);
+            if (it == ptrToRaw.end()) continue;
+            const int sortedIdx = rawToSorted[it->second];
+            if (sortedIdx >= 0 && static_cast<size_t>(sortedIdx) < count) {
+                set.entries.emplace_back(sortedIdx, mat);
+            }
+        }
+        if (!set.entries.empty()) smrSets.push_back(std::move(set));
+    }
+
     std::vector<Quat> bindLocalRots;
-    std::vector<bool> bindValid;
-    ComputeBindLocalRotations(parents, bindPoses, hasBindPose, bindLocalRots, bindValid);
+    std::vector<bool> bindRotValid;
+    std::vector<Vec3> bindLocalPos;
+    std::vector<bool> bindPosValid;
+    ComputeBindLocalTransforms(parents, capturedLocalPos, capturedLocalScale, rootParentInGo,
+                               smrSets, bindLocalRots, bindRotValid, bindLocalPos, bindPosValid);
     for (size_t i = 0; i < count; ++i) {
         c.bones[i].bindLocalRot = bindLocalRots[i];
-        c.bones[i].hasBindLocalRot = bindValid[i];
+        c.bones[i].hasBindLocalRot = bindRotValid[i];
         c.bones[i].limit = BuildJointLimit(static_cast<int>(i), names, parents,
                                            restWorldPos, restWorldRot, c.rootForward, c.rootRight);
         c.bones[i].ikChain = ResolveIkChain(static_cast<int>(i), names, parents);
+    }
+
+    // Publish an immutable target skeleton + BlendShape snapshot for Worker-thread MMD retargeting.
+    {
+        mmd::TargetSkeletonInput skel;
+        skel.targetName = c.activeTargetName;
+        skel.rootBoneIndex = c.rootBoneIndex;
+        skel.goToRootParentRot = c.goToRootParentRot;
+        skel.bones.reserve(count);
+        for (size_t i = 0; i < count; ++i) {
+            const auto& b = c.bones[i];
+            skel.bones.push_back({
+                b.name, b.parent,
+                bindPosValid[i] ? bindLocalPos[i] : b.capturedLocalPos,
+                b.hasBindLocalRot ? b.bindLocalRot : b.capturedLocalRot,
+                b.hasBindLocalRot,
+                capturedLocalScale[i]
+            });
+        }
+        std::vector<mmd::MorphTargetSlot> slots;
+        slots.reserve(c.blendShapes.size());
+        for (const auto& bs : c.blendShapes) {
+            slots.push_back({bs.smrIndex, bs.shapeIndex, bs.name});
+        }
+        std::scoped_lock lock(c.mmdMutex);
+        c.targetSkelTargetId = c.activeTargetId;
+        c.targetSkelForMmd = std::move(skel);
+        c.morphTargetSlotsForMmd = std::move(slots);
     }
 
     c.frameTargetAlive = true;
@@ -1056,6 +1511,7 @@ bool LoadSkeletonFromTarget(Context& c, const Runtime& rt, const TargetEntry& ta
 }
 
 bool HasActivePoseEdits(const Context& c) noexcept {
+    if (c.mmd.motion != nullptr) return true;
     if (c.pauseAnim || c.useBindBase) return true;
     if (c.rootOffset.LengthSq() > 1e-10) return true;
     for (const auto& b : c.bones) {
@@ -1064,58 +1520,296 @@ bool HasActivePoseEdits(const Context& c) noexcept {
     return false;
 }
 
+void SyncMmdSettingsToGame(Context& c) {
+    Settings copy;
+    {
+        std::scoped_lock lock(c.settingsMutex);
+        copy = c.settings;
+    }
+    c.mmd.loop = (copy.mmdLoop != 0);
+    c.mmd.speed = std::clamp(copy.mmdSpeed, 0.05f, 3.f);
+    c.mmd.playExpressions = (copy.mmdPlayExpressions != 0);
+    c.mmd.amplitude.master = std::clamp(copy.mmdAmpMaster, 0.f, 2.f);
+    c.mmd.travel.applyRootMotion = (copy.mmdApplyRoot != 0);
+    c.mmd.travel.lockPlanar = (copy.mmdLockPlanar != 0);
+    c.mmd.camSettings.followCharacter = (copy.mmdCamFollow != 0);
+    c.mmd.camSettings.autoCut = (copy.mmdCamAutoCut != 0);
+    c.mmd.camSettings.mirror = (copy.mmdCamMirror != 0);
+    c.mmd.camSettings.distanceScale = std::clamp(copy.mmdCamDistScale, 0.1f, 5.f);
+    c.mmd.camSettings.fovOffsetDeg = std::clamp(copy.mmdCamFovOffset, -60.f, 60.f);
+    c.mmd.camSettings.yawOffsetDeg = std::clamp(copy.mmdCamYawOffset, -180.f, 180.f);
+    c.mmd.camSettings.offsetY = std::clamp(copy.mmdCamOffsetY, -3.f, 3.f);
+}
+
+void CaptureMmdCameraAnchor(Context& c, const Runtime& rt) {
+    const auto& api = rt.Functions();
+    Object* anchorTf = nullptr;
+    Object* go = c.activeGoHandle ? api.il2cpp_gchandle_get_target(c.activeGoHandle) : nullptr;
+    if (go && c.unity.IsUnityObjectAlive(rt, go) && c.unity.goGetTransform) {
+        if (!rt.Invoke(c.unity.goGetTransform, go, nullptr, &anchorTf) || !anchorTf ||
+            !c.unity.IsUnityObjectAlive(rt, anchorTf)) {
+            anchorTf = nullptr;
+        }
+    }
+    if (!anchorTf && c.rootBoneIndex >= 0 && static_cast<size_t>(c.rootBoneIndex) < c.bones.size()) {
+        const auto& rb = c.bones[static_cast<size_t>(c.rootBoneIndex)];
+        if (rb.transformHandle) {
+            Object* rtf = api.il2cpp_gchandle_get_target(rb.transformHandle);
+            if (rtf && c.unity.IsUnityObjectAlive(rt, rtf)) {
+                anchorTf = rtf;
+            }
+        }
+    }
+    if (!anchorTf) return;
+
+    UnityVec3 goPos{};
+    UnityQuat goRot{};
+    if (!UnityBindings::InvokeValue(rt, c.unity.tfGetPosition, anchorTf, nullptr, goPos) ||
+        !UnityBindings::InvokeValue(rt, c.unity.tfGetRotation, anchorTf, nullptr, goRot)) {
+        return;
+    }
+    const Vec3 fwd = FromUnity(goRot).Rotate({0.0, 0.0, 1.0});
+    c.mmd.camAnchor.feetWorldPos = FromUnity(goPos);
+    c.mmd.camAnchor.charYawRad = std::atan2(fwd.x, fwd.z);
+    c.mmd.camAnchor.unitMeters = c.mmd.motion ? c.mmd.motion->unitMetersPerMmdUnit : 0.08;
+    c.mmd.camAnchor.valid = c.mmd.camAnchor.feetWorldPos.IsFinite() && std::isfinite(c.mmd.camAnchor.charYawRad);
+}
+
+void AdvanceMmdPlayback(Context& c) noexcept {
+    const auto now = std::chrono::steady_clock::now();
+    if (!c.mmd.hasLastTick) {
+        c.mmd.lastTick = now;
+        c.mmd.hasLastTick = true;
+        return;
+    }
+    const double dt = std::clamp(std::chrono::duration<double>(now - c.mmd.lastTick).count(), 0.0, 0.1);
+    c.mmd.lastTick = now;
+    if (!c.mmd.playing) return;
+
+    const double speed = static_cast<double>(std::clamp(c.mmd.speed, 0.05f, 3.f));
+    if (c.mmd.motion) {
+        const double maxF = (c.mmd.motion->frameCount > 1)
+                                ? static_cast<double>(c.mmd.motion->frameCount - 1)
+                                : 0.0;
+        if (maxF > 0.0) {
+            c.mmd.currentFrame += dt * c.mmd.motion->fps * speed;
+            if (c.mmd.currentFrame >= maxF) {
+                if (c.mmd.loop) {
+                    c.mmd.currentFrame = std::fmod(c.mmd.currentFrame, maxF);
+                } else {
+                    c.mmd.currentFrame = maxF;
+                    c.mmd.playing = false;
+                }
+            }
+        } else {
+            c.mmd.currentFrame = 0.0;
+        }
+    } else if (!c.mmd.cameraKeys.empty()) {
+        const double maxF = static_cast<double>(c.mmd.cameraKeys.back().frame);
+        if (maxF > 0.0) {
+            c.mmd.camOnlyFrame += dt * 30.0 * speed;
+            if (c.mmd.camOnlyFrame >= maxF) {
+                if (c.mmd.loop) c.mmd.camOnlyFrame = std::fmod(c.mmd.camOnlyFrame, maxF);
+                else {
+                    c.mmd.camOnlyFrame = maxF;
+                    c.mmd.playing = false;
+                }
+            }
+        }
+    }
+}
+
+void EvaluateMmdMorphsNoAlloc(Context& c, double vmdFrame) noexcept {
+    const size_t nSlots = c.blendShapes.size();
+    if (!c.mmd.motion || !c.mmd.playExpressions || c.mmd.morphBindings.empty() || nSlots == 0) return;
+    if (c.mmd.morphWeightsBuf.size() != nSlots) c.mmd.morphWeightsBuf.assign(nSlots, 0.f);
+    else std::fill(c.mmd.morphWeightsBuf.begin(), c.mmd.morphWeightsBuf.end(), 0.f);
+    if (c.mmd.morphTouchedBuf.size() != nSlots) c.mmd.morphTouchedBuf.assign(nSlots, static_cast<uint8_t>(0));
+    else std::fill(c.mmd.morphTouchedBuf.begin(), c.mmd.morphTouchedBuf.end(), static_cast<uint8_t>(0));
+
+    const auto& tracks = c.mmd.motion->morphTracks;
+    for (const auto& b : c.mmd.morphBindings) {
+        if (b.trackIndex >= tracks.size()) continue;
+        const float w01 = std::clamp(mmd::SampleMorphTrack(tracks[b.trackIndex], vmdFrame) * b.scale, 0.f, 1.f);
+        for (size_t i = 0; i < nSlots; ++i) {
+            if (c.blendShapes[i].smrIndex == b.smrIndex && c.blendShapes[i].shapeIndex == b.shapeIndex) {
+                c.mmd.morphWeightsBuf[i] = std::min(100.f, c.mmd.morphWeightsBuf[i] + w01 * 100.f);
+                c.mmd.morphTouchedBuf[i] = 1U;
+            }
+        }
+    }
+}
+
+void FillMmdUiSnapshot(const Context& c, MmdUiSnapshot& out) {
+    out.busyLoading = c.mmdLoading.load(std::memory_order_acquire);
+    out.fileDialogBusy = c.fileDialogOpen.load(std::memory_order_acquire);
+    out.totalBlendShapes = static_cast<uint32_t>(c.blendShapes.size());
+    if (c.mmd.motion) {
+        out.motionLoaded = true;
+        out.playing = c.mmd.playing;
+        out.currentFrame = c.mmd.currentFrame;
+        out.frameCount = c.mmd.motion->frameCount;
+        out.fps = c.mmd.motion->fps;
+        out.mappedBoneCount = c.mmd.motion->mappedBoneCount;
+        out.matchedMorphCount = static_cast<uint32_t>(c.mmd.morphBindings.size());
+        out.recommendedReference = c.mmd.motion->report.recommendedReference;
+        out.hasFootIk = c.mmd.motion->report.hasFootIk;
+        out.hasLegD = c.mmd.motion->report.hasLegD;
+        out.motionName = c.mmd.motion->displayName;
+    } else if (!c.mmd.cameraKeys.empty()) {
+        out.playing = c.mmd.playing;
+        out.currentFrame = c.mmd.camOnlyFrame;
+        out.frameCount = c.mmd.cameraKeys.back().frame + 1;
+        out.fps = 30.0;
+    }
+    out.cameraLoaded = !c.mmd.cameraKeys.empty();
+    out.cameraEnabled = c.mmd.camSettings.enabled && out.cameraLoaded;
+    out.cameraKeyCount = static_cast<uint32_t>(c.mmd.cameraKeys.size());
+    out.cameraName = c.mmd.cameraDisplayName;
+}
+
 void PublishStatusSnapshot(Context& c, std::string detail) {
     auto snap = std::make_shared<RenderSnapshot>();
     snap->revision = ++c.snapshotRevision;
     snap->bound = c.unity.bound;
     snap->statusDetail = std::move(detail);
+    FillMmdUiSnapshot(c, snap->mmd);
     c.published.store(std::move(snap), std::memory_order_release);
 }
 
 void ApplyPoseAndPublishNative(Context& c) {
     if (!c.unity.nativeDirectVerified) return;
 
+    AdvanceMmdPlayback(c);
+
     if (c.frameTargetAlive && !c.bones.empty() && HasActivePoseEdits(c)) {
         const auto setLocalRot = reinterpret_cast<NativeTransformQuatFn>(c.unity.nativeSetLocalRot.address);
         const auto getLocalRot = reinterpret_cast<NativeTransformQuatFn>(c.unity.nativeGetLocalRot.address);
         const auto setLocalPos = reinterpret_cast<NativeTransformVec3Fn>(c.unity.nativeSetLocalPos.address);
         const auto getLocalPos = reinterpret_cast<NativeTransformVec3Fn>(c.unity.nativeGetLocalPos.address);
-        const bool fullOverride = c.pauseAnim || c.useBindBase;
 
-        for (size_t i = 0; i < c.bones.size(); ++i) {
-            auto& b = c.bones[i];
-            if (!c.unity.IsUnityObjectAliveFast(b.framePtr)) continue;
+        if (c.mmd.motion) {
+            const auto& mot = *c.mmd.motion;
+            const double frame = c.mmd.currentFrame;
 
-            if (fullOverride) {
-                const Quat baseQ = (c.useBindBase && b.hasBindLocalRot) ? b.bindLocalRot : b.capturedLocalRot;
-                UnityQuat q = ToUnity((baseQ * Quat::FromUnityEuler(b.offsetEuler)).Normalized());
-                seh::CallTransformQuat(setLocalRot, b.framePtr, &q, c.unity.nativeSetLocalRot.method);
-            } else if (!b.offsetEuler.IsNearZero()) {
-                UnityQuat cur{};
-                if (seh::CallTransformQuat(getLocalRot, b.framePtr, &cur, c.unity.nativeGetLocalRot.method)) {
-                    UnityQuat q = ToUnity((FromUnity(cur) * Quat::FromUnityEuler(b.offsetEuler)).Normalized());
-                    seh::CallTransformQuat(setLocalRot, b.framePtr, &q, c.unity.nativeSetLocalRot.method);
+            for (const auto& track : mot.boneTracks) {
+                const int idx = track.targetBoneIndex;
+                if (idx < 0 || static_cast<size_t>(idx) >= c.bones.size()) continue;
+                auto& b = c.bones[static_cast<size_t>(idx)];
+                if (!c.unity.IsUnityObjectAliveFast(b.framePtr)) continue;
+                Quat q = mmd::SampleMappedBoneFrame(track, frame, c.mmd.amplitude);
+                if (!b.offsetEuler.IsNearZero()) {
+                    q = (q * Quat::FromUnityEuler(b.offsetEuler)).Normalized();
+                }
+                UnityQuat uq = ToUnity(q);
+                seh::CallTransformQuat(setLocalRot, b.framePtr, &uq, c.unity.nativeSetLocalRot.method);
+            }
+            for (int idx : mot.rigidHoldBones) {
+                if (idx < 0 || static_cast<size_t>(idx) >= c.bones.size()) continue;
+                auto& b = c.bones[static_cast<size_t>(idx)];
+                if (!b.hasBindLocalRot || !c.unity.IsUnityObjectAliveFast(b.framePtr)) continue;
+                Quat q = b.bindLocalRot;
+                if (!b.offsetEuler.IsNearZero()) {
+                    q = (q * Quat::FromUnityEuler(b.offsetEuler)).Normalized();
+                }
+                UnityQuat uq = ToUnity(q);
+                seh::CallTransformQuat(setLocalRot, b.framePtr, &uq, c.unity.nativeSetLocalRot.method);
+            }
+            for (const auto& offTrack : mot.boneOffsetTracks) {
+                const int idx = offTrack.targetBoneIndex;
+                if (idx < 0 || static_cast<size_t>(idx) >= c.bones.size()) continue;
+                auto& b = c.bones[static_cast<size_t>(idx)];
+                if (!c.unity.IsUnityObjectAliveFast(b.framePtr)) continue;
+                UnityVec3 up = ToUnity(mmd::SampleVec3Track(offTrack.frames, frame));
+                seh::CallTransformVec3(setLocalPos, b.framePtr, &up, c.unity.nativeSetLocalPos.method);
+            }
+            const int rIdx = (mot.rootBoneIndex >= 0 && static_cast<size_t>(mot.rootBoneIndex) < c.bones.size())
+                                 ? mot.rootBoneIndex
+                                 : c.rootBoneIndex;
+            if (rIdx >= 0 && static_cast<size_t>(rIdx) < c.bones.size()) {
+                auto& rb = c.bones[static_cast<size_t>(rIdx)];
+                if (c.unity.IsUnityObjectAliveFast(rb.framePtr)) {
+                    const Vec3 rawChar = mmd::SampleVec3Track(mot.rootTranslationsChar, frame);
+                    c.mmd.lastAuthoredRootChar = rawChar;
+                    const Vec3 appliedLocal = mmd::FilterRootTravel(rawChar, c.mmd.travel, mot.charToRootParentRot);
+                    c.mmd.lastAppliedRootChar = mot.charToRootParentRot.Conjugate().Rotate(appliedLocal);
+                    const Vec3 basePos = (rIdx == c.rootBoneIndex) ? c.capturedRootLocalPos : rb.capturedLocalPos;
+                    UnityVec3 up = ToUnity(basePos + appliedLocal + c.rootOffset);
+                    seh::CallTransformVec3(setLocalPos, rb.framePtr, &up, c.unity.nativeSetLocalPos.method);
                 }
             }
+            if (c.mmd.playExpressions && c.unity.nativeBlendVerified && !c.mmd.morphBindings.empty()) {
+                const double vmdFrame = (mot.fps > 1e-3) ? (frame * 30.0 / mot.fps) : frame;
+                EvaluateMmdMorphsNoAlloc(c, vmdFrame);
+                const auto setBlend = reinterpret_cast<NativeSmrSetBlendFn>(c.unity.nativeSmrSetBlend.address);
+                for (size_t i = 0; i < c.blendShapes.size(); ++i) {
+                    if (!c.mmd.morphTouchedBuf[i]) continue;
+                    auto& bs = c.blendShapes[i];
+                    if (bs.smrIndex < 0 || static_cast<size_t>(bs.smrIndex) >= c.activeSmrs.size()) continue;
+                    Object* smr = c.activeSmrs[static_cast<size_t>(bs.smrIndex)].framePtr;
+                    if (!c.unity.IsUnityObjectAliveFast(smr)) continue;
+                    if (seh::CallSmrSetBlend(setBlend, smr, bs.shapeIndex, c.mmd.morphWeightsBuf[i],
+                                             c.unity.nativeSmrSetBlend.method)) {
+                        bs.modified = true;
+                    }
+                }
+            }
+        } else {
+            const bool fullOverride = c.pauseAnim || c.useBindBase;
+            for (size_t i = 0; i < c.bones.size(); ++i) {
+                auto& b = c.bones[i];
+                if (!c.unity.IsUnityObjectAliveFast(b.framePtr)) continue;
 
-            if (static_cast<int>(i) == c.rootBoneIndex && (fullOverride || c.rootOffset.LengthSq() > 1e-10)) {
                 if (fullOverride) {
-                    UnityVec3 p = ToUnity(c.capturedRootLocalPos + c.rootOffset);
-                    seh::CallTransformVec3(setLocalPos, b.framePtr, &p, c.unity.nativeSetLocalPos.method);
-                } else {
-                    UnityVec3 cur{};
-                    if (seh::CallTransformVec3(getLocalPos, b.framePtr, &cur, c.unity.nativeGetLocalPos.method)) {
-                        UnityVec3 p = ToUnity(FromUnity(cur) + c.rootOffset);
+                    const Quat baseQ = (c.useBindBase && b.hasBindLocalRot) ? b.bindLocalRot : b.capturedLocalRot;
+                    UnityQuat q = ToUnity((baseQ * Quat::FromUnityEuler(b.offsetEuler)).Normalized());
+                    seh::CallTransformQuat(setLocalRot, b.framePtr, &q, c.unity.nativeSetLocalRot.method);
+                } else if (!b.offsetEuler.IsNearZero()) {
+                    UnityQuat cur{};
+                    if (seh::CallTransformQuat(getLocalRot, b.framePtr, &cur, c.unity.nativeGetLocalRot.method)) {
+                        UnityQuat q = ToUnity((FromUnity(cur) * Quat::FromUnityEuler(b.offsetEuler)).Normalized());
+                        seh::CallTransformQuat(setLocalRot, b.framePtr, &q, c.unity.nativeSetLocalRot.method);
+                    }
+                }
+
+                if (static_cast<int>(i) == c.rootBoneIndex && (fullOverride || c.rootOffset.LengthSq() > 1e-10)) {
+                    if (fullOverride) {
+                        UnityVec3 p = ToUnity(c.capturedRootLocalPos + c.rootOffset);
                         seh::CallTransformVec3(setLocalPos, b.framePtr, &p, c.unity.nativeSetLocalPos.method);
+                    } else {
+                        UnityVec3 cur{};
+                        if (seh::CallTransformVec3(getLocalPos, b.framePtr, &cur, c.unity.nativeGetLocalPos.method)) {
+                            UnityVec3 p = ToUnity(FromUnity(cur) + c.rootOffset);
+                            seh::CallTransformVec3(setLocalPos, b.framePtr, &p, c.unity.nativeSetLocalPos.method);
+                        }
                     }
                 }
             }
         }
     }
 
-    if (c.orbitEnabled && c.orbit.initialized &&
+    if (c.mmd.camSettings.enabled && !c.mmd.cameraKeys.empty() && c.mmd.camAnchor.valid &&
         c.unity.IsUnityObjectAliveFast(c.frameCameraPtr) &&
         c.unity.IsUnityObjectAliveFast(c.frameCameraTfPtr)) {
+        const double camFrame = (c.mmd.motion && c.mmd.motion->fps > 1e-3)
+                                    ? (c.mmd.currentFrame * 30.0 / c.mmd.motion->fps)
+                                    : c.mmd.camOnlyFrame;
+        const auto camPose = mmd::EvaluateMmdCameraUnity(
+            c.mmd.cameraKeys, camFrame, c.mmd.camAnchor, c.mmd.camSettings,
+            c.mmd.lastAuthoredRootChar, c.mmd.lastAppliedRootChar);
+        if (camPose.valid) {
+            UnityVec3 pos = ToUnity(camPose.worldPos);
+            UnityQuat rot = ToUnity(camPose.worldRot);
+            seh::CallTransformVec3(reinterpret_cast<NativeTransformVec3Fn>(c.unity.nativeSetPos.address),
+                                   c.frameCameraTfPtr, &pos, c.unity.nativeSetPos.method);
+            seh::CallTransformQuat(reinterpret_cast<NativeTransformQuatFn>(c.unity.nativeSetRot.address),
+                                   c.frameCameraTfPtr, &rot, c.unity.nativeSetRot.method);
+            seh::CallCameraSetFov(reinterpret_cast<NativeCameraSetFovFn>(c.unity.nativeCamSetFov.address),
+                                  c.frameCameraPtr, camPose.verticalFovDeg, c.unity.nativeCamSetFov.method);
+        }
+    } else if (c.orbitEnabled && c.orbit.initialized &&
+               c.unity.IsUnityObjectAliveFast(c.frameCameraPtr) &&
+               c.unity.IsUnityObjectAliveFast(c.frameCameraTfPtr)) {
         UnityVec3 pos = ToUnity(c.orbit.Position());
         UnityQuat rot = ToUnity(c.orbit.Rotation());
         seh::CallTransformVec3(reinterpret_cast<NativeTransformVec3Fn>(c.unity.nativeSetPos.address),
@@ -1127,7 +1821,9 @@ void ApplyPoseAndPublishNative(Context& c) {
     }
 
     CameraProjection cam{};
-    c.unity.ReadCameraProjectionNative(c.frameCameraPtr, c.frameCameraTfPtr, cam);
+    if (c.unity.ReadCameraProjectionNative(c.frameCameraPtr, c.frameCameraTfPtr, cam) && cam.viewportH > 1.f) {
+        c.lastViewportH = cam.viewportH;
+    }
 
     if (c.frameRootParentTfPtr && c.unity.IsUnityObjectAliveFast(c.frameRootParentTfPtr)) {
         UnityQuat pr{};
@@ -1156,6 +1852,7 @@ void ApplyPoseAndPublishNative(Context& c) {
     snap->camera = cam;
     snap->orbit = c.orbit;
     snap->orbitActive = c.orbitEnabled;
+    FillMmdUiSnapshot(c, snap->mmd);
 
     const auto getPos = reinterpret_cast<NativeTransformVec3Fn>(c.unity.nativeGetPos.address);
     const auto getRot = reinterpret_cast<NativeTransformQuatFn>(c.unity.nativeGetRot.address);
@@ -1198,46 +1895,158 @@ void ApplyPoseAndPublishNative(Context& c) {
 
 void ApplyPoseAndPublishReflection(Context& c, const Runtime& rt, Object* cam) {
     const auto& api = rt.Functions();
-    if (c.frameTargetAlive && !c.bones.empty() && HasActivePoseEdits(c)) {
-        const bool fullOverride = c.pauseAnim || c.useBindBase;
-        for (size_t i = 0; i < c.bones.size(); ++i) {
-            auto& b = c.bones[i];
-            if (!b.transformHandle) continue;
-            Object* tf = api.il2cpp_gchandle_get_target(b.transformHandle);
-            if (!tf || !c.unity.IsUnityObjectAlive(rt, tf)) continue;
+    AdvanceMmdPlayback(c);
 
+    if (c.frameTargetAlive && !c.bones.empty() && HasActivePoseEdits(c)) {
+        if (c.mmd.motion) {
+            const auto& mot = *c.mmd.motion;
+            const double frame = c.mmd.currentFrame;
             Object* ret = nullptr;
-            if (fullOverride) {
-                const Quat baseQ = (c.useBindBase && b.hasBindLocalRot) ? b.bindLocalRot : b.capturedLocalRot;
-                UnityQuat q = ToUnity((baseQ * Quat::FromUnityEuler(b.offsetEuler)).Normalized());
-                void* args[]{&q};
+
+            for (const auto& track : mot.boneTracks) {
+                const int idx = track.targetBoneIndex;
+                if (idx < 0 || static_cast<size_t>(idx) >= c.bones.size()) continue;
+                auto& b = c.bones[static_cast<size_t>(idx)];
+                if (!b.transformHandle) continue;
+                Object* tf = api.il2cpp_gchandle_get_target(b.transformHandle);
+                if (!tf || !c.unity.IsUnityObjectAlive(rt, tf)) continue;
+                Quat q = mmd::SampleMappedBoneFrame(track, frame, c.mmd.amplitude);
+                if (!b.offsetEuler.IsNearZero()) {
+                    q = (q * Quat::FromUnityEuler(b.offsetEuler)).Normalized();
+                }
+                UnityQuat uq = ToUnity(q);
+                void* args[]{&uq};
                 rt.Invoke(c.unity.tfSetLocalRotation, tf, args, &ret);
-            } else if (!b.offsetEuler.IsNearZero()) {
-                UnityQuat cur{};
-                if (UnityBindings::InvokeValue(rt, c.unity.tfGetLocalRotation, tf, nullptr, cur)) {
-                    UnityQuat q = ToUnity((FromUnity(cur) * Quat::FromUnityEuler(b.offsetEuler)).Normalized());
-                    void* args[]{&q};
-                    rt.Invoke(c.unity.tfSetLocalRotation, tf, args, &ret);
+            }
+            for (int idx : mot.rigidHoldBones) {
+                if (idx < 0 || static_cast<size_t>(idx) >= c.bones.size()) continue;
+                auto& b = c.bones[static_cast<size_t>(idx)];
+                if (!b.hasBindLocalRot || !b.transformHandle) continue;
+                Object* tf = api.il2cpp_gchandle_get_target(b.transformHandle);
+                if (!tf || !c.unity.IsUnityObjectAlive(rt, tf)) continue;
+                Quat q = b.bindLocalRot;
+                if (!b.offsetEuler.IsNearZero()) {
+                    q = (q * Quat::FromUnityEuler(b.offsetEuler)).Normalized();
+                }
+                UnityQuat uq = ToUnity(q);
+                void* args[]{&uq};
+                rt.Invoke(c.unity.tfSetLocalRotation, tf, args, &ret);
+            }
+            for (const auto& offTrack : mot.boneOffsetTracks) {
+                const int idx = offTrack.targetBoneIndex;
+                if (idx < 0 || static_cast<size_t>(idx) >= c.bones.size()) continue;
+                auto& b = c.bones[static_cast<size_t>(idx)];
+                if (!b.transformHandle) continue;
+                Object* tf = api.il2cpp_gchandle_get_target(b.transformHandle);
+                if (!tf || !c.unity.IsUnityObjectAlive(rt, tf)) continue;
+                UnityVec3 up = ToUnity(mmd::SampleVec3Track(offTrack.frames, frame));
+                void* args[]{&up};
+                rt.Invoke(c.unity.tfSetLocalPosition, tf, args, &ret);
+            }
+            const int rIdx = (mot.rootBoneIndex >= 0 && static_cast<size_t>(mot.rootBoneIndex) < c.bones.size())
+                                 ? mot.rootBoneIndex
+                                 : c.rootBoneIndex;
+            if (rIdx >= 0 && static_cast<size_t>(rIdx) < c.bones.size()) {
+                auto& rb = c.bones[static_cast<size_t>(rIdx)];
+                Object* tf = rb.transformHandle ? api.il2cpp_gchandle_get_target(rb.transformHandle) : nullptr;
+                if (tf && c.unity.IsUnityObjectAlive(rt, tf)) {
+                    const Vec3 rawChar = mmd::SampleVec3Track(mot.rootTranslationsChar, frame);
+                    c.mmd.lastAuthoredRootChar = rawChar;
+                    const Vec3 appliedLocal = mmd::FilterRootTravel(rawChar, c.mmd.travel, mot.charToRootParentRot);
+                    c.mmd.lastAppliedRootChar = mot.charToRootParentRot.Conjugate().Rotate(appliedLocal);
+                    const Vec3 basePos = (rIdx == c.rootBoneIndex) ? c.capturedRootLocalPos : rb.capturedLocalPos;
+                    UnityVec3 up = ToUnity(basePos + appliedLocal + c.rootOffset);
+                    void* args[]{&up};
+                    rt.Invoke(c.unity.tfSetLocalPosition, tf, args, &ret);
                 }
             }
-            if (static_cast<int>(i) == c.rootBoneIndex && (fullOverride || c.rootOffset.LengthSq() > 1e-10)) {
+            if (c.mmd.playExpressions && c.unity.smrSetBlendShapeWeight && !c.mmd.morphBindings.empty()) {
+                const double vmdFrame = (mot.fps > 1e-3) ? (frame * 30.0 / mot.fps) : frame;
+                EvaluateMmdMorphsNoAlloc(c, vmdFrame);
+                for (size_t i = 0; i < c.blendShapes.size(); ++i) {
+                    if (!c.mmd.morphTouchedBuf[i]) continue;
+                    auto& bs = c.blendShapes[i];
+                    if (bs.smrIndex < 0 || static_cast<size_t>(bs.smrIndex) >= c.activeSmrs.size()) continue;
+                    Object* smr = c.activeSmrs[static_cast<size_t>(bs.smrIndex)].smrHandle
+                                      ? api.il2cpp_gchandle_get_target(c.activeSmrs[static_cast<size_t>(bs.smrIndex)].smrHandle)
+                                      : nullptr;
+                    if (!smr || !c.unity.IsUnityObjectAlive(rt, smr)) continue;
+                    int32_t sIdx = bs.shapeIndex;
+                    float w = c.mmd.morphWeightsBuf[i];
+                    void* args[]{&sIdx, &w};
+                    if (rt.Invoke(c.unity.smrSetBlendShapeWeight, smr, args, &ret)) {
+                        bs.modified = true;
+                    }
+                }
+            }
+        } else {
+            const bool fullOverride = c.pauseAnim || c.useBindBase;
+            for (size_t i = 0; i < c.bones.size(); ++i) {
+                auto& b = c.bones[i];
+                if (!b.transformHandle) continue;
+                Object* tf = api.il2cpp_gchandle_get_target(b.transformHandle);
+                if (!tf || !c.unity.IsUnityObjectAlive(rt, tf)) continue;
+
+                Object* ret = nullptr;
                 if (fullOverride) {
-                    UnityVec3 p = ToUnity(c.capturedRootLocalPos + c.rootOffset);
-                    void* args[]{&p};
-                    rt.Invoke(c.unity.tfSetLocalPosition, tf, args, &ret);
-                } else {
-                    UnityVec3 cur{};
-                    if (UnityBindings::InvokeValue(rt, c.unity.tfGetLocalPosition, tf, nullptr, cur)) {
-                        UnityVec3 p = ToUnity(FromUnity(cur) + c.rootOffset);
+                    const Quat baseQ = (c.useBindBase && b.hasBindLocalRot) ? b.bindLocalRot : b.capturedLocalRot;
+                    UnityQuat q = ToUnity((baseQ * Quat::FromUnityEuler(b.offsetEuler)).Normalized());
+                    void* args[]{&q};
+                    rt.Invoke(c.unity.tfSetLocalRotation, tf, args, &ret);
+                } else if (!b.offsetEuler.IsNearZero()) {
+                    UnityQuat cur{};
+                    if (UnityBindings::InvokeValue(rt, c.unity.tfGetLocalRotation, tf, nullptr, cur)) {
+                        UnityQuat q = ToUnity((FromUnity(cur) * Quat::FromUnityEuler(b.offsetEuler)).Normalized());
+                        void* args[]{&q};
+                        rt.Invoke(c.unity.tfSetLocalRotation, tf, args, &ret);
+                    }
+                }
+                if (static_cast<int>(i) == c.rootBoneIndex && (fullOverride || c.rootOffset.LengthSq() > 1e-10)) {
+                    if (fullOverride) {
+                        UnityVec3 p = ToUnity(c.capturedRootLocalPos + c.rootOffset);
                         void* args[]{&p};
                         rt.Invoke(c.unity.tfSetLocalPosition, tf, args, &ret);
+                    } else {
+                        UnityVec3 cur{};
+                        if (UnityBindings::InvokeValue(rt, c.unity.tfGetLocalPosition, tf, nullptr, cur)) {
+                            UnityVec3 p = ToUnity(FromUnity(cur) + c.rootOffset);
+                            void* args[]{&p};
+                            rt.Invoke(c.unity.tfSetLocalPosition, tf, args, &ret);
+                        }
                     }
                 }
             }
         }
     }
 
-    if (c.orbitEnabled && c.orbit.initialized && cam && c.unity.IsUnityObjectAlive(rt, cam)) {
+    if (c.mmd.camSettings.enabled && !c.mmd.cameraKeys.empty() && c.mmd.camAnchor.valid &&
+        cam && c.unity.IsUnityObjectAlive(rt, cam)) {
+        const double camFrame = (c.mmd.motion && c.mmd.motion->fps > 1e-3)
+                                    ? (c.mmd.currentFrame * 30.0 / c.mmd.motion->fps)
+                                    : c.mmd.camOnlyFrame;
+        const auto camPose = mmd::EvaluateMmdCameraUnity(
+            c.mmd.cameraKeys, camFrame, c.mmd.camAnchor, c.mmd.camSettings,
+            c.mmd.lastAuthoredRootChar, c.mmd.lastAppliedRootChar);
+        if (camPose.valid) {
+            Object* camTf = nullptr;
+            if (rt.Invoke(c.unity.compGetTransform, cam, nullptr, &camTf) && camTf &&
+                c.unity.IsUnityObjectAlive(rt, camTf)) {
+                UnityVec3 pos = ToUnity(camPose.worldPos);
+                UnityQuat rot = ToUnity(camPose.worldRot);
+                void* pArgs[]{&pos};
+                void* rArgs[]{&rot};
+                Object* ret = nullptr;
+                rt.Invoke(c.unity.tfSetPosition, camTf, pArgs, &ret);
+                rt.Invoke(c.unity.tfSetRotation, camTf, rArgs, &ret);
+            }
+            if (c.unity.camSetFov) {
+                float fov = camPose.verticalFovDeg;
+                void* fArgs[]{&fov};
+                Object* ret = nullptr;
+                rt.Invoke(c.unity.camSetFov, cam, fArgs, &ret);
+            }
+        }
+    } else if (c.orbitEnabled && c.orbit.initialized && cam && c.unity.IsUnityObjectAlive(rt, cam)) {
         Object* camTf = nullptr;
         if (rt.Invoke(c.unity.compGetTransform, cam, nullptr, &camTf) && camTf && c.unity.IsUnityObjectAlive(rt, camTf)) {
             UnityVec3 pos = ToUnity(c.orbit.Position());
@@ -1257,7 +2066,9 @@ void ApplyPoseAndPublishReflection(Context& c, const Runtime& rt, Object* cam) {
     }
 
     CameraProjection camProj{};
-    c.unity.ReadCameraProjectionReflection(rt, cam, camProj);
+    if (c.unity.ReadCameraProjectionReflection(rt, cam, camProj) && camProj.viewportH > 1.f) {
+        c.lastViewportH = camProj.viewportH;
+    }
 
     auto snap = std::make_shared<RenderSnapshot>();
     snap->revision = ++c.snapshotRevision;
@@ -1276,6 +2087,7 @@ void ApplyPoseAndPublishReflection(Context& c, const Runtime& rt, Object* cam) {
     snap->camera = camProj;
     snap->orbit = c.orbit;
     snap->orbitActive = c.orbitEnabled;
+    FillMmdUiSnapshot(c, snap->mmd);
 
     snap->bones.reserve(c.bones.size());
     for (const auto& b : c.bones) {
@@ -1377,6 +2189,11 @@ void CABBIRD_CALL DetourAfterLateUpdate(const CabbirdMethodInfoV1* methodInfo) {
                 fast.orbitFov = c->pending.orbitFov;
                 c->pending.hasOrbitFov = false;
             }
+            if (c->pending.mmdHasSeek) {
+                fast.mmdHasSeek = true;
+                fast.mmdSeekFrame = c->pending.mmdSeekFrame;
+                c->pending.mmdHasSeek = false;
+            }
         }
         if (fast.hasBoneEdit) {
             for (const auto& [idx, euler] : fast.boneEdits) {
@@ -1390,11 +2207,19 @@ void CABBIRD_CALL DetourAfterLateUpdate(const CabbirdMethodInfoV1* methodInfo) {
         }
         if (fast.hasOrbitDelta && c->orbitEnabled && c->orbit.initialized) {
             if (fast.orbitDx != 0.f || fast.orbitDy != 0.f) c->orbit.Orbit(fast.orbitDx, fast.orbitDy);
-            if (fast.panDx != 0.f || fast.panDy != 0.f) c->orbit.Pan(fast.panDx, fast.panDy);
+            if (fast.panDx != 0.f || fast.panDy != 0.f) c->orbit.Pan(fast.panDx, fast.panDy, c->lastViewportH);
             if (fast.zoomNotches != 0.f) c->orbit.Zoom(fast.zoomNotches);
         }
         if (fast.hasOrbitFov) {
             c->orbit.fovDeg = std::clamp(fast.orbitFov, OrbitCameraState::kMinFovDeg, OrbitCameraState::kMaxFovDeg);
+        }
+        if (fast.mmdHasSeek) {
+            if (c->mmd.motion) {
+                const double maxF = c->mmd.motion->frameCount > 1 ? static_cast<double>(c->mmd.motion->frameCount - 1) : 0.0;
+                c->mmd.currentFrame = std::clamp(fast.mmdSeekFrame, 0.0, maxF);
+            } else if (!c->mmd.cameraKeys.empty()) {
+                c->mmd.camOnlyFrame = std::clamp(fast.mmdSeekFrame, 0.0, static_cast<double>(c->mmd.cameraKeys.back().frame));
+            }
         }
 
         ApplyPoseAndPublishNative(*c);
@@ -1432,65 +2257,77 @@ void RemoveAfterLateHook(Context& c) noexcept {
     g_activeDetourContext.store(nullptr, std::memory_order_release);
 }
 
-void UpdateOrbitCameraSetup(Context& c, const Runtime& rt, Object* cam, bool wantEnabled) {
+bool ComputeCharacterOrbitCenter(const Context& c, const Runtime& rt, Vec3& outCenter) {
     const auto& api = rt.Functions();
+    if (c.bones.empty()) return false;
+
+    auto accumulate = [&](bool bodyOnly) -> bool {
+        Vec3 minP{1e18, 1e18, 1e18};
+        Vec3 maxP{-1e18, -1e18, -1e18};
+        int count = 0;
+        for (const auto& b : c.bones) {
+            if (bodyOnly && !b.isBodyBone) continue;
+            if (!b.transformHandle) continue;
+            Object* tf = api.il2cpp_gchandle_get_target(b.transformHandle);
+            UnityVec3 wp{};
+            if (!tf || !c.unity.IsUnityObjectAlive(rt, tf) ||
+                !UnityBindings::InvokeValue(rt, c.unity.tfGetPosition, tf, nullptr, wp)) {
+                continue;
+            }
+            const Vec3 p = FromUnity(wp);
+            if (!p.IsFinite()) continue;
+            minP.x = std::min(minP.x, p.x); maxP.x = std::max(maxP.x, p.x);
+            minP.y = std::min(minP.y, p.y); maxP.y = std::max(maxP.y, p.y);
+            minP.z = std::min(minP.z, p.z); maxP.z = std::max(maxP.z, p.z);
+            ++count;
+        }
+        if (count == 0) return false;
+        outCenter = (minP + maxP) * 0.5;
+        return outCenter.IsFinite();
+    };
+
+    if (accumulate(true)) return true;
+    if (accumulate(false)) return true;
+    return false;
+}
+
+void UpdateOrbitCameraSetup(Context& c, const Runtime& rt, Object* cam, bool wantEnabled) {
     if (!wantEnabled) {
         if (c.orbitEnabled) RestoreOrbitCamera(c, rt);
         return;
     }
     if (!cam || !c.unity.IsUnityObjectAlive(rt, cam)) return;
 
-    if (!c.disabledBrainActive && c.unity.cinemachineBrainTypeHandle && c.unity.goGetComponent1 &&
-        c.unity.behaviourGetEnabled && c.unity.behaviourSetEnabled) {
-        Object* camGo = nullptr;
-        if (rt.Invoke(c.unity.compGetGameObject, cam, nullptr, &camGo) && camGo) {
-            Object* brainType = api.il2cpp_gchandle_get_target(c.unity.cinemachineBrainTypeHandle);
-            Object* brain = nullptr;
-            void* args[]{brainType};
-            if (brainType && rt.Invoke(c.unity.goGetComponent1, camGo, args, &brain) && brain &&
-                c.unity.IsUnityObjectAlive(rt, brain)) {
-                bool wasEnabled = false;
-                if (UnityBindings::InvokeValue(rt, c.unity.behaviourGetEnabled, brain, nullptr, wasEnabled) && wasEnabled) {
-                    bool disable = false;
-                    void* setArgs[]{&disable};
-                    Object* ret = nullptr;
-                    if (rt.Invoke(c.unity.behaviourSetEnabled, brain, setArgs, &ret)) {
-                        c.disabledBrainHandle = api.il2cpp_gchandle_new(brain, false);
-                        c.disabledBrainActive = true;
-                    }
-                }
-            }
-        }
-    }
-
-    if (!c.hasSavedCameraFov && c.unity.camGetFov) {
-        float fov = 45.f;
-        if (UnityBindings::InvokeValue(rt, c.unity.camGetFov, cam, nullptr, fov) && std::isfinite(fov)) {
-            c.savedCameraFov = fov;
-            c.hasSavedCameraFov = true;
-            FreeHandle(api, c.modifiedCameraHandle);
-            c.modifiedCameraHandle = api.il2cpp_gchandle_new(cam, false);
-        }
-    }
+    // Orbit Camera and MMD Camera are mutually exclusive.
+    c.mmd.camSettings.enabled = false;
+    EnsureCameraTakeover(c, rt, cam);
 
     if (!c.orbit.initialized) {
         CameraProjection curCam{};
-        c.unity.ReadCameraProjectionReflection(rt, cam, curCam);
-        Vec3 targetCenter = curCam.cameraPos + curCam.Forward() * 2.5;
-        if (c.rootBoneIndex >= 0 && static_cast<size_t>(c.rootBoneIndex) < c.bones.size()) {
-            Object* rootTf = api.il2cpp_gchandle_get_target(c.bones[static_cast<size_t>(c.rootBoneIndex)].transformHandle);
-            UnityVec3 wp{};
-            if (rootTf && c.unity.IsUnityObjectAlive(rt, rootTf) &&
-                UnityBindings::InvokeValue(rt, c.unity.tfGetPosition, rootTf, nullptr, wp)) {
-                targetCenter = FromUnity(wp);
+        if (c.unity.ReadCameraProjectionReflection(rt, cam, curCam)) {
+            if (curCam.viewportH > 1.f) c.lastViewportH = curCam.viewportH;
+            double orbitDist = 2.5;
+            Vec3 charCenter{};
+            if (ComputeCharacterOrbitCenter(c, rt, charCenter)) {
+                const double range = (charCenter - curCam.cameraPos).Length();
+                if (range > 0.35 && range < 25.0) {
+                    orbitDist = range;
+                }
+            }
+            const float liveFov = (std::isfinite(curCam.verticalFovDeg) &&
+                                   curCam.verticalFovDeg >= OrbitCameraState::kMinFovDeg &&
+                                   curCam.verticalFovDeg <= OrbitCameraState::kMaxFovDeg)
+                                      ? curCam.verticalFovDeg
+                                      : (c.hasSavedCameraFov ? c.savedCameraFov : 45.f);
+            // Keep the exact current camera position, orientation, and FOV so turning Orbit Camera on never jumps.
+            c.orbit.InitFromView(curCam.cameraPos, curCam.cameraRot, orbitDist, liveFov);
+            c.savedOrbitInitial = c.orbit;
+            c.hasSavedOrbitInitial = true;
+            {
+                std::scoped_lock lock(c.settingsMutex);
+                c.settings.orbitFov = c.orbit.fovDeg;
             }
         }
-        float desiredFov = 45.f;
-        {
-            std::scoped_lock lock(c.settingsMutex);
-            desiredFov = c.settings.orbitFov;
-        }
-        c.orbit.InitFromCamera(curCam.cameraPos, targetCenter, desiredFov);
     }
     c.orbitEnabled = true;
 }
@@ -1578,6 +2415,54 @@ CabbirdStatusV1 CABBIRD_CALL GameUpdateCallback(void* raw, const CabbirdIl2CppAp
             c.animSpeed = c.settings.animSpeed;
             c.orbit.fovDeg = c.settings.orbitFov;
         }
+        SyncMmdSettingsToGame(c);
+
+        // Install completed Worker-thread MMD motion / camera loads on the Game thread.
+        {
+            std::optional<PendingMmdMotionResult> incomingMotion;
+            std::optional<PendingMmdCameraResult> incomingCamera;
+            {
+                std::scoped_lock lock(c.mmdMutex);
+                if (c.pendingMmdMotion.has_value()) {
+                    incomingMotion = std::move(c.pendingMmdMotion);
+                    c.pendingMmdMotion.reset();
+                }
+                if (c.pendingMmdCamera.has_value()) {
+                    incomingCamera = std::move(c.pendingMmdCamera);
+                    c.pendingMmdCamera.reset();
+                }
+            }
+            if (incomingMotion && incomingMotion->motion &&
+                incomingMotion->builtForTargetId == c.activeTargetId &&
+                incomingMotion->builtForBoneCount == c.bones.size()) {
+                RestoreBlendShapes(c, rt);
+                c.mmd.motion = std::move(incomingMotion->motion);
+                c.mmd.morphBindings = std::move(incomingMotion->morphBindings);
+                c.mmd.morphWeightsBuf.assign(c.blendShapes.size(), 0.f);
+                c.mmd.morphTouchedBuf.assign(c.blendShapes.size(), 0U);
+                c.mmd.currentFrame = 0.0;
+                c.mmd.playing = false;
+                c.mmd.hasLastTick = false;
+                c.mmd.lastAuthoredRootChar = {};
+                c.mmd.lastAppliedRootChar = {};
+                CaptureMmdCameraAnchor(c, rt);
+                if (!c.mmd.motion->embeddedCameraKeys.empty() && c.mmd.cameraKeys.empty()) {
+                    c.mmd.cameraKeys = c.mmd.motion->embeddedCameraKeys;
+                    c.mmd.cameraDisplayName = c.mmd.motion->displayName;
+                }
+            }
+            if (incomingCamera && !incomingCamera->keys.empty()) {
+                c.mmd.cameraKeys = std::move(incomingCamera->keys);
+                c.mmd.cameraDisplayName = std::move(incomingCamera->displayName);
+                c.mmd.camOnlyFrame = 0.0;
+                CaptureMmdCameraAnchor(c, rt);
+                if (cam && c.unity.IsUnityObjectAlive(rt, cam)) {
+                    if (c.orbitEnabled) RestoreOrbitCamera(c, rt);
+                    c.mmd.camSettings.enabled = true;
+                    EnsureCameraTakeover(c, rt, cam);
+                }
+            }
+        }
 
         // Drain commands from UI / Render thread.
         PendingCommands cmd;
@@ -1636,7 +2521,7 @@ CabbirdStatusV1 CABBIRD_CALL GameUpdateCallback(void* raw, const CabbirdIl2CppAp
         if (cmd.hasPauseToggle) {
             const bool wasPaused = c.pauseAnim;
             c.pauseAnim = cmd.wantPause;
-            if (c.pauseAnim && !wasPaused && c.frameTargetAlive) {
+            if (c.pauseAnim && !wasPaused && c.frameTargetAlive && !c.useBindBase && !c.mmd.motion) {
                 for (size_t i = 0; i < c.bones.size(); ++i) {
                     Object* tf = api->il2cpp_gchandle_get_target(c.bones[i].transformHandle);
                     if (!tf || !c.unity.IsUnityObjectAlive(rt, tf)) continue;
@@ -1721,7 +2606,7 @@ CabbirdStatusV1 CABBIRD_CALL GameUpdateCallback(void* raw, const CabbirdIl2CppAp
         if (c.orbitEnabled && c.orbit.initialized) {
             if (cmd.hasOrbitDelta) {
                 if (cmd.orbitDx != 0.f || cmd.orbitDy != 0.f) c.orbit.Orbit(cmd.orbitDx, cmd.orbitDy);
-                if (cmd.panDx != 0.f || cmd.panDy != 0.f) c.orbit.Pan(cmd.panDx, cmd.panDy);
+                if (cmd.panDx != 0.f || cmd.panDy != 0.f) c.orbit.Pan(cmd.panDx, cmd.panDy, c.lastViewportH);
                 if (cmd.zoomNotches != 0.f) c.orbit.Zoom(cmd.zoomNotches);
             }
             if (cmd.hasOrbitFov) {
@@ -1733,13 +2618,124 @@ CabbirdStatusV1 CABBIRD_CALL GameUpdateCallback(void* raw, const CabbirdIl2CppAp
                 UnityVec3 wp{};
                 if (tf && c.unity.IsUnityObjectAlive(rt, tf) &&
                     UnityBindings::InvokeValue(rt, c.unity.tfGetPosition, tf, nullptr, wp)) {
-                    c.orbit.FocusOn(FromUnity(wp), 1.4);
+                    c.orbit.FocusOn(FromUnity(wp), 1.8);
                 }
             }
             if (cmd.orbitResetView) {
-                c.orbit.initialized = false;
-                UpdateOrbitCameraSetup(c, rt, cam, true);
+                if (c.hasSavedOrbitInitial) {
+                    c.orbit = c.savedOrbitInitial;
+                    std::scoped_lock lock(c.settingsMutex);
+                    c.settings.orbitFov = c.orbit.fovDeg;
+                } else {
+                    c.orbit.initialized = false;
+                    UpdateOrbitCameraSetup(c, rt, cam, true);
+                }
             }
+        }
+
+        if (cmd.mmdSyncSettings) {
+            const bool prevExpr = c.mmd.playExpressions;
+            SyncMmdSettingsToGame(c);
+            if (prevExpr && !c.mmd.playExpressions) {
+                RestoreBlendShapes(c, rt);
+            }
+        }
+        if (cmd.mmdTogglePlay) {
+            if (c.mmd.motion || !c.mmd.cameraKeys.empty()) {
+                c.mmd.playing = !c.mmd.playing;
+                c.mmd.hasLastTick = false;
+                if (c.mmd.playing && c.mmd.motion && c.mmd.motion->frameCount > 1 &&
+                    c.mmd.currentFrame >= static_cast<double>(c.mmd.motion->frameCount - 1) - 1e-3) {
+                    c.mmd.currentFrame = 0.0;
+                }
+            }
+        }
+        if (cmd.mmdSetPlaying) {
+            if (c.mmd.motion || !c.mmd.cameraKeys.empty()) {
+                c.mmd.playing = cmd.mmdWantPlaying;
+                c.mmd.hasLastTick = false;
+                if (c.mmd.playing && c.mmd.motion && c.mmd.motion->frameCount > 1 &&
+                    c.mmd.currentFrame >= static_cast<double>(c.mmd.motion->frameCount - 1) - 1e-3) {
+                    c.mmd.currentFrame = 0.0;
+                }
+            }
+        }
+        if (cmd.mmdStop) {
+            c.mmd.playing = false;
+            c.mmd.currentFrame = 0.0;
+            c.mmd.camOnlyFrame = 0.0;
+            c.mmd.hasLastTick = false;
+            c.mmd.lastAuthoredRootChar = {};
+            c.mmd.lastAppliedRootChar = {};
+            RestoreBlendShapes(c, rt);
+        }
+        if (cmd.mmdUnload) {
+            RestoreBlendShapes(c, rt);
+            if (c.mmd.motion) {
+                Object* ret = nullptr;
+                for (const auto& offTrack : c.mmd.motion->boneOffsetTracks) {
+                    const int idx = offTrack.targetBoneIndex;
+                    if (idx < 0 || static_cast<size_t>(idx) >= c.bones.size()) continue;
+                    Object* tf = c.bones[static_cast<size_t>(idx)].transformHandle
+                                     ? api->il2cpp_gchandle_get_target(c.bones[static_cast<size_t>(idx)].transformHandle)
+                                     : nullptr;
+                    if (tf && c.unity.IsUnityObjectAlive(rt, tf)) {
+                        UnityVec3 p = ToUnity(c.bones[static_cast<size_t>(idx)].capturedLocalPos);
+                        void* pArgs[]{&p};
+                        rt.Invoke(c.unity.tfSetLocalPosition, tf, pArgs, &ret);
+                    }
+                }
+                const int rIdx = c.mmd.motion->rootBoneIndex;
+                if (rIdx >= 0 && rIdx != c.rootBoneIndex && static_cast<size_t>(rIdx) < c.bones.size()) {
+                    Object* tf = c.bones[static_cast<size_t>(rIdx)].transformHandle
+                                     ? api->il2cpp_gchandle_get_target(c.bones[static_cast<size_t>(rIdx)].transformHandle)
+                                     : nullptr;
+                    if (tf && c.unity.IsUnityObjectAlive(rt, tf)) {
+                        UnityVec3 p = ToUnity(c.bones[static_cast<size_t>(rIdx)].capturedLocalPos);
+                        void* pArgs[]{&p};
+                        rt.Invoke(c.unity.tfSetLocalPosition, tf, pArgs, &ret);
+                    }
+                }
+            }
+            c.mmd.motion.reset();
+            c.mmd.morphBindings.clear();
+            c.mmd.playing = false;
+            c.mmd.currentFrame = 0.0;
+            c.mmd.lastAuthoredRootChar = {};
+            c.mmd.lastAppliedRootChar = {};
+            RestoreActiveAnimationAndBones(c, rt, true);
+        }
+        if (cmd.mmdHasSeek) {
+            if (c.mmd.motion) {
+                const double maxF = c.mmd.motion->frameCount > 1 ? static_cast<double>(c.mmd.motion->frameCount - 1) : 0.0;
+                c.mmd.currentFrame = std::clamp(cmd.mmdSeekFrame, 0.0, maxF);
+            } else if (!c.mmd.cameraKeys.empty()) {
+                c.mmd.camOnlyFrame = std::clamp(cmd.mmdSeekFrame, 0.0, static_cast<double>(c.mmd.cameraKeys.back().frame));
+            }
+        }
+        if (cmd.mmdCamClear) {
+            c.mmd.camSettings.enabled = false;
+            c.mmd.cameraKeys.clear();
+            c.mmd.cameraDisplayName.clear();
+            c.mmd.camAnchor.valid = false;
+            ReleaseCameraTakeoverIfIdle(c, rt);
+        }
+        if (cmd.mmdCamHasEnable) {
+            if (cmd.mmdCamWantEnable && !c.mmd.cameraKeys.empty() && cam && c.unity.IsUnityObjectAlive(rt, cam)) {
+                if (c.orbitEnabled) RestoreOrbitCamera(c, rt);
+                c.mmd.camSettings.enabled = true;
+                EnsureCameraTakeover(c, rt, cam);
+                CaptureMmdCameraAnchor(c, rt);
+            } else {
+                c.mmd.camSettings.enabled = false;
+                ReleaseCameraTakeoverIfIdle(c, rt);
+            }
+        } else if (c.mmd.camSettings.enabled && cam && c.unity.IsUnityObjectAlive(rt, cam)) {
+            EnsureCameraTakeover(c, rt, cam);
+            if (!c.mmd.camAnchor.valid) CaptureMmdCameraAnchor(c, rt);
+        }
+        if (cmd.mmdCamReanchor) {
+            CaptureMmdCameraAnchor(c, rt);
         }
 
         Object* activeGo = c.activeGoHandle ? api->il2cpp_gchandle_get_target(c.activeGoHandle) : nullptr;
@@ -1751,9 +2747,36 @@ CabbirdStatusV1 CABBIRD_CALL GameUpdateCallback(void* raw, const CabbirdIl2CppAp
 
         if (c.frameTargetAlive) {
             ApplyAnimationSpeedControl(c, rt);
+            for (auto& s : c.activeSmrs) {
+                Object* smr = s.smrHandle ? api->il2cpp_gchandle_get_target(s.smrHandle) : nullptr;
+                s.framePtr = (smr && c.unity.IsUnityObjectAlive(rt, smr)) ? smr : nullptr;
+            }
             for (auto& b : c.bones) {
                 Object* tf = b.transformHandle ? api->il2cpp_gchandle_get_target(b.transformHandle) : nullptr;
                 b.framePtr = (tf && c.unity.IsUnityObjectAlive(rt, tf)) ? tf : nullptr;
+            }
+            // Reflection fallback for facial BlendShapes if native direct BlendShape ABI is unavailable.
+            if (c.mmd.motion && c.mmd.playExpressions && !c.unity.nativeBlendVerified &&
+                c.unity.smrSetBlendShapeWeight && !c.mmd.morphBindings.empty() &&
+                c.afterLateHook.id != 0 && c.unity.nativeDirectVerified && c.postLateDetourHits > 0) {
+                const double vmdFrame = (c.mmd.motion->fps > 1e-3)
+                                            ? (c.mmd.currentFrame * 30.0 / c.mmd.motion->fps)
+                                            : c.mmd.currentFrame;
+                EvaluateMmdMorphsNoAlloc(c, vmdFrame);
+                Object* ret = nullptr;
+                for (size_t i = 0; i < c.blendShapes.size(); ++i) {
+                    if (!c.mmd.morphTouchedBuf[i]) continue;
+                    auto& bs = c.blendShapes[i];
+                    if (bs.smrIndex < 0 || static_cast<size_t>(bs.smrIndex) >= c.activeSmrs.size()) continue;
+                    Object* smr = c.activeSmrs[static_cast<size_t>(bs.smrIndex)].framePtr;
+                    if (!smr) continue;
+                    int32_t sIdx = bs.shapeIndex;
+                    float w = c.mmd.morphWeightsBuf[i];
+                    void* args[]{&sIdx, &w};
+                    if (rt.Invoke(c.unity.smrSetBlendShapeWeight, smr, args, &ret)) {
+                        bs.modified = true;
+                    }
+                }
             }
             if (c.rootBoneIndex >= 0 && static_cast<size_t>(c.rootBoneIndex) < c.bones.size()) {
                 Object* rootTf = c.bones[static_cast<size_t>(c.rootBoneIndex)].framePtr;
@@ -1795,7 +2818,9 @@ CabbirdStatusV1 CABBIRD_CALL CleanupWithRuntime(void* raw, const CabbirdIl2CppAp
         if (!api || api->struct_size < sizeof(*api) || api->api_version != 1) return Ok();
         auto& c = *static_cast<Context*>(raw);
         Runtime rt(*api);
+        c.mmd.camSettings.enabled = false;
         RestoreOrbitCamera(c, rt);
+        ReleaseCameraTakeoverIfIdle(c, rt);
         ClearActiveSkeleton(c, rt, true);
         ClearTargetList(c, *api);
         c.unity.ReleaseTypeHandles(api);
@@ -1816,14 +2841,209 @@ CabbirdStatusV1 CABBIRD_CALL StopCleanup(void* raw) noexcept {
     return Ok();
 }
 
-// ---------- Worker Async File I/O (NEVER runs on Game/Render threads) ----------
+// ---------- Worker Async File I/O & MMD Retargeting (NEVER runs on Game/Render threads) ----------
+
+std::wstring Utf8ToWideStr(std::string_view utf8) {
+    if (utf8.empty()) return {};
+    const int n = MultiByteToWideChar(CP_UTF8, 0, utf8.data(), static_cast<int>(utf8.size()), nullptr, 0);
+    if (n <= 0) return {};
+    std::wstring out(static_cast<size_t>(n), L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, utf8.data(), static_cast<int>(utf8.size()), out.data(), n);
+    return out;
+}
+
+std::string WideToUtf8Str(std::wstring_view wide) {
+    if (wide.empty()) return {};
+    const int n = WideCharToMultiByte(CP_UTF8, 0, wide.data(), static_cast<int>(wide.size()), nullptr, 0, nullptr, nullptr);
+    if (n <= 0) return {};
+    std::string out(static_cast<size_t>(n), '\0');
+    WideCharToMultiByte(CP_UTF8, 0, wide.data(), static_cast<int>(wide.size()), out.data(), n, nullptr, nullptr);
+    return out;
+}
+
+std::filesystem::path PathFromUtf8(std::string_view utf8) {
+    const std::wstring w = Utf8ToWideStr(utf8);
+    return w.empty() ? std::filesystem::path(utf8) : std::filesystem::path(w);
+}
+
+std::string PathToUtf8(const std::filesystem::path& p) {
+    return WideToUtf8Str(p.native());
+}
+
+bool PathHasExtLower(const std::filesystem::path& p, std::string_view extLower) {
+    return ToLowerAscii(PathToUtf8(p.extension())) == extLower;
+}
+
+std::optional<std::string> BrowseFileDialogWorker(std::string_view initialUtf8, bool cameraOnly) {
+    struct ComGuard {
+        HRESULT hr{};
+        ComGuard() : hr(CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE)) {}
+        ~ComGuard() {
+            if (SUCCEEDED(hr)) CoUninitialize();
+        }
+        bool Ok() const noexcept { return SUCCEEDED(hr) || hr == RPC_E_CHANGED_MODE; }
+    } com;
+    if (!com.Ok()) return std::nullopt;
+
+    Microsoft::WRL::ComPtr<IFileOpenDialog> dialog;
+    if (FAILED(CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&dialog)))) {
+        return std::nullopt;
+    }
+    DWORD options{};
+    if (SUCCEEDED(dialog->GetOptions(&options))) {
+        static_cast<void>(dialog->SetOptions(options | FOS_FORCEFILESYSTEM | FOS_FILEMUSTEXIST | FOS_PATHMUSTEXIST));
+    }
+    const COMDLG_FILTERSPEC motionFilters[]{
+        {L"MMD Motion / Pose (*.vmd;*.vpd)", L"*.vmd;*.vpd"},
+        {L"VMD Motion (*.vmd)", L"*.vmd"},
+        {L"VPD Pose (*.vpd)", L"*.vpd"},
+        {L"All Files (*.*)", L"*.*"}
+    };
+    const COMDLG_FILTERSPEC camFilters[]{
+        {L"MMD Camera VMD (*.vmd)", L"*.vmd"},
+        {L"All Files (*.*)", L"*.*"}
+    };
+    if (cameraOnly) {
+        static_cast<void>(dialog->SetFileTypes(static_cast<UINT>(std::size(camFilters)), camFilters));
+    } else {
+        static_cast<void>(dialog->SetFileTypes(static_cast<UINT>(std::size(motionFilters)), motionFilters));
+    }
+    static_cast<void>(dialog->SetFileTypeIndex(1));
+
+    if (!initialUtf8.empty()) {
+        std::filesystem::path cur = PathFromUtf8(initialUtf8);
+        std::error_code ec;
+        std::filesystem::path folder = std::filesystem::is_directory(cur, ec) ? cur : cur.parent_path();
+        if (!folder.empty() && std::filesystem::is_directory(folder, ec)) {
+            Microsoft::WRL::ComPtr<IShellItem> folderItem;
+            if (SUCCEEDED(SHCreateItemFromParsingName(folder.c_str(), nullptr, IID_PPV_ARGS(&folderItem)))) {
+                static_cast<void>(dialog->SetFolder(folderItem.Get()));
+            }
+        }
+    }
+
+    if (FAILED(dialog->Show(nullptr))) return std::nullopt;
+    Microsoft::WRL::ComPtr<IShellItem> selected;
+    if (FAILED(dialog->GetResult(&selected))) return std::nullopt;
+    PWSTR raw{};
+    if (FAILED(selected->GetDisplayName(SIGDN_FILESYSPATH, &raw)) || !raw) return std::nullopt;
+    std::string utf8 = WideToUtf8Str(raw);
+    CoTaskMemFree(raw);
+    if (utf8.empty()) return std::nullopt;
+    return utf8;
+}
 
 std::filesystem::path ResolveStateFilePath(const Context& c, std::string_view rawPath) {
-    std::filesystem::path p(rawPath);
+    std::filesystem::path p = PathFromUtf8(rawPath);
     if (p.is_absolute()) return p;
     std::filesystem::path base = c.writableStateDir.empty() ? std::filesystem::current_path()
-                                                            : std::filesystem::path(c.writableStateDir);
+                                                            : PathFromUtf8(c.writableStateDir);
     return base / "poses" / p;
+}
+
+std::filesystem::path ResolveReferenceAssetPath(const Context& c, int refMode) {
+    const char* file = mmd::ReferencePresetFilename(refMode);
+    if (!c.pluginDir.empty()) {
+        const auto candidate = PathFromUtf8(c.pluginDir) / "assets" / file;
+        std::error_code ec;
+        if (std::filesystem::exists(candidate, ec)) return candidate;
+    }
+    return std::filesystem::current_path() / "assets" / file;
+}
+
+void ExecuteLoadMmdMotionWorker(Context& c, const std::string& pathUtf8,
+                                int refMode, const mmd::RetargetOptions& opts) {
+    struct LoadingGuard {
+        std::atomic_bool& flag;
+        ~LoadingGuard() { flag.store(false, std::memory_order_release); }
+    } loadingGuard{c.mmdLoading};
+
+    if (pathUtf8.empty()) return;
+    const std::filesystem::path filePath = PathFromUtf8(pathUtf8);
+    const std::string displayName = PathToUtf8(filePath.filename());
+
+    mmd::TargetSkeletonInput targetSkel;
+    std::vector<mmd::MorphTargetSlot> morphSlots;
+    uint64_t targetId = 0;
+    {
+        std::scoped_lock lock(c.mmdMutex);
+        targetId = c.targetSkelTargetId;
+        targetSkel = c.targetSkelForMmd;
+        morphSlots = c.morphTargetSlotsForMmd;
+    }
+    if (targetSkel.bones.empty()) {
+        SetNotice(c, c.text.Text("notice.no-skeleton", "Load a target skeleton before importing."));
+        return;
+    }
+
+    const std::filesystem::path refPath = ResolveReferenceAssetPath(c, refMode);
+    mmd::ReferenceSkeleton refSkel;
+    std::string err;
+    if (!mmd::LoadReferenceSkeletonFile(refPath, refSkel, err)) {
+        const std::string refName = PathToUtf8(refPath.filename());
+        const std::string_view args[]{refName};
+        SetNotice(c, c.text.Format("notice.mmd-no-ref", "Missing reference skeleton asset: {0}", args));
+        return;
+    }
+
+    mmd::VmdDocument doc;
+    const bool okParse = PathHasExtLower(filePath, ".vpd")
+                             ? mmd::ParseVpdFile(filePath, doc, err)
+                             : mmd::ParseVmdFile(filePath, doc, err);
+    if (!okParse) {
+        const std::string_view args[]{err};
+        SetNotice(c, c.text.Format("notice.mmd-failed", "Failed to load motion: {0}", args));
+        return;
+    }
+
+    auto built = std::make_shared<mmd::LoadedMotion>();
+    if (!mmd::BuildUnityMotion(doc, refSkel, targetSkel, opts, *built, err)) {
+        const std::string_view args[]{err};
+        SetNotice(c, c.text.Format("notice.mmd-failed", "Failed to load motion: {0}", args));
+        return;
+    }
+    built->sourcePath = pathUtf8;
+    built->displayName = displayName;
+    built->referenceMode = refMode;
+
+    auto bindings = mmd::BuildMorphBindings(built->morphTracks, morphSlots);
+
+    const std::string frameStr = std::to_string(built->frameCount);
+    const std::string boneStr = std::to_string(built->mappedBoneCount);
+    const size_t builtBoneCount = targetSkel.bones.size();
+    {
+        std::scoped_lock lock(c.mmdMutex);
+        c.pendingMmdMotion = PendingMmdMotionResult{std::move(built), std::move(bindings), targetId, builtBoneCount};
+    }
+
+    const std::string_view args[]{displayName, frameStr, boneStr};
+    SetNotice(c, c.text.Format("notice.mmd-loaded", "Loaded {0}: {1} frames, {2} bones mapped", args));
+}
+
+void ExecuteLoadMmdCameraWorker(Context& c, const std::string& pathUtf8) {
+    if (pathUtf8.empty()) return;
+    const std::filesystem::path filePath = PathFromUtf8(pathUtf8);
+    const std::string displayName = PathToUtf8(filePath.filename());
+
+    mmd::VmdDocument doc;
+    std::string err;
+    if (!mmd::ParseVmdFile(filePath, doc, err)) {
+        const std::string_view args[]{err};
+        SetNotice(c, c.text.Format("notice.mmd-failed", "Failed to load motion: {0}", args));
+        return;
+    }
+    if (doc.cameraKeys.empty()) {
+        const std::string_view args[]{displayName};
+        SetNotice(c, c.text.Format("notice.mmd-cam-empty", "No camera keyframes found in {0}", args));
+        return;
+    }
+    const std::string keyStr = std::to_string(doc.cameraKeys.size());
+    {
+        std::scoped_lock lock(c.mmdMutex);
+        c.pendingMmdCamera = PendingMmdCameraResult{std::move(doc.cameraKeys), displayName};
+    }
+    const std::string_view args[]{displayName, keyStr};
+    SetNotice(c, c.text.Format("notice.mmd-cam-loaded", "Loaded camera {0} ({1} keys)", args));
 }
 
 void CABBIRD_CALL RunWorkerIoTask(void* raw, CabbirdGenerationHandleV1) noexcept {
@@ -1835,9 +3055,62 @@ void CABBIRD_CALL RunWorkerIoTask(void* raw, CabbirdGenerationHandleV1) noexcept
             batch.swap(c.ioQueue);
         }
         for (const auto& job : batch) {
+            if (job.kind == WorkerJobKind::BrowseMmdMotion) {
+                if (c.fileDialogOpen.exchange(true, std::memory_order_acq_rel)) continue;
+                std::optional<std::string> picked;
+                try {
+                    picked = BrowseFileDialogWorker(job.path, false);
+                } catch (...) {}
+                c.fileDialogOpen.store(false, std::memory_order_release);
+                if (picked && !picked->empty()) {
+                    {
+                        std::scoped_lock lock(c.mmdMutex);
+                        c.pickedMotionPath = *picked;
+                    }
+                    {
+                        std::scoped_lock lock(c.settingsMutex);
+                        if (picked->size() <= 520) c.settings.mmdMotionPath = *picked;
+                    }
+                    QueueSaveSettings(c);
+                    c.mmdLoading.store(true, std::memory_order_release);
+                    ExecuteLoadMmdMotionWorker(c, *picked, job.mmdReferenceMode, job.mmdOptions);
+                }
+                continue;
+            }
+            if (job.kind == WorkerJobKind::LoadMmdMotion) {
+                c.mmdLoading.store(true, std::memory_order_release);
+                ExecuteLoadMmdMotionWorker(c, job.path, job.mmdReferenceMode, job.mmdOptions);
+                continue;
+            }
+            if (job.kind == WorkerJobKind::BrowseMmdCamera) {
+                if (c.fileDialogOpen.exchange(true, std::memory_order_acq_rel)) continue;
+                std::optional<std::string> picked;
+                try {
+                    picked = BrowseFileDialogWorker(job.path, true);
+                } catch (...) {}
+                c.fileDialogOpen.store(false, std::memory_order_release);
+                if (picked && !picked->empty()) {
+                    {
+                        std::scoped_lock lock(c.mmdMutex);
+                        c.pickedCameraPath = *picked;
+                    }
+                    {
+                        std::scoped_lock lock(c.settingsMutex);
+                        if (picked->size() <= 520) c.settings.mmdCameraPath = *picked;
+                    }
+                    QueueSaveSettings(c);
+                    ExecuteLoadMmdCameraWorker(c, *picked);
+                }
+                continue;
+            }
+            if (job.kind == WorkerJobKind::LoadMmdCamera) {
+                ExecuteLoadMmdCameraWorker(c, job.path);
+                continue;
+            }
+
             const auto fullPath = ResolveStateFilePath(c, job.path);
-            const std::string displayPath = fullPath.filename().string();
-            if (!job.isImport) {
+            const std::string displayPath = PathToUtf8(fullPath.filename());
+            if (job.kind == WorkerJobKind::ExportPose || job.kind == WorkerJobKind::ExportSkeleton) {
                 std::error_code ec;
                 if (fullPath.has_parent_path()) {
                     std::filesystem::create_directories(fullPath.parent_path(), ec);
@@ -1856,10 +3129,10 @@ void CABBIRD_CALL RunWorkerIoTask(void* raw, CabbirdGenerationHandleV1) noexcept
                     continue;
                 }
                 const std::string_view args[]{displayPath};
-                SetNotice(c, job.isSkeletonExport
+                SetNotice(c, job.kind == WorkerJobKind::ExportSkeleton
                     ? c.text.Format("notice.skeleton-exported", "Exported skeleton to {0}.", args)
                     : c.text.Format("notice.pose-exported", "Exported pose to {0}.", args));
-            } else {
+            } else if (job.kind == WorkerJobKind::ImportPose) {
                 std::ifstream in(fullPath, std::ios::binary);
                 if (!in.is_open()) {
                     const std::string_view args[]{displayPath};
@@ -1906,6 +3179,8 @@ void CABBIRD_CALL RunWorkerIoTask(void* raw, CabbirdGenerationHandleV1) noexcept
             }
         }
     } catch (...) {
+        c.mmdLoading.store(false, std::memory_order_release);
+        c.fileDialogOpen.store(false, std::memory_order_release);
         SetNotice(c, c.text.Text("notice.io-error", "File operation failed."));
     }
 }
@@ -2020,21 +3295,29 @@ void HandleViewportInteraction(Context& c, const Settings& s, const CabbirdInput
                           KeyDown(in, VK_CONTROL) || KeyDown(in, VK_LCONTROL) || KeyDown(in, VK_RCONTROL);
     const bool ctrlZ = ctrlDown && KeyDown(in, 'Z');
     const bool ctrlY = ctrlDown && KeyDown(in, 'Y');
-    if (menuOwnsMouse && !uiWantsKeyboard && c.renderSnap.targetAlive && c.drag.mode == DragMode::None) {
-        if (ctrlZ && !c.prevCtrlZ) {
-            PoseSnapshot restored;
-            if (c.history.Undo(CaptureLiveSnapshot(c.renderSnap), restored)) {
-                ApplySnapshotToTarget(c, restored);
-            }
-        } else if (ctrlY && !c.prevCtrlY) {
-            PoseSnapshot restored;
-            if (c.history.Redo(restored)) {
-                ApplySnapshotToTarget(c, restored);
+    const bool spaceDown = KeyDown(in, VK_SPACE);
+    if (menuOwnsMouse && !uiWantsKeyboard && c.drag.mode == DragMode::None) {
+        if (spaceDown && !c.prevSpaceDown && (c.renderSnap.mmd.motionLoaded || c.renderSnap.mmd.cameraLoaded)) {
+            std::scoped_lock lock(c.commandMutex);
+            c.pending.mmdTogglePlay = true;
+        }
+        if (c.renderSnap.targetAlive) {
+            if (ctrlZ && !c.prevCtrlZ) {
+                PoseSnapshot restored;
+                if (c.history.Undo(CaptureLiveSnapshot(c.renderSnap), restored)) {
+                    ApplySnapshotToTarget(c, restored);
+                }
+            } else if (ctrlY && !c.prevCtrlY) {
+                PoseSnapshot restored;
+                if (c.history.Redo(restored)) {
+                    ApplySnapshotToTarget(c, restored);
+                }
             }
         }
     }
     c.prevCtrlZ = ctrlZ;
     c.prevCtrlY = ctrlY;
+    c.prevSpaceDown = spaceDown;
 
     auto finishPoseDrag = [&]() {
         if (c.drag.dragMoved && c.drag.currentOffsets.size() == c.renderSnap.bones.size()) {
@@ -2100,11 +3383,12 @@ void HandleViewportInteraction(Context& c, const Settings& s, const CabbirdInput
             } else {
                 const float dx = mouse.x - c.drag.lastMouse.x;
                 const float dy = mouse.y - c.drag.lastMouse.y;
-                if (dx != 0.f || dy != 0.f) {
+                if (dx != 0.f || dy != 0.f || wheelNotches != 0.f) {
                     std::scoped_lock lock(c.commandMutex);
                     c.pending.hasOrbitDelta = true;
                     c.pending.orbitDx += dx;
                     c.pending.orbitDy += dy;
+                    c.pending.zoomNotches += wheelNotches;
                 }
                 c.drag.lastMouse = mouse;
             }
@@ -2114,11 +3398,12 @@ void HandleViewportInteraction(Context& c, const Settings& s, const CabbirdInput
             } else {
                 const float dx = mouse.x - c.drag.lastMouse.x;
                 const float dy = mouse.y - c.drag.lastMouse.y;
-                if (dx != 0.f || dy != 0.f) {
+                if (dx != 0.f || dy != 0.f || wheelNotches != 0.f) {
                     std::scoped_lock lock(c.commandMutex);
                     c.pending.hasOrbitDelta = true;
                     c.pending.panDx += dx;
                     c.pending.panDy += dy;
+                    c.pending.zoomNotches += wheelNotches;
                 }
                 c.drag.lastMouse = mouse;
             }
@@ -2129,11 +3414,10 @@ void HandleViewportInteraction(Context& c, const Settings& s, const CabbirdInput
                 finishPoseDrag();
             } else if (passedThreshold(kGizmoDragThresholdPx, false) &&
                        c.drag.boneIndex >= 0 && static_cast<size_t>(c.drag.boneIndex) < c.renderSnap.bones.size()) {
-                const Vec2 totalDelta{mouse.x - c.drag.startMouse.x, mouse.y - c.drag.startMouse.y};
-                const double deg = ComputeGizmoDragDegrees(totalDelta, c.drag.gizmoTangent);
+                const double angleRad = UpdateGizmoDragRadians(c.drag.gizmoDrag, mouse);
                 const Vec3 localAxis = GizmoLocalAxis(c.drag.gizmoAxis);
                 const Quat startQ = Quat::FromUnityEuler(c.drag.startOffsets[static_cast<size_t>(c.drag.boneIndex)]);
-                Quat newQ = (startQ * Quat::FromAxisAngle(localAxis, deg * kDegToRad)).Normalized();
+                Quat newQ = (startQ * Quat::FromAxisAngle(localAxis, angleRad)).Normalized();
                 if (s.enableJointLimits != 0) {
                     newQ = ClampOffsetInBoneFrame(newQ, c.renderSnap.bones[static_cast<size_t>(c.drag.boneIndex)].limit);
                 }
@@ -2204,16 +3488,26 @@ void HandleViewportInteraction(Context& c, const Settings& s, const CabbirdInput
                                        targetPos, polePos, newMid, clampedEnd)) {
                         const Vec3 newUpperDir = (newMid - c.drag.startUpperPos).Normalized();
                         const Quat upperWorldDelta = Quat::FromToRotation(c.drag.startUpperToMidDir, newUpperDir);
+                        const EulerAngles startUpperEuler = c.drag.startOffsets[static_cast<size_t>(c.drag.ikChain.upper)];
                         const EulerAngles upperEuler = ComputeBoneOffsetFromWorldDelta(
                             c.renderSnap, c.drag.ikChain.upper,
                             c.drag.startUpperWorldRot,
-                            c.drag.startOffsets[static_cast<size_t>(c.drag.ikChain.upper)],
+                            startUpperEuler,
                             upperWorldDelta, s.enableJointLimits != 0);
 
-                        const Vec3 carriedLowerDir = upperWorldDelta.Rotate(c.drag.startMidToEndDir).Normalized();
-                        const Vec3 desiredLowerDir = (clampedEnd - newMid).Normalized();
+                        // Compute actual applied upper-bone world delta (respecting joint limits if clamped).
+                        const Quat upperLocalStep = (Quat::FromUnityEuler(startUpperEuler).Inverse() *
+                                                     Quat::FromUnityEuler(upperEuler)).Normalized();
+                        const Quat appliedUpperWorld = (c.drag.startUpperWorldRot * upperLocalStep *
+                                                        c.drag.startUpperWorldRot.Inverse()).Normalized();
+                        const double upperLen = (c.drag.startMidPos - c.drag.startUpperPos).Length();
+                        const Vec3 actualMid = c.drag.startUpperPos +
+                                               appliedUpperWorld.Rotate(c.drag.startUpperToMidDir).Normalized() * upperLen;
+
+                        const Vec3 carriedLowerDir = appliedUpperWorld.Rotate(c.drag.startMidToEndDir).Normalized();
+                        const Vec3 desiredLowerDir = (clampedEnd - actualMid).Normalized();
                         const Quat lowerExtraWorld = Quat::FromToRotation(carriedLowerDir, desiredLowerDir);
-                        const Quat lowerAfterUpperRot = (upperWorldDelta * c.drag.startLowerWorldRot).Normalized();
+                        const Quat lowerAfterUpperRot = (appliedUpperWorld * c.drag.startLowerWorldRot).Normalized();
                         const EulerAngles lowerEuler = ComputeBoneOffsetFromWorldDelta(
                             c.renderSnap, c.drag.ikChain.lower,
                             lowerAfterUpperRot,
@@ -2255,35 +3549,63 @@ void HandleViewportInteraction(Context& c, const Settings& s, const CabbirdInput
     c.hoveredRootAxis = kGizmoAxisNone;
 
     if (!overUi && canPickScene) {
-        RootArrowPick rootPick;
-        if (s.showGizmo != 0 && c.selectedBone >= 0 && c.selectedBone == c.renderSnap.rootBoneIndex &&
-            static_cast<size_t>(c.selectedBone) < c.renderSnap.bones.size()) {
-            const auto& rb = c.renderSnap.bones[static_cast<size_t>(c.selectedBone)];
-            rootPick = PickRootMoveArrows(cam, rb.worldPos, c.renderSnap.rootParentWorldRot, mouse.x, mouse.y);
-            c.hoveredRootAxis = rootPick.axis;
-        }
-
-        GizmoPickResult gizmoPick;
-        if (c.hoveredRootAxis == kGizmoAxisNone && s.showGizmo != 0 && c.selectedBone >= 0 &&
-            static_cast<size_t>(c.selectedBone) < c.renderSnap.bones.size()) {
-            const auto& sb = c.renderSnap.bones[static_cast<size_t>(c.selectedBone)];
-            gizmoPick = PickRotationGizmo(cam, sb.worldPos, sb.worldRot, mouse.x, mouse.y);
-            c.hoveredGizmoAxis = gizmoPick.axis;
-        }
-
-        const float pickRad = std::max(kJointPickRadiusMinPx, s.jointRadius + 6.f);
-        float bestDistSq = pickRad * pickRad;
+        // 1. Pick visible joint dots FIRST so clicking/dragging ANY joint position (including the
+        // currently selected joint center dot) is never hijacked by the 3 rotation rings or arrows.
+        const float pickRad = std::max(kJointPickRadiusMinPx, s.jointRadius + 4.f);
+        float nearestDistSq = pickRad * pickRad;
+        bool anyBoneNear = false;
+        std::vector<Vec2> cachedScreen(c.renderSnap.bones.size());
+        std::vector<uint8_t> cachedValid(c.renderSnap.bones.size(), 0);
         for (size_t i = 0; i < c.renderSnap.bones.size(); ++i) {
             const auto& b = c.renderSnap.bones[i];
             if (!BoneVisibleInOverlay(b, s, static_cast<int>(i), c.selectedBone)) continue;
-            Vec2 sp{};
-            if (!cam.WorldToScreen(b.worldPos, sp)) continue;
-            const float dx = sp.x - mouse.x;
-            const float dy = sp.y - mouse.y;
+            if (!cam.WorldToScreen(b.worldPos, cachedScreen[i])) continue;
+            cachedValid[i] = 1;
+            const float dx = cachedScreen[i].x - mouse.x;
+            const float dy = cachedScreen[i].y - mouse.y;
             const float dSq = dx * dx + dy * dy;
-            if (dSq < bestDistSq) {
-                bestDistSq = dSq;
-                c.hoveredBone = static_cast<int>(i);
+            if (dSq <= nearestDistSq) {
+                nearestDistSq = dSq;
+                anyBoneNear = true;
+            }
+        }
+        if (anyBoneNear) {
+            // Break ties among stacked bones within kJointStackTiePx by descendant count (then nearest).
+            const float tieLimit = std::sqrt(nearestDistSq) + kJointStackTiePx;
+            const float tieLimitSq = tieLimit * tieLimit;
+            uint32_t bestWeight = 0;
+            float bestDistSq = tieLimitSq + 1.f;
+            for (size_t i = 0; i < c.renderSnap.bones.size(); ++i) {
+                if (!cachedValid[i]) continue;
+                const float dx = cachedScreen[i].x - mouse.x;
+                const float dy = cachedScreen[i].y - mouse.y;
+                const float dSq = dx * dx + dy * dy;
+                if (dSq > tieLimitSq) continue;
+                const uint32_t w = (i < c.boneDescendantCount.size()) ? c.boneDescendantCount[i] : 0U;
+                if (c.hoveredBone < 0 || w > bestWeight || (w == bestWeight && dSq < bestDistSq)) {
+                    c.hoveredBone = static_cast<int>(i);
+                    bestWeight = w;
+                    bestDistSq = dSq;
+                }
+            }
+        }
+
+        // 2. Only hit-test root move arrows and rotation rings when the cursor is NOT over a joint dot.
+        RootArrowPick rootPick;
+        GizmoPickResult gizmoPick;
+        if (c.hoveredBone < 0 && s.showGizmo != 0 && c.selectedBone >= 0 &&
+            static_cast<size_t>(c.selectedBone) < c.renderSnap.bones.size()) {
+            const float centerExcl = std::max(kGizmoDefaultCenterExclusionPx, s.jointRadius + 10.f);
+            const auto& sb = c.renderSnap.bones[static_cast<size_t>(c.selectedBone)];
+            if (c.selectedBone == c.renderSnap.rootBoneIndex) {
+                rootPick = PickRootMoveArrows(cam, sb.worldPos, c.renderSnap.rootParentWorldRot,
+                                              mouse.x, mouse.y, centerExcl);
+                c.hoveredRootAxis = rootPick.axis;
+            }
+            if (c.hoveredRootAxis == kGizmoAxisNone) {
+                gizmoPick = PickRotationGizmo(cam, sb.worldPos, sb.worldRot,
+                                              mouse.x, mouse.y, centerExcl);
+                c.hoveredGizmoAxis = gizmoPick.axis;
             }
         }
 
@@ -2299,19 +3621,7 @@ void HandleViewportInteraction(Context& c, const Settings& s, const CabbirdInput
         };
 
         if (leftPressed) {
-            if (c.hoveredRootAxis != kGizmoAxisNone) {
-                snapshotForDrag();
-                c.drag.mode = DragMode::RootArrow;
-                c.drag.boneIndex = c.selectedBone;
-                c.drag.gizmoAxis = rootPick.axis;
-                c.drag.rootArrowPick = rootPick;
-            } else if (c.hoveredGizmoAxis != kGizmoAxisNone) {
-                snapshotForDrag();
-                c.drag.mode = DragMode::GizmoRing;
-                c.drag.boneIndex = c.selectedBone;
-                c.drag.gizmoAxis = gizmoPick.axis;
-                c.drag.gizmoTangent = gizmoPick.tangent2D;
-            } else if (c.hoveredBone >= 0) {
+            if (c.hoveredBone >= 0) {
                 c.selectedBone = c.hoveredBone;
                 snapshotForDrag();
                 c.drag.boneIndex = c.hoveredBone;
@@ -2362,31 +3672,45 @@ void HandleViewportInteraction(Context& c, const Settings& s, const CabbirdInput
                         }
                     }
                 }
-            }
-        } else if (rightPressed) {
-            if (c.hoveredBone >= 0) {
-                c.selectedBone = c.hoveredBone;
+            } else if (c.hoveredRootAxis != kGizmoAxisNone) {
                 snapshotForDrag();
-                c.drag.mode = DragMode::JointTwist;
-                c.drag.boneIndex = c.hoveredBone;
-            } else if (c.renderSnap.orbitActive) {
-                c.drag = {};
-                c.drag.mode = DragMode::OrbitRotate;
-                c.drag.startMouse = mouse;
-                c.drag.lastMouse = mouse;
+                c.drag.mode = DragMode::RootArrow;
+                c.drag.boneIndex = c.selectedBone;
+                c.drag.gizmoAxis = rootPick.axis;
+                c.drag.rootArrowPick = rootPick;
+            } else if (c.hoveredGizmoAxis != kGizmoAxisNone) {
+                snapshotForDrag();
+                c.drag.mode = DragMode::GizmoRing;
+                c.drag.boneIndex = c.selectedBone;
+                c.drag.gizmoAxis = gizmoPick.axis;
+                c.drag.gizmoDrag = BeginGizmoDrag(gizmoPick, mouse);
             }
-        } else if (middlePressed && c.renderSnap.orbitActive) {
+        } else if (rightPressed && c.hoveredBone >= 0) {
+            c.selectedBone = c.hoveredBone;
+            snapshotForDrag();
+            c.drag.mode = DragMode::JointTwist;
+            c.drag.boneIndex = c.hoveredBone;
+        }
+    }
+
+    // Orbit camera controls work everywhere outside UI panels, even when the 3D skeleton is hidden.
+    if (!overUi && c.renderSnap.orbitActive && c.drag.mode == DragMode::None) {
+        if (rightPressed && c.hoveredBone < 0) {
+            c.drag = {};
+            c.drag.mode = DragMode::OrbitRotate;
+            c.drag.startMouse = mouse;
+            c.drag.lastMouse = mouse;
+        } else if (middlePressed) {
             c.drag = {};
             c.drag.mode = DragMode::OrbitPan;
             c.drag.startMouse = mouse;
             c.drag.lastMouse = mouse;
         }
-    }
-
-    if (!overUi && c.renderSnap.orbitActive && wheelNotches != 0.f) {
-        std::scoped_lock lock(c.commandMutex);
-        c.pending.hasOrbitDelta = true;
-        c.pending.zoomNotches += wheelNotches;
+        if (wheelNotches != 0.f) {
+            std::scoped_lock lock(c.commandMutex);
+            c.pending.hasOrbitDelta = true;
+            c.pending.zoomNotches += wheelNotches;
+        }
     }
 
     c.prevLeftDown = leftDown;
@@ -2402,7 +3726,7 @@ void DrawSkeletonAndGizmoOverlay(Context& c, const CabbirdUiServiceV1* ui, const
     const auto& cam = c.renderSnap.camera;
     const auto& bones = c.renderSnap.bones;
     c.drawPrims.clear();
-    c.drawPrims.reserve(bones.size() * 3 + 200);
+    c.drawPrims.reserve(bones.size() * 3 + 220);
 
     auto pushLine = [&](Vec2 a, Vec2 b, uint32_t col, float thick) {
         CabbirdUiScreenPrimitiveV1 p{sizeof(p)};
@@ -2437,6 +3761,7 @@ void DrawSkeletonAndGizmoOverlay(Context& c, const CabbirdUiServiceV1* ui, const
     const uint32_t colLineEdited = CABBIRD_RGBA_V1(255, 215, 95, 225);
     const uint32_t colLineActive = CABBIRD_RGBA_V1(80, 240, 255, 245);
 
+    // 1. Bone lines.
     for (size_t i = 0; i < bones.size(); ++i) {
         if (!projected[i]) continue;
         const int p = bones[i].parent;
@@ -2448,6 +3773,71 @@ void DrawSkeletonAndGizmoOverlay(Context& c, const CabbirdUiServiceV1* ui, const
         pushLine(screenPos[static_cast<size_t>(p)], screenPos[i], col, isActive ? 2.4f : 1.6f);
     }
 
+    // 2. Rotation gizmo rings & root move arrows (drawn behind joint dots so dots remain crisp and clickable).
+    if (s.showGizmo != 0 && c.selectedBone >= 0 && static_cast<size_t>(c.selectedBone) < bones.size()) {
+        const auto& sb = bones[static_cast<size_t>(c.selectedBone)];
+        const double ringRadius = ComputeGizmoWorldRadius(cam, sb.worldPos, kGizmoScreenRadiusPx);
+        const uint32_t axisColorsFront[3]{
+            CABBIRD_RGBA_V1(245, 78, 78, 240),
+            CABBIRD_RGBA_V1(82, 230, 108, 240),
+            CABBIRD_RGBA_V1(88, 162, 255, 240)
+        };
+        const uint32_t axisColorsBack[3]{
+            CABBIRD_RGBA_V1(245, 78, 78, 65),
+            CABBIRD_RGBA_V1(82, 230, 108, 65),
+            CABBIRD_RGBA_V1(88, 162, 255, 65)
+        };
+        const uint32_t colHighlight = CABBIRD_RGBA_V1(255, 245, 130, 255);
+
+        for (int axis = 0; axis < 3; ++axis) {
+            const bool active = (c.drag.mode == DragMode::GizmoRing && c.drag.gizmoAxis == axis) ||
+                                (c.drag.mode == DragMode::None && c.hoveredGizmoAxis == axis);
+            BuildRotationRingSegments(cam, sb.worldPos, sb.worldRot, axis, ringRadius, c.gizmoSegs);
+            for (const auto& seg : c.gizmoSegs) {
+                const uint32_t col = (active && seg.frontFacing) ? colHighlight
+                                   : (seg.frontFacing ? axisColorsFront[axis] : axisColorsBack[axis]);
+                const float thick = (active && seg.frontFacing) ? 3.2f : (seg.frontFacing ? 2.0f : 1.0f);
+                pushLine(seg.a, seg.b, col, thick);
+            }
+        }
+
+        if (c.selectedBone == c.renderSnap.rootBoneIndex) {
+            Vec2 o2{};
+            if (cam.WorldToScreen(sb.worldPos, o2)) {
+                const double arrowLen = ComputeGizmoWorldRadius(cam, sb.worldPos, kGizmoArrowScreenLenPx);
+                const float innerGap = s.jointRadius + 5.f;
+                for (int axis = 0; axis < 3; ++axis) {
+                    const Vec3 dirWorld = c.renderSnap.rootParentWorldRot.Rotate(GizmoLocalAxis(axis)).Normalized();
+                    Vec2 tip{};
+                    if (!cam.WorldToScreen(sb.worldPos + dirWorld * arrowLen, tip)) continue;
+                    const float ax = tip.x - o2.x;
+                    const float ay = tip.y - o2.y;
+                    const float segLen = std::hypot(ax, ay);
+                    if (segLen < innerGap + 8.f) continue;
+                    const float ux = ax / segLen;
+                    const float uy = ay / segLen;
+                    const Vec2 start{o2.x + ux * innerGap, o2.y + uy * innerGap};
+                    const bool active = (c.drag.mode == DragMode::RootArrow && c.drag.gizmoAxis == axis) ||
+                                        (c.drag.mode == DragMode::None && c.hoveredRootAxis == axis);
+                    const uint32_t col = active ? colHighlight : axisColorsFront[axis];
+                    const float thick = active ? 3.6f : 2.5f;
+                    pushLine(start, tip, colLineShadow, thick + 1.8f);
+                    pushLine(start, tip, col, thick);
+                    // Arrowhead wings at tip.
+                    const float headLen = active ? 10.f : 8.5f;
+                    const float headWidth = active ? 5.5f : 4.5f;
+                    const Vec2 leftWing{tip.x - ux * headLen - uy * headWidth, tip.y - uy * headLen + ux * headWidth};
+                    const Vec2 rightWing{tip.x - ux * headLen + uy * headWidth, tip.y - uy * headLen - ux * headWidth};
+                    pushLine(tip, leftWing, colLineShadow, thick + 1.4f);
+                    pushLine(tip, rightWing, colLineShadow, thick + 1.4f);
+                    pushLine(tip, leftWing, col, thick);
+                    pushLine(tip, rightWing, col, thick);
+                }
+            }
+        }
+    }
+
+    // 3. Joint dots rendered on top of lines and gizmo rings.
     const uint32_t colJointNormal   = CABBIRD_RGBA_V1(230, 245, 255, 215);
     const uint32_t colJointIk       = CABBIRD_RGBA_V1(120, 235, 175, 235);
     const uint32_t colJointEdited   = CABBIRD_RGBA_V1(255, 195, 70, 240);
@@ -2467,58 +3857,12 @@ void DrawSkeletonAndGizmoOverlay(Context& c, const CabbirdUiServiceV1* ui, const
 
         float r = s.jointRadius;
         uint32_t fill = isIkEnd ? colJointIk : (isEdited ? colJointEdited : colJointNormal);
-        if (isHovered) { r += 2.0f; fill = colJointHovered; }
-        if (isSelected) { r += 2.5f; fill = colJointSelected; }
+        if (isSelected) { r += 2.0f; fill = colJointSelected; }
+        if (isHovered) { r += 2.5f; fill = colJointHovered; }
         if (isDragged) { r += 3.0f; fill = colJointDragged; }
 
         pushCircle(screenPos[i], r, fill, true);
         pushCircle(screenPos[i], r + 0.8f, colOutlineDark, false, 1.5f);
-    }
-
-    if (s.showGizmo != 0 && c.selectedBone >= 0 && static_cast<size_t>(c.selectedBone) < bones.size()) {
-        const auto& sb = bones[static_cast<size_t>(c.selectedBone)];
-        const double ringRadius = ComputeGizmoWorldRadius(cam, sb.worldPos, kGizmoScreenRadiusPx);
-        const uint32_t axisColorsFront[3]{
-            CABBIRD_RGBA_V1(245, 78, 78, 240),
-            CABBIRD_RGBA_V1(82, 230, 108, 240),
-            CABBIRD_RGBA_V1(88, 162, 255, 240)
-        };
-        const uint32_t axisColorsBack[3]{
-            CABBIRD_RGBA_V1(245, 78, 78, 85),
-            CABBIRD_RGBA_V1(82, 230, 108, 85),
-            CABBIRD_RGBA_V1(88, 162, 255, 85)
-        };
-        const uint32_t colHighlight = CABBIRD_RGBA_V1(255, 245, 130, 255);
-
-        for (int axis = 0; axis < 3; ++axis) {
-            const bool active = (c.drag.mode == DragMode::GizmoRing && c.drag.gizmoAxis == axis) ||
-                                (c.drag.mode == DragMode::None && c.hoveredGizmoAxis == axis);
-            BuildRotationRingSegments(cam, sb.worldPos, sb.worldRot, axis, ringRadius, c.gizmoSegs);
-            for (const auto& seg : c.gizmoSegs) {
-                const uint32_t col = active ? colHighlight : (seg.frontFacing ? axisColorsFront[axis] : axisColorsBack[axis]);
-                const float thick = active ? 3.2f : (seg.frontFacing ? 2.1f : 1.2f);
-                pushLine(seg.a, seg.b, col, thick);
-            }
-        }
-
-        if (c.selectedBone == c.renderSnap.rootBoneIndex) {
-            Vec2 o2{};
-            if (cam.WorldToScreen(sb.worldPos, o2)) {
-                const double arrowLen = ComputeGizmoWorldRadius(cam, sb.worldPos, kGizmoArrowScreenLenPx);
-                for (int axis = 0; axis < 3; ++axis) {
-                    const Vec3 dirWorld = c.renderSnap.rootParentWorldRot.Rotate(GizmoLocalAxis(axis)).Normalized();
-                    Vec2 tip{};
-                    if (!cam.WorldToScreen(sb.worldPos + dirWorld * arrowLen, tip)) continue;
-                    const bool active = (c.drag.mode == DragMode::RootArrow && c.drag.gizmoAxis == axis) ||
-                                        (c.drag.mode == DragMode::None && c.hoveredRootAxis == axis);
-                    const uint32_t col = active ? colHighlight : axisColorsFront[axis];
-                    const float thick = active ? 3.8f : 2.6f;
-                    pushLine(o2, tip, colLineShadow, thick + 1.8f);
-                    pushLine(o2, tip, col, thick);
-                    pushCircle(tip, active ? 5.5f : 4.2f, col, true);
-                }
-            }
-        }
     }
 
     if (!c.drawPrims.empty()) {
@@ -2721,11 +4065,13 @@ void DrawTargetAndSettingsTab(Context& c, const CabbirdUiServiceV1* ui, Settings
         c.pending.wantOrbitEnabled = (orbitOn != 0);
     }
     if (c.renderSnap.orbitActive) {
-        if (ui->slider_float(u, StringView(c.text.Text("camera.fov", "Camera FOV")), &s.orbitFov, 15.f, 110.f)) {
+        float liveFov = c.renderSnap.orbit.initialized ? c.renderSnap.orbit.fovDeg : s.orbitFov;
+        if (ui->slider_float(u, StringView(c.text.Text("camera.fov", "Camera FOV")), &liveFov, 15.f, 110.f)) {
+            s.orbitFov = liveFov;
             settingsChanged = true;
             std::scoped_lock lock(c.commandMutex);
             c.pending.hasOrbitFov = true;
-            c.pending.orbitFov = s.orbitFov;
+            c.pending.orbitFov = liveFov;
         }
         if (ui->button_enabled(u, StringView(c.text.Text("camera.focus-joint", "Focus Selected")), 0.f, 0.f,
                                c.selectedBone >= 0 ? 1 : 0)) {
@@ -2739,7 +4085,7 @@ void DrawTargetAndSettingsTab(Context& c, const CabbirdUiServiceV1* ui, Settings
             c.pending.orbitResetView = true;
         }
         UiTextWrapped(ui, c.text.Text("camera.hint",
-            "Empty space: RMB orbit, MMB pan, Wheel zoom. Joints: LMB drag (+Wheel depth), RMB twist."));
+            "Empty space: RMB orbit, MMB pan, Wheel zoom; Joints: LMB drag position (+Wheel depth), RMB twist"));
     }
 
     ui->separator(u);
@@ -2762,11 +4108,11 @@ void DrawTargetAndSettingsTab(Context& c, const CabbirdUiServiceV1* ui, Settings
             offs.push_back(b.offsetEuler);
         }
         const auto doc = SerializePoseJson(c.renderSnap.activeTargetName, names, offs, c.renderSnap.rootOffset);
-        QueueWorkerIo(c, {false, false, c.posePathBuf, doc.dump(2)});
+        QueueWorkerIo(c, {WorkerJobKind::ExportPose, c.posePathBuf, doc.dump(2), 0, {}});
     }
     ui->same_line(u, 0.f, 6.f);
     if (ui->button_enabled(u, StringView(c.text.Text("file.import-pose", "Import Pose")), 0.f, 0.f, hasSkel)) {
-        QueueWorkerIo(c, {true, false, c.posePathBuf, {}});
+        QueueWorkerIo(c, {WorkerJobKind::ImportPose, c.posePathBuf, {}, 0, {}});
     }
     ui->same_line(u, 0.f, 6.f);
     if (ui->button_enabled(u, StringView(c.text.Text("file.export-skeleton", "Export Skeleton")), 0.f, 0.f, hasSkel)) {
@@ -2776,7 +4122,261 @@ void DrawTargetAndSettingsTab(Context& c, const CabbirdUiServiceV1* ui, Settings
             out.push_back({b.name, b.parent, {}, b.restLocalRot, b.worldPos});
         }
         const auto doc = SerializeSkeletonJson(c.renderSnap.activeTargetName, out);
-        QueueWorkerIo(c, {false, true, c.skeletonPathBuf, doc.dump(2)});
+        QueueWorkerIo(c, {WorkerJobKind::ExportSkeleton, c.skeletonPathBuf, doc.dump(2), 0, {}});
+    }
+}
+
+void DrawMmdTab(Context& c, const CabbirdUiServiceV1* ui, Settings& s, bool& settingsChanged) {
+    const auto u = ui->user;
+    const auto& ms = c.renderSnap.mmd;
+    bool mmdRuntimeChanged = false;
+
+    auto buildRetargetOptions = [&]() -> mmd::RetargetOptions {
+        mmd::RetargetOptions opts{};
+        opts.fps = 30.0;
+        opts.ikMode = static_cast<mmd::IkMode>(std::clamp(s.mmdIkMode, 0, 2));
+        opts.hipOnPelvis = (s.mmdHipOnPelvis != 0);
+        opts.feetAnchor = (s.mmdFeetAnchor != 0);
+        opts.targetLegIk = (s.mmdTargetLegIk != 0);
+        return opts;
+    };
+
+    if (ui->input_text(u, StringView(c.text.Text("mmd.file-path", "Motion File") + "##bp_mmd_path"),
+                       c.mmdMotionPathBuf, sizeof(c.mmdMotionPathBuf), CABBIRD_UI_TEXT_INPUT_V1_NONE)) {
+        s.mmdMotionPath = c.mmdMotionPathBuf;
+        settingsChanged = true;
+    }
+
+    const int canBrowse = (!ms.fileDialogBusy && !ms.busyLoading) ? 1 : 0;
+    const int canLoad = (c.renderSnap.targetAlive && !ms.busyLoading && c.mmdMotionPathBuf[0] != '\0') ? 1 : 0;
+    if (ui->button_enabled(u, StringView(c.text.Text("mmd.browse", "Browse...") + "##bp_mmd_brw"), 0.f, 0.f,
+                           (c.renderSnap.targetAlive && canBrowse) ? 1 : 0)) {
+        QueueWorkerIo(c, {WorkerJobKind::BrowseMmdMotion, c.mmdMotionPathBuf, {}, s.mmdReferenceMode, buildRetargetOptions()});
+    }
+    ui->same_line(u, 0.f, 6.f);
+    if (ui->button_enabled(u, StringView(c.text.Text("mmd.load", "Load VMD / VPD") + "##bp_mmd_load"), 0.f, 0.f, canLoad)) {
+        QueueWorkerIo(c, {WorkerJobKind::LoadMmdMotion, c.mmdMotionPathBuf, {}, s.mmdReferenceMode, buildRetargetOptions()});
+    }
+    ui->same_line(u, 0.f, 6.f);
+    if (ui->button_enabled(u, StringView(c.text.Text("mmd.unload", "Unload") + "##bp_mmd_unload"), 0.f, 0.f,
+                           ms.motionLoaded ? 1 : 0)) {
+        std::scoped_lock lock(c.commandMutex);
+        c.pending.mmdUnload = true;
+    }
+
+    if (ms.busyLoading) {
+        UiTextWrapped(ui, c.text.Text("mmd.loading", "Converting and loading motion..."));
+    }
+
+    const std::string refLabels[3]{
+        c.text.Text("mmd.ref.pmx", "Standard Miku PMX"),
+        c.text.Text("mmd.ref.unity", "Unity Miku V4C"),
+        c.text.Text("mmd.ref.endfield", "Endfield Standard A")
+    };
+
+    if (ms.motionLoaded) {
+        const std::string fStr = std::to_string(ms.frameCount);
+        const std::string fpsStr = std::to_string(static_cast<int>(std::llround(ms.fps)));
+        const std::string bStr = std::to_string(ms.mappedBoneCount);
+        const std::string mStr = std::to_string(ms.matchedMorphCount);
+        const std::string_view args[]{ms.motionName, fStr, fpsStr, bStr, mStr};
+        UiTextWrapped(ui, c.text.Format("mmd.summary",
+            "{0} | {1} frames ({2} FPS) | {3} bones, {4} morphs", args));
+
+        const int recIdx = std::clamp(ms.recommendedReference, 0, 2);
+        const std::string_view recArgs[]{refLabels[recIdx]};
+        UiTextWrapped(ui, c.text.Format("mmd.recommend", "Recommended rig: {0}", recArgs));
+    }
+
+    ui->separator(u);
+
+    const bool hasAnyPlayable = ms.motionLoaded || ms.cameraLoaded;
+    const std::string playLabel = ms.playing
+        ? c.text.Text("mmd.pause", "Pause")
+        : c.text.Text("mmd.play", "Play");
+    if (ui->button_enabled(u, StringView(playLabel + "##bp_mmd_play"), 0.f, 0.f, hasAnyPlayable ? 1 : 0)) {
+        std::scoped_lock lock(c.commandMutex);
+        c.pending.mmdTogglePlay = true;
+    }
+    ui->same_line(u, 0.f, 6.f);
+    if (ui->button_enabled(u, StringView(c.text.Text("mmd.stop", "Stop") + "##bp_mmd_stop"), 0.f, 0.f, hasAnyPlayable ? 1 : 0)) {
+        std::scoped_lock lock(c.commandMutex);
+        c.pending.mmdStop = true;
+    }
+    ui->same_line(u, 0.f, 8.f);
+    if (ui->checkbox(u, StringView(c.text.Text("mmd.loop", "Loop") + "##bp_mmd_loop"), &s.mmdLoop)) {
+        settingsChanged = true;
+        mmdRuntimeChanged = true;
+    }
+    ui->same_line(u, 0.f, 8.f);
+    ui->text(u, StringView(c.text.Text("mmd.shortcut-space", "Space: Play / Pause")));
+
+    if (hasAnyPlayable && ms.frameCount > 1) {
+        float frameVal = static_cast<float>(ms.currentFrame);
+        const float maxFrame = static_cast<float>(ms.frameCount - 1);
+        if (ui->slider_float(u, StringView(c.text.Text("mmd.frame", "Frame") + "##bp_mmd_frm"),
+                             &frameVal, 0.f, maxFrame)) {
+            std::scoped_lock lock(c.commandMutex);
+            c.pending.mmdHasSeek = true;
+            c.pending.mmdSeekFrame = static_cast<double>(frameVal);
+        }
+    }
+
+    if (ui->button(u, StringView(c.text.Text("anim.speed-reset", "1.0x") + "##bp_mmd_spd1"), 48.f, 0.f)) {
+        s.mmdSpeed = 1.f;
+        settingsChanged = true;
+        mmdRuntimeChanged = true;
+    }
+    ui->same_line(u, 0.f, 6.f);
+    if (ui->slider_float(u, StringView(c.text.Text("mmd.speed", "Speed") + "##bp_mmd_spd"),
+                         &s.mmdSpeed, 0.1f, 2.5f)) {
+        settingsChanged = true;
+        mmdRuntimeChanged = true;
+    }
+    if (ui->slider_float(u, StringView(c.text.Text("mmd.amp-master", "Amplitude") + "##bp_mmd_amp"),
+                         &s.mmdAmpMaster, 0.f, 2.f)) {
+        settingsChanged = true;
+        mmdRuntimeChanged = true;
+    }
+
+    if (ui->checkbox(u, StringView(c.text.Text("mmd.apply-root", "Root Motion") + "##bp_mmd_root"), &s.mmdApplyRoot)) {
+        settingsChanged = true;
+        mmdRuntimeChanged = true;
+    }
+    ui->same_line(u, 0.f, 10.f);
+    if (ui->checkbox(u, StringView(c.text.Text("mmd.lock-planar", "Lock Planar") + "##bp_mmd_pln"), &s.mmdLockPlanar)) {
+        settingsChanged = true;
+        mmdRuntimeChanged = true;
+    }
+    if (ui->checkbox(u, StringView(c.text.Text("mmd.expressions", "Facial Morphs") + "##bp_mmd_expr"), &s.mmdPlayExpressions)) {
+        settingsChanged = true;
+        mmdRuntimeChanged = true;
+    }
+    ui->same_line(u, 0.f, 10.f);
+    if (ui->checkbox(u, StringView(c.text.Text("mmd.target-leg-ik", "Target Leg IK") + "##bp_mmd_tlik"), &s.mmdTargetLegIk)) {
+        settingsChanged = true;
+    }
+    if (ui->checkbox(u, StringView(c.text.Text("mmd.hip-pelvis", "Hip on Pelvis") + "##bp_mmd_hip"), &s.mmdHipOnPelvis)) {
+        settingsChanged = true;
+    }
+    ui->same_line(u, 0.f, 10.f);
+    if (ui->checkbox(u, StringView(c.text.Text("mmd.feet-anchor", "Feet Anchor") + "##bp_mmd_feet"), &s.mmdFeetAnchor)) {
+        settingsChanged = true;
+    }
+
+    ui->separator(u);
+
+    ui->text(u, StringView(c.text.Text("mmd.ref-label", "Reference Rig")));
+    for (int i = 0; i < 3; ++i) {
+        if (i > 0) ui->same_line(u, 0.f, 4.f);
+        const std::string lbl = refLabels[i] + "##bp_mmd_ref_" + std::to_string(i);
+        if (UiButtonSelectable(ui, lbl, 0.f, s.mmdReferenceMode == i)) {
+            s.mmdReferenceMode = i;
+            settingsChanged = true;
+        }
+    }
+
+    ui->text(u, StringView(c.text.Text("mmd.ik-label", "Source IK")));
+    const std::string ikLabels[3]{
+        c.text.Text("mmd.ik.follow", "Follow VMD"),
+        c.text.Text("mmd.ik.on", "Force On"),
+        c.text.Text("mmd.ik.off", "Force Off")
+    };
+    for (int i = 0; i < 3; ++i) {
+        if (i > 0) ui->same_line(u, 0.f, 4.f);
+        const std::string lbl = ikLabels[i] + "##bp_mmd_ik_" + std::to_string(i);
+        if (UiButtonSelectable(ui, lbl, 0.f, s.mmdIkMode == i)) {
+            s.mmdIkMode = i;
+            settingsChanged = true;
+        }
+    }
+
+    ui->separator(u);
+
+    ui->text(u, StringView(c.text.Text("mmd.cam-section", "MMD Camera Track")));
+    if (ui->input_text(u, StringView(c.text.Text("mmd.cam-path", "Camera VMD") + "##bp_cam_path"),
+                       c.mmdCameraPathBuf, sizeof(c.mmdCameraPathBuf), CABBIRD_UI_TEXT_INPUT_V1_NONE)) {
+        s.mmdCameraPath = c.mmdCameraPathBuf;
+        settingsChanged = true;
+    }
+    if (ui->button_enabled(u, StringView(c.text.Text("mmd.browse", "Browse...") + "##bp_cam_brw"), 0.f, 0.f, canBrowse)) {
+        QueueWorkerIo(c, {WorkerJobKind::BrowseMmdCamera, c.mmdCameraPathBuf, {}, 0, {}});
+    }
+    ui->same_line(u, 0.f, 6.f);
+    if (ui->button_enabled(u, StringView(c.text.Text("mmd.cam-load", "Load Camera") + "##bp_cam_load"), 0.f, 0.f,
+                           c.mmdCameraPathBuf[0] != '\0' ? 1 : 0)) {
+        QueueWorkerIo(c, {WorkerJobKind::LoadMmdCamera, c.mmdCameraPathBuf, {}, 0, {}});
+    }
+    ui->same_line(u, 0.f, 6.f);
+    if (ui->button_enabled(u, StringView(c.text.Text("mmd.cam-clear", "Clear") + "##bp_cam_clr"), 0.f, 0.f,
+                           ms.cameraLoaded ? 1 : 0)) {
+        std::scoped_lock lock(c.commandMutex);
+        c.pending.mmdCamClear = true;
+    }
+
+    if (ms.cameraLoaded) {
+        const std::string kStr = std::to_string(ms.cameraKeyCount);
+        const std::string_view cArgs[]{ms.cameraName, kStr};
+        UiTextWrapped(ui, c.text.Format("mmd.cam-loaded-summary", "Camera: {0} ({1} keys)", cArgs));
+
+        int camOn = ms.cameraEnabled ? 1 : 0;
+        if (ui->checkbox(u, StringView(c.text.Text("mmd.cam-enable", "Enable MMD Camera") + "##bp_cam_en"), &camOn)) {
+            std::scoped_lock lock(c.commandMutex);
+            c.pending.mmdCamHasEnable = true;
+            c.pending.mmdCamWantEnable = (camOn != 0);
+        }
+        if (ui->checkbox(u, StringView(c.text.Text("mmd.cam-follow", "Follow Character") + "##bp_cam_flw"), &s.mmdCamFollow)) {
+            settingsChanged = true;
+            mmdRuntimeChanged = true;
+        }
+        ui->same_line(u, 0.f, 8.f);
+        if (ui->checkbox(u, StringView(c.text.Text("mmd.cam-autocut", "Auto Cut") + "##bp_cam_cut"), &s.mmdCamAutoCut)) {
+            settingsChanged = true;
+            mmdRuntimeChanged = true;
+        }
+        ui->same_line(u, 0.f, 8.f);
+        if (ui->checkbox(u, StringView(c.text.Text("mmd.cam-mirror", "Mirror Camera") + "##bp_cam_mir"), &s.mmdCamMirror)) {
+            settingsChanged = true;
+            mmdRuntimeChanged = true;
+        }
+        if (ui->slider_float(u, StringView(c.text.Text("mmd.cam-dist", "Distance Scale") + "##bp_cam_dst"),
+                             &s.mmdCamDistScale, 0.2f, 3.f)) {
+            settingsChanged = true;
+            mmdRuntimeChanged = true;
+        }
+        if (ui->slider_float(u, StringView(c.text.Text("mmd.cam-fov-offset", "FOV Offset") + "##bp_cam_fov"),
+                             &s.mmdCamFovOffset, -45.f, 45.f)) {
+            settingsChanged = true;
+            mmdRuntimeChanged = true;
+        }
+        if (ui->slider_float(u, StringView(c.text.Text("mmd.cam-yaw-offset", "Yaw Offset") + "##bp_cam_yaw"),
+                             &s.mmdCamYawOffset, -180.f, 180.f)) {
+            settingsChanged = true;
+            mmdRuntimeChanged = true;
+        }
+        if (ui->slider_float(u, StringView(c.text.Text("mmd.cam-offset-y", "Height Offset (m)") + "##bp_cam_y"),
+                             &s.mmdCamOffsetY, -2.f, 2.f)) {
+            settingsChanged = true;
+            mmdRuntimeChanged = true;
+        }
+        if (ui->button(u, StringView(c.text.Text("mmd.cam-reset", "Reset Camera") + "##bp_cam_rst"), 0.f, 0.f)) {
+            s.mmdCamFollow = 1;
+            s.mmdCamAutoCut = 1;
+            s.mmdCamMirror = 0;
+            s.mmdCamDistScale = 1.f;
+            s.mmdCamFovOffset = 0.f;
+            s.mmdCamYawOffset = 0.f;
+            s.mmdCamOffsetY = 0.f;
+            settingsChanged = true;
+            mmdRuntimeChanged = true;
+            std::scoped_lock lock(c.commandMutex);
+            c.pending.mmdCamReanchor = true;
+        }
+    }
+
+    if (mmdRuntimeChanged) {
+        std::scoped_lock lock(c.commandMutex);
+        c.pending.mmdSyncSettings = true;
     }
 }
 
@@ -3040,13 +4640,23 @@ void CABBIRD_CALL Draw(void* raw, const CabbirdUiServiceV1* frameUi) noexcept {
                 c.historyTargetId = c.renderSnap.activeTargetId;
                 c.historyBoneCount = c.renderSnap.bones.size();
                 c.history.Reset(CaptureLiveSnapshot(c.renderSnap));
-                if (c.selectedBone >= static_cast<int>(c.renderSnap.bones.size())) {
+                const size_t boneCount = c.renderSnap.bones.size();
+                c.boneDescendantCount.assign(boneCount, 0U);
+                for (size_t i = 0; i < boneCount; ++i) {
+                    int p = c.renderSnap.bones[i].parent;
+                    for (size_t hop = 0; hop < boneCount && p >= 0 && static_cast<size_t>(p) < boneCount; ++hop) {
+                        ++c.boneDescendantCount[static_cast<size_t>(p)];
+                        p = c.renderSnap.bones[static_cast<size_t>(p)].parent;
+                    }
+                }
+                if (c.selectedBone >= static_cast<int>(boneCount)) {
                     c.selectedBone = c.renderSnap.rootBoneIndex;
                 }
             }
         } else {
             c.selectedBone = -1;
             c.hoveredBone = -1;
+            c.boneDescendantCount.clear();
         }
 
         Settings s;
@@ -3057,7 +4667,22 @@ void CABBIRD_CALL Draw(void* raw, const CabbirdUiServiceV1* frameUi) noexcept {
         if (!c.pathBufsInitialized) {
             std::snprintf(c.posePathBuf, sizeof(c.posePathBuf), "%s", s.poseFilePath.c_str());
             std::snprintf(c.skeletonPathBuf, sizeof(c.skeletonPathBuf), "%s", s.skeletonFilePath.c_str());
+            std::snprintf(c.mmdMotionPathBuf, sizeof(c.mmdMotionPathBuf), "%s", s.mmdMotionPath.c_str());
+            std::snprintf(c.mmdCameraPathBuf, sizeof(c.mmdCameraPathBuf), "%s", s.mmdCameraPath.c_str());
             c.pathBufsInitialized = true;
+        }
+        {
+            std::scoped_lock lock(c.mmdMutex);
+            if (c.pickedMotionPath.has_value()) {
+                std::snprintf(c.mmdMotionPathBuf, sizeof(c.mmdMotionPathBuf), "%s", c.pickedMotionPath->c_str());
+                s.mmdMotionPath = *c.pickedMotionPath;
+                c.pickedMotionPath.reset();
+            }
+            if (c.pickedCameraPath.has_value()) {
+                std::snprintf(c.mmdCameraPathBuf, sizeof(c.mmdCameraPathBuf), "%s", c.pickedCameraPath->c_str());
+                s.mmdCameraPath = *c.pickedCameraPath;
+                c.pickedCameraPath.reset();
+            }
         }
 
         if (c.renderSnap.targetAlive) {
@@ -3154,6 +4779,11 @@ void CABBIRD_CALL Draw(void* raw, const CabbirdUiServiceV1* frameUi) noexcept {
                 DrawTargetAndSettingsTab(c, ui, s, settingsChanged);
                 ui->end_tab_item(u);
             }
+            if (ui->begin_tab_item(u, StringView(c.text.Text("tab.mmd", "MMD Motion")), nullptr,
+                                   CABBIRD_UI_TAB_ITEM_V1_NONE, 1)) {
+                DrawMmdTab(c, ui, s, settingsChanged);
+                ui->end_tab_item(u);
+            }
             if (ui->begin_tab_item(u, StringView(c.text.Text("tab.pose", "Joint Pose")), nullptr,
                                    CABBIRD_UI_TAB_ITEM_V1_NONE, 1)) {
                 DrawJointPoseTab(c, ui, s);
@@ -3247,6 +4877,11 @@ CabbirdStatusV1 CABBIRD_CALL Load(const CabbirdHostApiV1* host, void** result) n
             return Status(CABBIRD_STATUS_V1_UNAVAILABLE);
         }
 
+        if (c->core->plugin_directory) {
+            c->pluginDir = QueryDirectoryString([&](char* buf, size_t* sz) {
+                return c->core->plugin_directory(c->core->user, buf, sz);
+            });
+        }
         // Prefer writable plugin-state directory (never write user files into the read-only package/profile dir).
         const auto* pluginState = Query<CabbirdPluginStateServiceV1>(host, CABBIRD_PLUGIN_STATE_SERVICE_V1_ID);
         if (pluginState && pluginState->directory) {
@@ -3254,10 +4889,8 @@ CabbirdStatusV1 CABBIRD_CALL Load(const CabbirdHostApiV1* host, void** result) n
                 return pluginState->directory(pluginState->user, buf, sz);
             });
         }
-        if (c->writableStateDir.empty() && c->core->plugin_directory) {
-            c->writableStateDir = QueryDirectoryString([&](char* buf, size_t* sz) {
-                return c->core->plugin_directory(c->core->user, buf, sz);
-            });
+        if (c->writableStateDir.empty()) {
+            c->writableStateDir = c->pluginDir;
         }
 
         PublishStatusSnapshot(*c, {});

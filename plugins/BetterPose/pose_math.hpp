@@ -323,6 +323,30 @@ struct Mat4 {
         outRot = Quat::FromBasis(cx, cy, cz);
         return outRot.IsFinite();
     }
+
+    Vec3 ExtractPosition() const noexcept {
+        return {static_cast<double>(At(0, 3)), static_cast<double>(At(1, 3)), static_cast<double>(At(2, 3))};
+    }
+
+    Vec3 ExtractScale() const noexcept {
+        const double sx = Vec3{At(0, 0), At(1, 0), At(2, 0)}.Length();
+        const double sy = Vec3{At(0, 1), At(1, 1), At(2, 1)}.Length();
+        const double sz = Vec3{At(0, 2), At(1, 2), At(2, 2)}.Length();
+        return {sx, sy, sz};
+    }
+
+    static Mat4 Identity() noexcept { return Mat4{}; }
+
+    static Mat4 FromTrs(const Vec3& pos, const Quat& rot, const Vec3& scale = {1.0, 1.0, 1.0}) noexcept {
+        const Vec3 rx = rot.Rotate({scale.x, 0.0, 0.0});
+        const Vec3 ry = rot.Rotate({0.0, scale.y, 0.0});
+        const Vec3 rz = rot.Rotate({0.0, 0.0, scale.z});
+        Mat4 out;
+        out.At(0, 0) = static_cast<float>(rx.x); out.At(0, 1) = static_cast<float>(ry.x); out.At(0, 2) = static_cast<float>(rz.x); out.At(0, 3) = static_cast<float>(pos.x);
+        out.At(1, 0) = static_cast<float>(rx.y); out.At(1, 1) = static_cast<float>(ry.y); out.At(1, 2) = static_cast<float>(rz.y); out.At(1, 3) = static_cast<float>(pos.y);
+        out.At(2, 0) = static_cast<float>(rx.z); out.At(2, 1) = static_cast<float>(ry.z); out.At(2, 2) = static_cast<float>(rz.z); out.At(2, 3) = static_cast<float>(pos.z);
+        return out;
+    }
 };
 
 struct CameraProjection {
@@ -446,8 +470,326 @@ inline bool SolveTwoBoneIk(const Vec3& rootPos, const Vec3& midPos, const Vec3& 
     return outNewMidPos.IsFinite() && outClampedEndPos.IsFinite();
 }
 
-// Compute local bind-pose rotations from Unity Mesh.bindposes (boneToMesh matrices) and parent indices.
-// Returns true for each bone `i` whose parent `p` also has a valid bindpose matrix.
+struct SmrBindPoseSet {
+    Mat4 smrInGo{};
+    bool smrUnderBone{};
+    std::vector<std::pair<int, Mat4>> entries;  // (boneIndex, Mesh.bindposes[i])
+};
+
+// Snap a non-zero vector to its nearest signed cardinal axis (+-X, +-Y, +-Z).
+inline Vec3 NearestCardinalAxis(const Vec3& v) noexcept {
+    const double ax = std::fabs(v.x);
+    const double ay = std::fabs(v.y);
+    const double az = std::fabs(v.z);
+    if (ax >= ay && ax >= az) return {v.x >= 0.0 ? 1.0 : -1.0, 0.0, 0.0};
+    if (ay >= ax && ay >= az) return {0.0, v.y >= 0.0 ? 1.0 : -1.0, 0.0};
+    return {0.0, 0.0, v.z >= 0.0 ? 1.0 : -1.0};
+}
+
+// Compute unified bind-pose local rotations (and root/pelvis local positions) across ALL
+// SkinnedMeshRenderers on a character, including root bones (parent == -1) and unskinned
+// bridge bones (e.g. Root -> Pelvis where Root or Pelvis has no skin weights).
+inline void ComputeBindLocalTransforms(const std::vector<int>& parents,
+                                       const std::vector<Vec3>& capturedLocalPos,
+                                       const std::vector<Vec3>& capturedLocalScale,
+                                       const std::vector<Mat4>& rootParentInGo,
+                                       const std::vector<SmrBindPoseSet>& smrSets,
+                                       std::vector<Quat>& outLocalRot,
+                                       std::vector<bool>& outRotValid,
+                                       std::vector<Vec3>& outLocalPos,
+                                       std::vector<bool>& outPosValid) {
+    const size_t n = parents.size();
+    outLocalRot.assign(n, Quat::Identity());
+    outRotValid.assign(n, false);
+    outLocalPos.assign(n, Vec3{});
+    outPosValid.assign(n, false);
+    if (n == 0) return;
+
+    // Topological order (parents before children).
+    std::vector<size_t> topo;
+    topo.reserve(n);
+    std::vector<uint8_t> visitState(n, 0);
+    auto visit = [&](auto&& self, size_t idx) -> void {
+        if (visitState[idx] != 0) return;
+        visitState[idx] = 1;
+        const int p = parents[idx];
+        if (p >= 0 && static_cast<size_t>(p) < n && visitState[static_cast<size_t>(p)] == 0) {
+            self(self, static_cast<size_t>(p));
+        }
+        visitState[idx] = 2;
+        topo.push_back(idx);
+    };
+    for (size_t i = 0; i < n; ++i) visit(visit, i);
+
+    // Pre-invert every valid bindpose matrix per SMR.
+    struct PreppedSmr {
+        Mat4 smrInGo{};
+        bool smrUnderBone{};
+        std::vector<int> boneIndices;
+        std::vector<Mat4> bindposes;     // mesh -> bone
+        std::vector<Mat4> invBindposes;  // bone -> mesh
+        std::vector<int> slotOfBone;     // size n, -1 if absent
+    };
+    std::vector<PreppedSmr> prepped;
+    prepped.reserve(smrSets.size());
+    for (const auto& set : smrSets) {
+        PreppedSmr ps;
+        ps.smrInGo = set.smrInGo;
+        ps.smrUnderBone = set.smrUnderBone;
+        ps.slotOfBone.assign(n, -1);
+        for (const auto& [bIdx, bp] : set.entries) {
+            if (bIdx < 0 || static_cast<size_t>(bIdx) >= n || !bp.IsFinite()) continue;
+            if (ps.slotOfBone[static_cast<size_t>(bIdx)] >= 0) continue;
+            Mat4 invBp;
+            if (!bp.Inverse(invBp)) continue;
+            const int slot = static_cast<int>(ps.boneIndices.size());
+            ps.slotOfBone[static_cast<size_t>(bIdx)] = slot;
+            ps.boneIndices.push_back(bIdx);
+            ps.bindposes.push_back(bp);
+            ps.invBindposes.push_back(invBp);
+        }
+        if (!ps.boneIndices.empty()) prepped.push_back(std::move(ps));
+    }
+
+    // Step 1: Unify all SMRs into character GameObject space (`boneInGo[i]`).
+    // Pick anchor SMR with the most skinned bones (preferring SMRs not parented under an animated bone).
+    std::vector<Mat4> boneInGo(n, Mat4::Identity());
+    std::vector<bool> hasBoneInGo(n, false);
+    std::vector<bool> smrAligned(prepped.size(), false);
+
+    if (!prepped.empty()) {
+        size_t anchorIdx = 0;
+        for (size_t s = 1; s < prepped.size(); ++s) {
+            const bool curBetterStatic = (!prepped[s].smrUnderBone && prepped[anchorIdx].smrUnderBone);
+            const bool sameStatic = (prepped[s].smrUnderBone == prepped[anchorIdx].smrUnderBone);
+            if (curBetterStatic || (sameStatic && prepped[s].boneIndices.size() > prepped[anchorIdx].boneIndices.size())) {
+                anchorIdx = s;
+            }
+        }
+        auto applySmrToGo = [&](size_t s, const Mat4& smrToGo) {
+            const auto& ps = prepped[s];
+            for (size_t k = 0; k < ps.boneIndices.size(); ++k) {
+                const size_t bi = static_cast<size_t>(ps.boneIndices[k]);
+                if (!hasBoneInGo[bi]) {
+                    const Mat4 m = Mat4::Multiply(smrToGo, ps.invBindposes[k]);
+                    if (m.IsFinite()) {
+                        boneInGo[bi] = m;
+                        hasBoneInGo[bi] = true;
+                    }
+                }
+            }
+            smrAligned[s] = true;
+        };
+
+        applySmrToGo(anchorIdx, prepped[anchorIdx].smrInGo);
+
+        // Iteratively register remaining SMRs through any shared bone (exact bind-time frame alignment!).
+        bool progress = true;
+        while (progress) {
+            progress = false;
+            for (size_t s = 0; s < prepped.size(); ++s) {
+                if (smrAligned[s]) continue;
+                const auto& ps = prepped[s];
+                for (size_t k = 0; k < ps.boneIndices.size(); ++k) {
+                    const size_t shared = static_cast<size_t>(ps.boneIndices[k]);
+                    if (!hasBoneInGo[shared]) continue;
+                    const Mat4 smrToGo = Mat4::Multiply(boneInGo[shared], ps.bindposes[k]);
+                    if (smrToGo.IsFinite()) {
+                        applySmrToGo(s, smrToGo);
+                        progress = true;
+                        break;
+                    }
+                }
+            }
+        }
+        // Any disjoint SMR that shares zero bones falls back to its own static transform in goTransform space.
+        for (size_t s = 0; s < prepped.size(); ++s) {
+            if (!smrAligned[s] && !prepped[s].smrUnderBone) {
+                applySmrToGo(s, prepped[s].smrInGo);
+            }
+        }
+    }
+
+    // Step 2: Reconstruct bind-pose transforms for unskinned bridge & root bones (reverse topo: children first).
+    std::vector<std::vector<size_t>> children(n);
+    for (size_t i = 0; i < n; ++i) {
+        const int p = parents[i];
+        if (p >= 0 && static_cast<size_t>(p) < n) {
+            children[static_cast<size_t>(p)].push_back(i);
+        }
+    }
+
+    std::vector<bool> wasSynthesized(n, false);
+    for (auto it = topo.rbegin(); it != topo.rend(); ++it) {
+        const size_t u = *it;
+        if (hasBoneInGo[u]) continue;
+
+        std::vector<size_t> skinnedKids;
+        for (size_t c : children[u]) {
+            if (hasBoneInGo[c]) skinnedKids.push_back(c);
+        }
+        if (skinnedKids.empty()) continue;
+
+        const Vec3 liveScale = (u < capturedLocalScale.size() && capturedLocalScale[u].IsFinite() &&
+                                capturedLocalScale[u].x > 1e-5 && capturedLocalScale[u].y > 1e-5 &&
+                                capturedLocalScale[u].z > 1e-5)
+                                   ? capturedLocalScale[u]
+                                   : Vec3{1.0, 1.0, 1.0};
+
+        // Case 2A: >= 2 skinned children with non-collinear offsets (e.g. unskinned Pelvis -> Spine, Thigh_L, Thigh_R).
+        bool solvedTriad = false;
+        if (skinnedKids.size() >= 2 && capturedLocalPos.size() == n) {
+            double bestArea = 1e-5;
+            size_t bestA = 0, bestB = 0, bestC = 0;
+            bool useOriginPivot = false;
+            if (skinnedKids.size() >= 3) {
+                for (size_t a = 0; a < skinnedKids.size(); ++a) {
+                    for (size_t b = a + 1; b < skinnedKids.size(); ++b) {
+                        for (size_t c = b + 1; c < skinnedKids.size(); ++c) {
+                            const Vec3 v1 = capturedLocalPos[skinnedKids[b]] - capturedLocalPos[skinnedKids[a]];
+                            const Vec3 v2 = capturedLocalPos[skinnedKids[c]] - capturedLocalPos[skinnedKids[a]];
+                            const double area = v1.Cross(v2).Length();
+                            if (area > bestArea) {
+                                bestArea = area;
+                                bestA = skinnedKids[a];
+                                bestB = skinnedKids[b];
+                                bestC = skinnedKids[c];
+                            }
+                        }
+                    }
+                }
+            } else {
+                // 2 children (e.g. Thigh_L + Thigh_R): check local vectors from u origin.
+                const Vec3 v1 = capturedLocalPos[skinnedKids[0]];
+                const Vec3 v2 = capturedLocalPos[skinnedKids[1]];
+                if (v1.Cross(v2).Length() > bestArea) {
+                    useOriginPivot = true;
+                    bestA = skinnedKids[0];
+                    bestB = skinnedKids[1];
+                }
+            }
+
+            if (!useOriginPivot && bestArea > 1e-5) {
+                const Vec3 l1 = capturedLocalPos[bestB] - capturedLocalPos[bestA];
+                const Vec3 l2 = capturedLocalPos[bestC] - capturedLocalPos[bestA];
+                const Vec3 b1 = boneInGo[bestB].ExtractPosition() - boneInGo[bestA].ExtractPosition();
+                const Vec3 b2 = boneInGo[bestC].ExtractPosition() - boneInGo[bestA].ExtractPosition();
+                const Vec3 eL1 = l1.Normalized();
+                const Vec3 eL3 = eL1.Cross(l2).Normalized();
+                const Vec3 eL2 = eL3.Cross(eL1).Normalized();
+                const Vec3 eB1 = b1.Normalized();
+                const Vec3 eB3 = eB1.Cross(b2).Normalized();
+                const Vec3 eB2 = eB3.Cross(eB1).Normalized();
+                if (eL2.LengthSq() > 0.5 && eB2.LengthSq() > 0.5 && l1.Length() > 1e-5) {
+                    const Quat qL = Quat::FromBasis(eL1, eL2, eL3);
+                    const Quat qB = Quat::FromBasis(eB1, eB2, eB3);
+                    const Quat rU = (qB * qL.Conjugate()).Normalized();
+                    const double uniScale = b1.Length() / l1.Length();
+                    Vec3 posSum{};
+                    for (size_t k : skinnedKids) {
+                        posSum += boneInGo[k].ExtractPosition() - rU.Rotate(capturedLocalPos[k] * uniScale);
+                    }
+                    const Vec3 posU = posSum / static_cast<double>(skinnedKids.size());
+                    boneInGo[u] = Mat4::FromTrs(posU, rU, {uniScale, uniScale, uniScale});
+                    hasBoneInGo[u] = true;
+                    wasSynthesized[u] = true;
+                    solvedTriad = true;
+                }
+            }
+        }
+
+        // Case 2B: Unskinned root bone (e.g. floor Root / Bip001 -> Pelvis).
+        if (!solvedTriad && parents[u] < 0) {
+            const Mat4 parentMat = (u < rootParentInGo.size() && rootParentInGo[u].IsFinite())
+                                       ? rootParentInGo[u]
+                                       : Mat4::Identity();
+            const Vec3 locPos = (u < capturedLocalPos.size() && capturedLocalPos[u].IsFinite())
+                                    ? capturedLocalPos[u]
+                                    : Vec3{};
+            // Align child's cardinal local axis (e.g. +Z on 3dsMax FBX or +Y on Unity) straight to Unity +Y.
+            Quat qAlign = Quat::Identity();
+            const size_t primaryKid = skinnedKids.front();
+            if (primaryKid < capturedLocalPos.size() && capturedLocalPos[primaryKid].LengthSq() > 1e-4) {
+                const Vec3 cardLocal = NearestCardinalAxis(capturedLocalPos[primaryKid]);
+                const Vec3 kidBindPos = boneInGo[primaryKid].ExtractPosition();
+                const Vec3 rootBindPos = parentMat.ExtractPosition() + locPos;
+                const Vec3 deltaBind = kidBindPos - rootBindPos;
+                if (deltaBind.LengthSq() > 1e-4) {
+                    const Vec3 cardBind = NearestCardinalAxis(deltaBind);
+                    Quat parentRot = Quat::Identity();
+                    parentMat.ExtractRotation(parentRot);
+                    const Vec3 desiredInParent = parentRot.Inverse().Rotate(cardBind).Normalized();
+                    qAlign = Quat::FromToRotation(cardLocal, desiredInParent);
+                }
+            }
+            const Mat4 localRoot = Mat4::FromTrs(locPos, qAlign, liveScale);
+            boneInGo[u] = Mat4::Multiply(parentMat, localRoot);
+            hasBoneInGo[u] = true;
+            wasSynthesized[u] = true;
+        }
+    }
+
+    // Step 3: Extract final bindLocalRot (and root/pelvis bindLocalPos) for every resolved bone.
+    for (size_t i = 0; i < n; ++i) {
+        if (!hasBoneInGo[i]) continue;
+        const int p = parents[i];
+
+        if (p >= 0 && static_cast<size_t>(p) < n) {
+            // Prefer exact same-SMR relative transform whenever both i and p are skinned in one SMR.
+            bool doneSameSmr = false;
+            for (const auto& ps : prepped) {
+                const int slotI = ps.slotOfBone[i];
+                const int slotP = ps.slotOfBone[static_cast<size_t>(p)];
+                if (slotI >= 0 && slotP >= 0) {
+                    const Mat4 localBind = Mat4::Multiply(ps.bindposes[static_cast<size_t>(slotP)],
+                                                          ps.invBindposes[static_cast<size_t>(slotI)]);
+                    Quat q;
+                    if (localBind.ExtractRotation(q)) {
+                        outLocalRot[i] = q;
+                        outRotValid[i] = true;
+                        outLocalPos[i] = localBind.ExtractPosition();
+                        outPosValid[i] = outLocalPos[i].IsFinite();
+                        doneSameSmr = true;
+                        break;
+                    }
+                }
+            }
+            if (doneSameSmr) continue;
+
+            if (hasBoneInGo[static_cast<size_t>(p)]) {
+                Mat4 invParent;
+                if (boneInGo[static_cast<size_t>(p)].Inverse(invParent)) {
+                    const Mat4 localBind = Mat4::Multiply(invParent, boneInGo[i]);
+                    Quat q;
+                    if (localBind.ExtractRotation(q)) {
+                        outLocalRot[i] = q;
+                        outRotValid[i] = true;
+                        outLocalPos[i] = localBind.ExtractPosition();
+                        outPosValid[i] = outLocalPos[i].IsFinite();
+                    }
+                }
+            }
+        } else {
+            // Root bone (parent == -1): extract bind rotation relative to its Unity parent in goTransform space!
+            const Mat4 parentMat = (i < rootParentInGo.size() && rootParentInGo[i].IsFinite())
+                                       ? rootParentInGo[i]
+                                       : Mat4::Identity();
+            Mat4 invParent;
+            if (parentMat.Inverse(invParent)) {
+                const Mat4 localBind = Mat4::Multiply(invParent, boneInGo[i]);
+                Quat q;
+                if (localBind.ExtractRotation(q)) {
+                    outLocalRot[i] = q;
+                    outRotValid[i] = true;
+                    outLocalPos[i] = localBind.ExtractPosition();
+                    outPosValid[i] = outLocalPos[i].IsFinite();
+                }
+            }
+        }
+    }
+}
+
+// Compute local bind-pose rotations from Unity Mesh.bindposes (single-SMR convenience wrapper).
 inline void ComputeBindLocalRotations(const std::vector<int>& parents,
                                       const std::vector<Mat4>& bindPoses,
                                       const std::vector<bool>& hasBindPose,
@@ -458,26 +800,16 @@ inline void ComputeBindLocalRotations(const std::vector<int>& parents,
     outValid.assign(n, false);
     if (bindPoses.size() != n || hasBindPose.size() != n) return;
 
-    std::vector<Mat4> meshFromBone(n);
-    std::vector<bool> invOk(n, false);
+    SmrBindPoseSet single;
+    single.smrInGo = Mat4::Identity();
     for (size_t i = 0; i < n; ++i) {
-        if (hasBindPose[i] && bindPoses[i].IsFinite()) {
-            invOk[i] = bindPoses[i].Inverse(meshFromBone[i]);
-        }
+        if (hasBindPose[i]) single.entries.emplace_back(static_cast<int>(i), bindPoses[i]);
     }
-    for (size_t i = 0; i < n; ++i) {
-        const int p = parents[i];
-        if (!invOk[i] || p < 0 || static_cast<size_t>(p) >= n || !hasBindPose[static_cast<size_t>(p)]) {
-            continue;
-        }
-        // localBind = inverse(meshFromBone[p]) * meshFromBone[i] = bindPoses[p] * meshFromBone[i]
-        const Mat4 localBind = Mat4::Multiply(bindPoses[static_cast<size_t>(p)], meshFromBone[i]);
-        Quat q;
-        if (localBind.ExtractRotation(q)) {
-            outLocalRot[i] = q;
-            outValid[i] = true;
-        }
-    }
+    std::vector<Vec3> dummyPos(n), dummyScale(n, Vec3{1.0, 1.0, 1.0}), outPos;
+    std::vector<Mat4> rootParents(n, Mat4::Identity());
+    std::vector<bool> outPosValid;
+    ComputeBindLocalTransforms(parents, dummyPos, dummyScale, rootParents, {single},
+                               outLocalRot, outValid, outPos, outPosValid);
 }
 
 // Wrap angle into [-180, 180] degrees.
