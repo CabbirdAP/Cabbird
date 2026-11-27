@@ -1,6 +1,6 @@
 # 内建插件
 
-运行包提供十二个独立插件包，发行版本统一为 `1.0.0`，默认全部停用。先在插件管理器中加载插件；窗口内另有“启用”开关的功能，还需打开该开关。
+运行包提供十四个独立插件包，发行版本统一为 `1.0.0`，默认全部停用。先在插件管理器中加载插件；窗口内另有“启用”开关的功能，还需打开该开关。
 关闭窗口不会停用插件，停止或卸载请使用插件管理器。
 
 | 插件 | 插件 ID | 功能 |
@@ -17,6 +17,8 @@
 | Free Flight | `cabbird.free-flight` | 镜头方向自由移动、升降与悬停 |
 | God Mode | `cabbird.god-mode` | 当前受控英雄的游戏原生无敌效果 |
 | Collectibles | `cabbird.collectibles` | 扫描当前大地图，逐个传送并交互收集 |
+| 更好的动作（BetterPose） | `cabbird.better-pose` | 可视化 3D 骨骼姿态编辑、双骨 IK、镜像与姿态导入导出 |
+| 相机工具（Camera Tools） | `cabbird.camera-tools` | 额外视距、FOV、自由相机、场景跟随加载与开发者模式传送 |
 
 ## 设置保存
 
@@ -36,12 +38,14 @@
 | Story Tools | `config-settings.json` |
 | Free Flight | `config-free-flight-settings.json` |
 | Collectibles | `config-settings.json` |
+| 更好的动作（BetterPose） | `config-better-pose-settings.json` |
+| 相机工具（Camera Tools） | `config-camera-tools-settings.json` |
 
 下列各节列出的设置在加载插件时恢复，编辑后由后台 Worker 保存，停止时补存尚未落盘的改动。
 旧格式不自动迁移；与当前配置格式不符时使用默认值，修改后按新格式保存。
 例如 Move Speed 的完整路径为
 `Cabbird/config/plugins/cabbird.move-speed/config-movement-settings.json`。
-Player Coordinates、Story Tools、FakeUID、IL2CPP Dump、Move Speed、Free Flight 和 Collectibles 使用宿主管理的窗口，其位置、尺寸与开合状态另存于
+Player Coordinates、Story Tools、FakeUID、IL2CPP Dump、Move Speed、Free Flight、Collectibles、BetterPose 和 Camera Tools 使用宿主管理的窗口，其位置、尺寸与开合状态另存于
 `Cabbird/state/ui-window-state.json`。
 当前实体、列表选择、运行计数和排队中的游戏操作不保存，也不会在下次加载时重复执行。
 插件窗口只展示功能控件与业务数据。诊断说明和运行统计不显示在窗口底部；实际失败按事件或状态变化写入日志，正常等待和持续运行不刷日志。
@@ -194,6 +198,22 @@ Player Coordinates、Story Tools、FakeUID、IL2CPP Dump、Move Speed、Free Fli
 采集目录未准备时，仅用已加载对象的明确原生拾取动作补充分类，并在结果中标明其来源；该补充范围限于已加载区域。
 
 保存项：宝箱与收集物筛选、传送后等待时间、结果页码。扫描清单和任务进度仅存在于当前会话。
+
+## 更好的动作（BetterPose）
+
+可视化 3D 骨骼姿态编辑插件。可绑定当前受控角色或扫描附近角色与场景骨架，在游戏画面叠加绘制关节与三轴旋转环，直接左键拖拽调整姿态；支持双骨 IK（可选腿部锁定平面）、解剖学关节角度限制、左右镜像、撤销/重做、动画暂停与倍速、环绕预览相机，以及姿态 JSON 导入导出与骨架结构导出。
+
+通过兼容资料与元数据校验入口后在 `UpdateSource.RunAfterLateUpdate` 后置写入姿态与环绕相机，停止或卸载插件时在 Game 线程恢复原始动画速度、骨骼姿态与相机控制。
+
+保存项：骨骼显示与过滤开关、旋转环与悬停提示、IK 与关节限位开关、关节半径、动画暂停与速度、环绕相机 FOV、姿态与骨架文件路径。当前编辑的目标与姿态历史仅保存在当前会话中。
+
+## 相机工具（Camera Tools）
+
+调整主相机的额外视距（0–100 m）与视角 FOV（0 为游戏默认，否则 15–170°），并支持一键恢复游戏默认。在 `UniversalRenderPipeline.Render` 渲染前应用偏移与 FOV，渲染返回后立即还原原值，避免破坏 Cinemachine 状态或游戏动态 FOV。
+
+自由相机默认关闭，默认按 `F7` 切换（点击窗口中的激活键按钮可改绑，`Backspace` 清除、`Esc` 取消）。启用后以 `W/A/S/D` 沿相机朝向移动、`Space` 上升、`Shift` 下降、按住 `Ctrl` 4 倍加速，移动速度范围 1–200 m/s（默认 10 m/s）；期间通过共享移动服务与输入回调 Hook 抑制角色跟随移动。开启“场景跟随相机加载”时会随自由相机位置刷新原生 AOI 区域，关闭或停止时切回玩家位置。仅在开发者模式下显示“传送到相机位置”按钮及可改绑快捷键（默认 `1`），调用玩家传送服务执行并复测结果。
+
+保存项：额外视距、视角 FOV、自由相机开关、场景跟随加载、移动速度、激活键与传送快捷键。
 
 ## 插件包更新
 
