@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "locale": "zh-CN",
   "messages": {
-    "plugin.description": "通过游戏线程快照绘制实体方框与名称，并持久化分类、距离、样式和窗口设置。",
+    "plugin.description": "通过游戏线程快照绘制实体方框与名称，并持久化分类、距离、样式和窗口设置",
     "window.title": "实体透视",
     "settings.enabled": "启用实体透视",
     "settings.boxes": "绘制方框",

@@ -3,7 +3,7 @@
   "locale": "zh-CN",
   "messages": {
     "window.title": "收集物",
-    "plugin.description": "扫描当前已准备地图的静态目标，再逐个传送并调用已支持的原生收集交互。仅本次目标匹配的服务器完成与奖励回包计为已收集。",
+    "plugin.description": "扫描当前已准备地图的静态目标，再逐个传送并调用已支持的原生收集交互仅本次目标匹配的服务器完成与奖励回包计为已收集",
     "settings.chests": "宝箱",
     "settings.collections": "收集物",
     "settings.settle": "传送后等待（秒）",
@@ -58,7 +58,7 @@
     "source.loaded": "已加载交互",
     "source.map": "地图",
     "action.resume": "继续",
-    "queue.map_invalid": "地图已变化或扫描尚未完成，请重新扫描后继续。",
+    "queue.map_invalid": "地图已变化或扫描尚未完成，请重新扫描后继续",
     "route.already_complete": "原已完成，已跳过",
     "route.not_spawned": "当前未生成，奖励未确认",
     "log.target_result": "收集目标结果：{0}"

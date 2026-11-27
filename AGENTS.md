@@ -98,6 +98,7 @@ CMake 文件、构建产物或正在运行的游戏文件来掩盖源码问题�
 每个插件都必须走 i18n。新增插件、修改插件文案、审查插件 PR 时按下面执行；接口与目录格式以
 `docs/api-reference/platform-services.md` 为准。
 
+- **禁止中文句号**：宿主、插件和示例的所有 i18n 文案禁止使用中文句号 `。`，句中和句末均不得保留。
 - **每个插件都要有本地化路径**：带任何用户可见文本的插件，包目录里必须有 `locales/zh-CN.json`
   （`schemaVersion: 1`、`locale: "zh-CN"`、`messages`），并在 `manifest.json` 的 `services` 声明
   `{"id": "cabbird.localization", "minVersion": 1}`（capability 仍是共用的 `ui`）。没有 UI 的纯诊断

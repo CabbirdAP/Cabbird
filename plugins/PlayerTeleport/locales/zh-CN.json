@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "locale": "zh-CN",
   "messages": {
-    "plugin.description": "通过游戏线程指令传送受控玩家或宿主分类的角色实体，并验证后续位置；坐标、旋转、列表和窗口设置可跨重启恢复。",
+    "plugin.description": "通过游戏线程指令传送受控玩家或宿主分类的角色实体，并验证后续位置；坐标、旋转、列表和窗口设置可跨重启恢复",
     "result.reverted": "游戏已将实体移离目标位置",
     "result.unavailable": "传送服务不可用",
     "result.refused": "游戏或宿主拒绝了传送",

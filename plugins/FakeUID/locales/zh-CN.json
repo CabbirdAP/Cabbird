@@ -3,7 +3,7 @@
   "locale": "zh-CN",
   "messages": {
     "window.title": "自定义 UID",
-    "plugin.description": "修改客户端界面显示的 UID。",
+    "plugin.description": "修改客户端界面显示的 UID",
     "uid.waiting": "等待游戏加载",
     "uid.original": "原始 UID：{0}",
     "settings.display": "显示 UID",
@@ -14,7 +14,7 @@
     "runtime.types-unavailable": "UID 界面、TMP_Text 或 UnityEngine.Object 类型尚未加载",
     "runtime.field-unavailable": "m_txtUid 缺失或类型不匹配，已拒绝访问",
     "runtime.discovery-unavailable": "Unity 对象发现方法不可用",
-    "runtime.invalid-display": "请输入 1 至 256 个单行 UTF-8 字符，不包含 < > 标记。",
+    "runtime.invalid-display": "请输入 1 至 256 个单行 UTF-8 字符，不包含 < > 标记",
     "runtime.read-failed": "读取 UID 文本失败",
     "runtime.setter-failed": "TMP 文本设置失败",
     "runtime.readback-mismatch": "设置已返回，但文本回读不匹配",

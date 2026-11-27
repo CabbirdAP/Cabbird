@@ -3,7 +3,7 @@
   "locale": "zh-CN",
   "messages": {
     "window.title": "Unity 实体查看器",
-    "plugin.description": "读取宿主的实体与玩家快照，显示服务可用状态。",
+    "plugin.description": "读取宿主的实体与玩家快照，显示服务可用状态",
     "kind.player": "玩家",
     "kind.monster": "怪物",
     "kind.npc": "NPC",

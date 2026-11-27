@@ -3,7 +3,7 @@
   "locale": "zh-CN",
   "messages": {
     "window.title": "可靠配置",
-    "plugin.description": "演示由宿主持久化的配置与后台保存。",
+    "plugin.description": "演示由宿主持久化的配置与后台保存",
     "settings.value": "原子 JSON 配置值：{0}",
     "settings.increment": "递增"
   }
