@@ -5,7 +5,7 @@
   "author": "Cabbird",
   "license": "AGPL-3.0-only",
   "version": "1.0.0",
-  "description": "Camera-relative controlled-player flight using the verified native movement controller. Disabled by default; F6 toggles flight. Enabled state, flight speed and the customizable hotkey persist.",
+  "description": "Camera-relative controlled-player flight using the verified native movement controller. Disabled by default; the backtick/tilde key (left of 1) toggles flight. Enabled state, flight speed and the customizable hotkey persist.",
   "entry": "plugin.dll",
   "api": {"major": 1, "minMinor": 0, "maxMinor": 0},
   "games": ["ap"],

@@ -3,7 +3,7 @@
   "locale": "zh-CN",
   "messages": {
     "window.title": "自由飞行",
-    "plugin.description": "使用已校验的原生移动控制器，按镜头方向控制当前玩家自由飞行。默认关闭，F6 切换；开关、飞行速度与可自定义的快捷键会保存。",
+    "plugin.description": "使用已校验的原生移动控制器，按镜头方向控制当前玩家自由飞行。默认关闭，数字 1 左侧的反引号／波浪号键切换；开关、飞行速度与可自定义的快捷键会保存。",
     "settings.enabled": "启用",
     "settings.speed": "飞行速度（米/秒）",
     "settings.hotkey": "切换快捷键：{0}",

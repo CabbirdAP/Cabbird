@@ -16,7 +16,7 @@ static_assert(sizeof(Vector3) == 12);
 struct Settings {
     int enabled{};
     float speed{10};
-    std::uint32_t hotkey{VK_F6};
+    std::uint32_t hotkey{VK_OEM_3};
     bool operator==(const Settings&) const = default;
 };
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(Settings, enabled, speed, hotkey)
@@ -299,7 +299,7 @@ CabbirdStatusV1 CABBIRD_CALL Load(const CabbirdHostApiV1* host, void** result) n
             if (const auto saved = c->config.Read()) {
                 // Existing schema-2 settings predate the hotkey field.
                 const Settings settings{saved->at("enabled").get<int>(), saved->at("speed").get<float>(),
-                    saved->value("hotkey", std::uint32_t{VK_F6})};
+                    saved->value("hotkey", Settings{}.hotkey)};
                 if (Valid(settings)) c->settings = settings;
             }
         } catch (...) { LogOnce(*c, 32, "log.settings", "Free Flight: saved settings are invalid; defaults retained."); }
