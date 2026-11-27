@@ -1,0 +1,107 @@
+{
+  "schemaVersion": 2,
+  "id": "cabbird.camera-tools",
+  "name": "Camera Tools",
+  "description": "Adjusts extra view distance and field of view, provides a free camera with optional scene streaming, and teleports to the camera position in developer mode.",
+  "author": "Cabbird",
+  "license": "AGPL-3.0-only",
+  "version": "1.0.0",
+  "entry": "plugin.dll",
+  "api": {
+    "major": 1,
+    "minMinor": 0,
+    "maxMinor": 0
+  },
+  "games": [
+    "ap"
+  ],
+  "builds": [
+    "ap-*"
+  ],
+  "loadPhase": "game-ready",
+  "services": [
+    {
+      "id": "cabbird.core",
+      "minVersion": 1
+    },
+    {
+      "id": "cabbird.ui",
+      "minVersion": 1
+    },
+    {
+      "id": "cabbird.window",
+      "minVersion": 1
+    },
+    {
+      "id": "cabbird.input",
+      "minVersion": 1
+    },
+    {
+      "id": "cabbird.profile",
+      "minVersion": 1
+    },
+    {
+      "id": "cabbird.json",
+      "minVersion": 1
+    },
+    {
+      "id": "cabbird.unity.il2cpp",
+      "minVersion": 1
+    },
+    {
+      "id": "cabbird.unity.metadata",
+      "minVersion": 1
+    },
+    {
+      "id": "cabbird.unity.player",
+      "minVersion": 1,
+      "optional": true
+    },
+    {
+      "id": "cabbird.unity.player-teleport",
+      "minVersion": 1,
+      "optional": true
+    },
+    {
+      "id": "cabbird.unity.player-motion",
+      "minVersion": 1,
+      "optional": true
+    },
+    {
+      "id": "cabbird.game-lifecycle",
+      "minVersion": 1
+    },
+    {
+      "id": "cabbird.interop.hook",
+      "minVersion": 1,
+      "optional": true
+    },
+    {
+      "id": "cabbird.config",
+      "minVersion": 1
+    },
+    {
+      "id": "cabbird.scheduler",
+      "minVersion": 1
+    },
+    {
+      "id": "cabbird.localization",
+      "minVersion": 1
+    }
+  ],
+  "capabilities": [
+    "ui",
+    "ui-window",
+    "input",
+    "json",
+    "memory-read",
+    "unity-il2cpp",
+    "unity-metadata",
+    "unity-player-snapshot",
+    "unity-player-teleport",
+    "unity-player-motion",
+    "interop-hook",
+    "configuration",
+    "scheduler"
+  ]
+}

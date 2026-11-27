@@ -81,6 +81,13 @@ cabbird_add_plugin(BetterPose
 target_link_libraries(BetterPose PRIVATE nlohmann_json::nlohmann_json)
 target_compile_options(BetterPose PRIVATE /utf-8)
 
+cabbird_add_plugin(CameraTools
+    SOURCES plugins/CameraTools/plugin.cpp
+    MANIFEST plugins/CameraTools/manifest.json
+    PACKAGE_NAME CameraTools)
+target_link_libraries(CameraTools PRIVATE nlohmann_json::nlohmann_json)
+target_compile_options(CameraTools PRIVATE /utf-8)
+
 endif()
 
 # Each preview build refreshes the same package inventory as the release.
