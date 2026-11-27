@@ -480,7 +480,9 @@ void ApplyCabbirdUiStyle() noexcept {
     colors[ImGuiCol_Text] = ImGuiColor(theme.text);
     colors[ImGuiCol_TextDisabled] = ImGuiColor(theme.text_muted);
     colors[ImGuiCol_WindowBg] = ImGuiColor(theme.window_background);
-    colors[ImGuiCol_ChildBg] = ImGuiColor(theme.child_background);
+    // The owning window paints the surface. Layout children remain transparent,
+    // matching Anomaly; an opaque ChildBg creates white cards over that surface.
+    colors[ImGuiCol_ChildBg] = ImVec4(0.0f, 0.0f, 0.0f, 0.0f);
     // Ordinary popups remain readable and opaque; a local glass surface may
     // opt out explicitly, rather than making every menu reveal the game.
     colors[ImGuiCol_PopupBg] = ImVec4(theme.popup_background.red,
