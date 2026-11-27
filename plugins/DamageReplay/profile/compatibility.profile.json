@@ -1,4 +1,5 @@
 {
+  "$schema": "../../../schemas/plugin-profile.schema.json",
   "schemaVersion": 1,
   "game": "ap",
   "module": "GameAssembly.dll",
@@ -24,7 +25,8 @@
     "attackerCacheEnabledOffset": 640,
     "attackerPositionOffset": 644,
     "attackerForwardOffset": 656,
-    "performanceCollisionsOffset": 704
+    "performanceCollisionsOffset": 704,
+    "collisionInfoSize": 48
   },
   "symbols": [
     {
@@ -34,6 +36,83 @@
           "entry": "48 83 EC 38 49 8B C0 48 89 4C 24 20 48 89 54 24 28 48 8B C8 45 33 C0 48 8D 54 24 20 E8 CF F1 3C 00 48 83 C4 38 C3",
           "values": {
             "rva": 17977280
+          }
+        }
+      ]
+    },
+    {
+      "name": "rent",
+      "candidates": [
+        {
+          "entry": "48 89 54 24 10 57 48 83 EC 40 80 3D 40 26 D3 0A 00 48 8B F9 75 43 48 8D 0D 23 72 7F 0A E8 AE B7",
+          "values": {
+            "rva": 108897968
+          }
+        }
+      ]
+    },
+    {
+      "name": "free",
+      "candidates": [
+        {
+          "entry": "48 89 54 24 10 53 48 83 EC 20 80 3D 91 30 D3 0A 00 48 8B D9 75 43 48 8D 0D C3 76 7F 0A E8 FE C1",
+          "values": {
+            "rva": 108895328
+          }
+        }
+      ]
+    },
+    {
+      "name": "copy",
+      "candidates": [
+        {
+          "entry": "48 89 5C 24 08 57 48 83 EC 20 80 3D DF B1 C1 0F 00 48 8B FA 48 8B D9 75 13 48 8D 0D 60 85 4E 0F",
+          "values": {
+            "rva": 25884496
+          }
+        }
+      ]
+    },
+    {
+      "name": "collision",
+      "candidates": [
+        {
+          "entry": "48 89 5C 24 08 57 48 83 EC 50 80 3D 6F 05 BC 0F 00 48 8B DA 48 8B F9 75 13 48 8D 0D 70 4E 58 0F",
+          "values": {
+            "rva": 26257200
+          }
+        }
+      ]
+    },
+    {
+      "name": "critical",
+      "candidates": [
+        {
+          "entry": "48 89 5C 24 08 57 48 83 EC 20 80 3D 2C FC BB 0F 00 8B DA 48 8B F9 75 13 48 8D 0D 19 95 58 0F E8",
+          "values": {
+            "rva": 26259552
+          }
+        }
+      ]
+    },
+    {
+      "name": "cache",
+      "candidates": [
+        {
+          "entry": "48 89 5C 24 08 48 89 74 24 10 57 48 83 EC 40 80 3D 79 DF BB 0F 00 49 8B F8 48 8B F2 48 8B D9 75",
+          "values": {
+            "rva": 26266880
+          }
+        }
+      ]
+    },
+    {
+      "name": "performance",
+      "candidates": [
+        {
+          "entry": "48 89 5C 24 08 57 48 83 EC 20 80 3D 4D DE BB 0F 00 48 8B DA 48 8B F9 75 13 48 8D 0D C8 C0 57 0F",
+          "values": {
+            "rva": 26267184
           }
         }
       ]

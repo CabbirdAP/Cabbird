@@ -137,6 +137,10 @@ CMake 文件、构建产物或正在运行的游戏文件来掩盖源码问题�
 `UnityBuildProfile` 负责，活动证据由 `UnityProfileRuntime` 发布。构建 ID 用于说明资料来源，
 RVA 路线必须验证实际入口字节，禁止仅凭版本字符串相信地址。
 
+- **插件兼容资料只有一个入口**：凡自行使用扫描签名、RVA、入口字节、固定游戏字段偏移、虚表槽位、
+  记录尺寸或步长的插件，必须统一放在 `profile/compatibility.profile.json`，同一插件的全部能力共用
+  这一份文件，禁止另建 `replay.profile.json` 等功能专用兼容文件。仅消费宿主服务或经完整名称、类型、
+  尺寸校验的运行时元数据、且没有自带固定兼容数据的插件，不创建空 Profile，也不复制宿主的兼容资料。
 - **signature / offset 只能放在 Profile**：扫描签名、入口字节、相对调用位置、游戏对象字段偏移、
   虚表槽位、版本相关的记录尺寸和步长等兼容数据，禁止硬编码在 `.cpp` / `.hpp`、宏、
   `constexpr` 数组或嵌入的 JSON 中。优先使用经名称、类型和尺寸校验的 IL2CPP 元数据。
@@ -154,6 +158,8 @@ RVA 路线必须验证实际入口字节，禁止仅凭版本字符串相信地�
   缺少权威入口字节时，使用只读 `cabbird.unity.metadata` 在 Game 域验证唯一方法形状和实际入口，
   禁止猜字节、复制内部 MethodInfo 布局或退回未经验证的裸 RVA。
 - Profile 是发布兼容资料；用户可写设置走 `cabbird.config` / `plugin-state`，不写回 Profile。
+- 修改插件兼容资料、读取路径或签名时，运行 `pwsh -NoProfile -File tools/check_plugin_profiles.ps1`
+  （可用 `-Plugin <名字>` 缩小范围），并构建受影响插件；删除旧文件后确认构建包与安装包同步移除。
 
 ## 构建与测试约定
 

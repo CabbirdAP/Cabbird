@@ -290,7 +290,11 @@ write_atomic(...)  /* 校验后原子替换 */
 
 ## 包内兼容资料
 
-插件版本相关数据放在 `profile/`，通过宿主 `cabbird.profile` 和 SDK `ProfileSnapshot` 加载。
+插件自带的扫描签名、RVA、入口字节、固定字段偏移、虚表槽位、版本相关记录尺寸和步长，
+统一放在唯一的 `profile/compatibility.profile.json`，通过宿主 `cabbird.profile` 和 SDK `ProfileSnapshot` 加载。
+同一插件的不同功能共用这份资料，不另建功能专用 Profile。仅使用宿主服务或校验后的运行时元数据，
+没有固定兼容数据的插件不需要空 Profile，也不复制宿主的数据。
 不自行打开 JSON 文件、不包含宿主实现头、不把偏移或入口字节写回 C++。
+修改后运行 `pwsh -NoProfile -File tools/check_plugin_profiles.ps1`，再构建受影响插件。
 在 Lifecycle/Worker 加载后，Game/Render 只读取解析好的快照；入口或字段校验失败时按具体原因降级。
 示例格式与只读元数据服务见 [兼容资料与元数据](../api-reference/compatibility-profiles.md)。

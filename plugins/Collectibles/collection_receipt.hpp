@@ -19,7 +19,11 @@ public:
         hooks_ = hooks.get();
         const char* names[]{"receiptResponseList","receiptListItems","receiptListSize","receiptEntryObject","receiptEntryRewards","receiptObjectId","receiptObjectComplete","receiptRewardsList","receiptItemAmount","receiptNullableValue","receiptNullableBoolValue","receiptArrayData","receiptNullableHas"};
         for (std::size_t i{};i<std::size(names);++i) offsets_[i]=profile.Value(names[i],4096);
-        if(offsets_[9]+sizeof(std::uint32_t)>8 || offsets_[10]>=2 || offsets_[12]>=2)return false;
+        nullableIntSize_=profile.Value("receiptNullableIntSize",sizeof(NullableIntStorage),alignof(std::uint32_t));
+        nullableBoolSize_=profile.Value("receiptNullableBoolSize",sizeof(NullableBoolStorage));
+        if(nullableIntSize_<sizeof(std::uint32_t)||nullableBoolSize_==0||
+            offsets_[9]>nullableIntSize_-sizeof(std::uint32_t)||offsets_[10]>=nullableBoolSize_||
+            offsets_[12]>=nullableBoolSize_||offsets_[12]>=nullableIntSize_)return false;
         // These native bodies independently witness the nested protobuf and
         // collection layouts, which the public class-name resolver cannot find.
         for(const char* name:{"receiptResponse","receiptObjectIdGetter","receiptObjectCompleteGetter","receiptEntryObjectGetter","receiptEntryRewardsGetter","receiptRewardsGetter","receiptAmountGetter","receiptCollectionWitness"}) {
@@ -31,7 +35,7 @@ public:
     }
     template<class Runtime> bool Validate(const Runtime& runtime, const CabbirdUnityMetadataServiceV1* metadata) const {
         struct FieldShape {const char* klass;const char* name;std::uint32_t storage;std::size_t slot;};
-        const FieldShape fields[]{{"SCWorldMapObjInteract","<objs>k__BackingField",sizeof(void*),0},{"WorldObj","__pbn__objId",8,5},{"WorldObj","__pbn__complete",2,6},{"Rewards","<rewards>k__BackingField",sizeof(void*),7},{"CommonItem","__pbn__itemnum",8,8}};
+        const FieldShape fields[]{{"SCWorldMapObjInteract","<objs>k__BackingField",sizeof(void*),0},{"WorldObj","__pbn__objId",nullableIntSize_,5},{"WorldObj","__pbn__complete",nullableBoolSize_,6},{"Rewards","<rewards>k__BackingField",sizeof(void*),7},{"CommonItem","__pbn__itemnum",nullableIntSize_,8}};
         for(const auto& field:fields){
             auto* klass=runtime.FindClassAnyImage("Protocal.Cs",field.klass);auto* info=runtime.FindField(klass,field.name);
             if(!info)return false;
@@ -85,6 +89,10 @@ public:
         active_.store(nullptr,std::memory_order_release);return true;
     }
 private:
+    // Bounded scratch buffers, not game record sizes. Profile sizes determine
+    // metadata validation, read lengths and the bounds of every decoded field.
+    using NullableIntStorage=std::array<std::uint8_t,2*sizeof(std::uint32_t)>;
+    using NullableBoolStorage=std::array<std::uint8_t,2*sizeof(std::uint8_t)>;
     bool ValidateProof(const cabbird::sdk::Profile& profile,std::string_view name,std::uintptr_t& address) const {
         const auto main=cabbird::sdk::ResolveProfileSymbolRva(core_,profile,name);
         if(!main||!main.candidate||main.candidate->entry.empty()||main.candidate->entry.size()>64)return false;
@@ -122,6 +130,10 @@ private:
     template<class T>bool Read(std::uintptr_t object,std::uint32_t offset,T& out)const noexcept {
         return object&&cabbird::sdk::Succeeded(core_->read_memory(core_->user,object+offset,{reinterpret_cast<std::uint8_t*>(&out),sizeof(out)}));
     }
+    template<std::size_t N>bool ReadNullable(std::uintptr_t object,std::uint32_t offset,
+            std::array<std::uint8_t,N>& out,std::uint32_t size)const noexcept {
+        return object&&cabbird::sdk::Succeeded(core_->read_memory(core_->user,object+offset,{out.data(),size}));
+    }
     bool List(std::uintptr_t list,std::uintptr_t& items,std::int32_t& count)const noexcept {
         return Read(list,offsets_[1],items)&&Read(list,offsets_[2],count)&&count>=0&&count<=64&&(count==0||items);
     }
@@ -134,18 +146,18 @@ private:
         if(!valid)return 0;
         inspection.stage="object-id";
         for(std::int32_t i{};i<count;++i){
-            std::uintptr_t entry{},object{};std::array<std::uint8_t,8> id{};
-            if(!Read(items,offsets_[11]+i*sizeof(void*),entry)||!Read(entry,offsets_[3],object)||!Read(object,offsets_[5],id))continue;
+            std::uintptr_t entry{},object{};NullableIntStorage id{};
+            if(!Read(items,offsets_[11]+i*sizeof(void*),entry)||!Read(entry,offsets_[3],object)||!ReadNullable(object,offsets_[5],id,nullableIntSize_))continue;
             std::uint32_t actual{};std::memcpy(&actual,id.data()+offsets_[9],sizeof(actual));
             if(i<2){inspection.ids[i]=actual;if(id[offsets_[12]])inspection.present|=static_cast<std::uint8_t>(1u<<i);}
             if(!id[offsets_[12]]||actual!=target)continue;matched=true;
             inspection.stage="target-rewards";
-            std::array<std::uint8_t,2> done{};if(Read(object,offsets_[6],done))complete=done[offsets_[12]]&&done[offsets_[10]];
+            NullableBoolStorage done{};if(ReadNullable(object,offsets_[6],done,nullableBoolSize_))complete=done[offsets_[12]]&&done[offsets_[10]];
             std::uintptr_t reward{},rewardList{},rewardItems{};std::int32_t rewards{};
             if(!Read(entry,offsets_[4],reward)||!Read(reward,offsets_[7],rewardList)||!List(rewardList,rewardItems,rewards))return 0;
             std::uint32_t positive{};
-            for(std::int32_t j{};j<rewards;++j){std::uintptr_t item{};std::array<std::uint8_t,8> quantity{};std::uint32_t amount{};
-                if(Read(rewardItems,offsets_[11]+j*sizeof(void*),item)&&Read(item,offsets_[8],quantity)&&quantity[offsets_[12]]){std::memcpy(&amount,quantity.data()+offsets_[9],sizeof(amount));if(amount)++positive;}}
+            for(std::int32_t j{};j<rewards;++j){std::uintptr_t item{};NullableIntStorage quantity{};std::uint32_t amount{};
+                if(Read(rewardItems,offsets_[11]+j*sizeof(void*),item)&&ReadNullable(item,offsets_[8],quantity,nullableIntSize_)&&quantity[offsets_[12]]){std::memcpy(&amount,quantity.data()+offsets_[9],sizeof(amount));if(amount)++positive;}}
             inspection.stage="target-read";return positive;
         }
         return 0;
@@ -177,6 +189,7 @@ private:
     }
     const CabbirdCoreServiceV1* core_{};const CabbirdHookServiceV1* hooks_{};
     std::array<std::uint32_t,13> offsets_{};std::uintptr_t entry_{},original_{};CabbirdGenerationHandleV1 handle_{};
+    std::uint32_t nullableIntSize_{},nullableBoolSize_{};
     std::atomic<DWORD> gameThread_{};
     mutable std::atomic<std::uint64_t> armed_{},seen_{};
     mutable std::atomic<std::uint32_t> callbackCount_{},foreignThreadCallbacks_{};

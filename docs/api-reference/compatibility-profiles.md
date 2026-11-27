@@ -4,6 +4,13 @@ Cabbird 分开保存兼容数据和执行合同。插件包中的 Profile 记录
 宿主负责读取当前 generation 的不可变文件、校验 schema、管理句柄。Unity 元数据服务在 Game 域
 解析真实的方法与字段，不向插件暴露内部 `MethodInfo` 布局。
 
+插件自带的签名、RVA、入口字节、固定偏移、虚表槽位、版本相关记录尺寸和步长，统一存放在
+`profile/compatibility.profile.json`；一个插件的不同能力共用这一份文件。仅使用宿主服务或经名称、
+类型、尺寸校验的运行时元数据、没有自带固定兼容数据的插件不需要空文件，也不复制宿主 Profile。
+修改兼容资料后运行 `tools/check_plugin_profiles.ps1`，重建对应插件以同步包数据；删除的旧文件也必须
+从构建包和安装包移除。实现侧仍保留调用 ABI、`sizeof` / `offsetof`、范围、对齐与字段关系校验，
+资料声明的尺寸必须与实际使用的本机表示及运行时元数据一致。
+
 宿主的 `profiles/unity-build-profiles.json` 在 Lifecycle / Worker 读取。方法条目声明
 `type`、`method`、`returnType`、`parameterTypes`、`static`、RVA 与入口字节。
 `UnityBuildProfile::Resolve` 只验证模块、可执行入口及字节，用于在 Game 帧尚未建立时引导帧时钟；
@@ -14,7 +21,7 @@ Cabbird 分开保存兼容数据和执行合同。插件包中的 Profile 记录
 
 头文件：[services/profile.h](../../include/cabbird/sdk/services/profile.h)。
 manifest 同时声明 `cabbird.profile`、`cabbird.json` v1 与 `json` capability。
-`load(user, relative_path, *document)` 读取当前包快照的 `profile/<relative_path>`，
+`load(user, relative_path, *document)` 读取当前包快照的 `profile/<relative_path>`，插件兼容资料传入 `compatibility.profile.json`，
 返回可通过 `cabbird.json` 检查和释放的 generation 句柄。
 
 仅 Lifecycle 与宿主管理的 Worker 回调允许加载。Game、Render 和自建线程不做资料文件 I/O。

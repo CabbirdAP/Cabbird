@@ -78,7 +78,6 @@ const std::array<NativeMethod, NativeCount> kNativeMethods{{
 }};
 struct Compatibility {
     cabbird::sdk::Profile profile;
-    cabbird::sdk::Profile replay_profile;
     Layout layout;
     std::uintptr_t address{};
     std::array<std::uintptr_t, NativeCount> native{};
@@ -161,6 +160,10 @@ void PrepareCompatibility(const Host& services) {
         {"ap", "GameAssembly.dll", ".text", "damage-replay-v4"});
     if (!loaded) throw std::runtime_error(loaded.error());
     auto profile = std::move(loaded).value();
+    // The native call ABI is fixed by CollisionInfo; compatibility data must
+    // explicitly agree before this representation is read or passed to the game.
+    if (profile.Value("collisionInfoSize", sizeof(CollisionInfo), alignof(CollisionInfo)) != sizeof(CollisionInfo))
+        throw std::runtime_error("collisionInfoSize does not match the supported native ABI");
     const auto resolved = cabbird::sdk::ResolveProfileSymbolRva(g_core, profile, "damageEntry");
     if (!resolved) throw std::runtime_error(resolved.error);
     Layout layout;
@@ -184,17 +187,14 @@ void PrepareCompatibility(const Host& services) {
     layout.cache_position = profile.Value("attackerPositionOffset", 4096, alignof(float));
     layout.cache_forward = profile.Value("attackerForwardOffset", 4096, alignof(float));
     layout.performance = profile.Value("performanceCollisionsOffset", 4096, alignof(std::uintptr_t));
-    auto replay = cabbird::sdk::LoadProfile(services, "replay.profile.json",
-        {"ap", "GameAssembly.dll", "il2cpp", "damage-fresh-replay-v1"});
-    if (!replay) throw std::runtime_error(replay.error());
     std::array<std::uintptr_t, NativeCount> native{};
     const char* symbols[]{"rent", "free", "copy", "collision", "critical", "cache", "performance"};
     for (std::size_t i{}; i < NativeCount; ++i) {
-        const auto entry = cabbird::sdk::ResolveProfileSymbolRva(g_core, replay.value(), symbols[i]);
+        const auto entry = cabbird::sdk::ResolveProfileSymbolRva(g_core, profile, symbols[i]);
         if (!entry) throw std::runtime_error(std::string(symbols[i]) + ": " + entry.error);
         native[i] = entry.address;
     }
-    g_compatibility = {std::move(profile), std::move(replay).value(), layout, resolved.address, native, true};
+    g_compatibility = {std::move(profile), layout, resolved.address, native, true};
 }
 
 struct IdentityResult {
@@ -302,7 +302,7 @@ bool ValidateLiveMetadata() {
         const auto owner = std::string(spec.namespaze) + "." + spec.type;
         const CabbirdStringViewV1 args[]{StringView(spec.parameters[0]), spec.count == 2 ? StringView(spec.parameters[1]) : CabbirdStringViewV1{}};
         const CabbirdUnityMethodRequestV1 native_request{sizeof(native_request), spec.flags,
-            StringView(g_compatibility.replay_profile.module), StringView(owner), StringView(spec.name),
+            StringView(g_compatibility.profile.module), StringView(owner), StringView(spec.name),
             StringView(spec.result), args, spec.count};
         CabbirdUnityMethodResultV1 native_result{sizeof(native_result)};
         status = g_metadata->resolve_method(g_metadata->user, &native_request, &native_result);
