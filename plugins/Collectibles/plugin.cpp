@@ -32,8 +32,9 @@ struct Settings {
     int skipCompleteChests{1};
     // 1-based queue position the next start begins at.
     std::uint32_t startIndex{1};
-    // Skip a target early once the interaction registry stops changing without ever holding it.
-    int earlySkipEmpty{1};
+    // Off by default: the registry census cannot tell a slow load from a missing object, so an
+    // early skip can drop a target that would have loaded a moment later.
+    int earlySkipEmpty{0};
     std::uint32_t page{};
     // Enabled collection categories (TDWorldCollectingType ids). Empty means "every category".
     std::vector<std::int32_t> categories;
@@ -44,7 +45,7 @@ void to_json(Json& j, const Settings& s) { j = {{"chests",s.chests},{"collection
 void from_json(const Json& j, Settings& s) { j.at("chests").get_to(s.chests); j.at("collections").get_to(s.collections); j.at("settleSeconds").get_to(s.settleSeconds); s.readySeconds = j.value("readySeconds", 10.f);
     s.skipCompleteChests = j.value("skipCompleteChests", 1);
     s.startIndex = j.value("startIndex", 1u);
-    s.earlySkipEmpty = j.value("earlySkipEmpty", 1); s.page = j.value("page", 0u);
+    s.earlySkipEmpty = j.value("earlySkipEmpty", 0); s.page = j.value("page", 0u);
     s.categories.clear();
     if (const auto found = j.find("categories"); found != j.end() && found->is_array())
         for (const auto& id : *found) if (id.is_number_integer()) s.categories.push_back(id.get<std::int32_t>()); }
@@ -145,6 +146,9 @@ struct Context {
     std::uint32_t hitsIssued{};
     // Registry census while waiting for a target to appear: an unchanged size means loading finished.
     std::uint32_t registryCount{};
+    // While waiting for a target to become interactable, refresh the AOI periodically: an object
+    // that only appears on the next AOI update never shows up by waiting alone.
+    Clock::time_point nextRefresh{};
     Clock::time_point registryStable{};
     Clock::time_point nextHit{};
     Clock::time_point retryAt{};
@@ -336,7 +340,7 @@ void Advance(Context& c, bool completed, bool unknown = false, RouteState result
     c.retryAt = {};
     if (completed) c.consecutiveFailures = 0;
     c.hitsIssued = 0; c.nextHit = {};
-    c.registryCount = 0; c.registryStable = {};
+    c.registryCount = 0; c.registryStable = {}; c.nextRefresh = {};
     c.game.phase = c.game.visited == c.queue.size() ? Phase::Complete : Phase::Moving;
     c.deadline = {};
 }
@@ -611,6 +615,10 @@ CabbirdStatusV1 Execute(Work& work, const CabbirdIl2CppApiV1& api) {
         } else {
             c.registryCount = 0;
             c.registryStable = {};
+            if (now >= c.nextRefresh) {
+                static_cast<void>(c.collector.RefreshArrival(runtime, target));
+                c.nextRefresh = now + std::chrono::seconds(1);
+            }
             c.settled = action == InteractionState::Discovering ? now : now + std::chrono::milliseconds(200);
         }
         return Ok();
