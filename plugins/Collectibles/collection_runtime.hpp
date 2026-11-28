@@ -27,9 +27,12 @@ using Method = CabbirdMethodInfoV1;
 using Field = CabbirdFieldInfoV1;
 struct Vector3 { float x{}, y{}, z{}; };
 enum class CompletionState { Unknown, Incomplete, Complete, Unavailable };
-enum class RouteState { AlreadyComplete, Queued, Moving, Waiting, Interacting, Complete, Skipped, UnknownTimeout, Unsupported, InteractionTimeout, Stopped, Failed, NotSpawned };
+enum class RouteState { AlreadyComplete, Queued, Moving, Waiting, Interacting, Complete, Skipped, UnknownTimeout, Unsupported, InteractionTimeout, Stopped, Failed, NotSpawned, Filtered };
 enum class PresenceState { MayLoad, NotSpawned, Unavailable };
-struct TargetPresence { CompletionState completion{CompletionState::Unavailable}; PresenceState presence{PresenceState::Unavailable}; };
+struct TargetPresence { CompletionState completion{CompletionState::Unavailable}; PresenceState presence{PresenceState::Unavailable};
+    // A failed native read is not the same as "this target is unavailable": the route can retry
+    // or skip one target instead of ending the whole run.
+    bool transient{}; };
 enum class PickupKind { None, Collection, Book, Special };
 struct Target {
     std::int32_t mapId{};
@@ -225,6 +228,11 @@ public:
     void ResetScanReport() { stats_ = {}; worldId_ = 0; if (available_) failure_.clear(); }
     std::string_view LastFailure() const noexcept { return failure_; }
     std::string_view LastInteractionDetails() const noexcept { return interactionDetails_; }
+    // True when the last interaction was a hit-collection node, which needs one hit per damage step.
+    bool LastHitCollection() const noexcept { return lastHitCollection_; }
+    // Interaction registry size and how many entries matched the last target.
+    std::uint32_t LastRegistered() const noexcept { return lastRegistered_; }
+    std::uint32_t LastTargetMatches() const noexcept { return lastTargetMatches_; }
     bool CancelInteraction(const CabbirdIl2CppServiceV1* service) const {
         receipt_.Cancel(); puzzlePreparedMap_ = 0; puzzlePreparedDetails_.clear();
         std::vector<CabbirdIl2CppGCHandleV1> handles;
@@ -400,6 +408,8 @@ public:
         api.il2cpp_field_static_get_value(completeField, &complete_);
         api.il2cpp_field_static_get_value(incompleteField, &incomplete_);
         api.il2cpp_field_static_get_value(noDataField, &noData_);
+        // HitCollectionAction covers nodes that need one hit with the gathering tool. Its native
+        // button path is the same entry the game uses, so it is tried rather than refused.
         for (const auto* name : {"SimpleCollectionAction", "PickUpBookAction", "PickupAstraxiomAction"}) {
             auto* klass = runtime.FindClassAnyImage("Azur.Gameplay.World.WorldInteract", name);
             if (!klass) return Error(std::string("Azur.Gameplay.World.WorldInteract.") + name + " class unavailable");
@@ -421,7 +431,7 @@ public:
         failure_.clear();
         return true;
     }
-    bool BeginScan(const Runtime& runtime, bool chests, bool collections) {
+    bool BeginScan(const Runtime& runtime, bool chests, bool collections, bool skipCompleteChests) {
         Object *world{}, *map{}, *local{}, *manager{};
         if (!WorldState(runtime, world, map, local, manager)) return false;
         std::int32_t worldId{};
@@ -434,6 +444,7 @@ public:
         if (collections) scanKinds_.insert(scanKinds_.end(), collections_.begin(), collections_.end());
         stats_.kinds = scanKinds_;
         collectCatalog_ = collections;
+        skipCompleteChests_ = skipCompleteChests;
         catalog_.Begin();
         scanChests_ = chests;
         loadedPickups_.clear(); loadedChests_.clear(); loadedChestIndex_.clear(); loadedChestMerge_ = 0;
@@ -507,10 +518,9 @@ public:
                 if (completion == CompletionState::Unavailable) return ScanError("ServerMap.GetObjectServerCompleteState unavailable");
                 if (completion == CompletionState::Complete) {
                     ++stats_.kinds[scanKind_].complete;
-                    // Chest lifecycle completion can coexist with a visible,
-                    // unopened reward action. Keep it until the exact native
-                    // action and this request's reward response are checked.
-                    if (!target.chest) { ++stats_.completeExcluded; continue; }
+                    // A completed object is already collected or opened. Completed chests are
+                    // normally empty registrations, so they are dropped unless the caller keeps them.
+                    if (!target.chest || skipCompleteChests_) { ++stats_.completeExcluded; continue; }
                 }
                 if (completion == CompletionState::Unknown) ++stats_.kinds[scanKind_].unknown;
                 target.completion = completion;
@@ -549,12 +559,15 @@ public:
     bool RewardConfirmed() const { return receipt_.Confirmed(); }
     std::string RewardDetails() const { return receipt_.Details(); }
     bool StopReceipt() { return receipt_.Stop(); }
-    CompletionState Completion(const Runtime& runtime, const Target& target) const {
+    CompletionState Completion(const Runtime& runtime, const Target& target, bool* transient = nullptr) const {
+        if (transient) *transient = false;
         Object *world{}, *map{}, *local{}, *manager{};
         if (!WorldState(runtime, world, map, local, manager)) return CompletionState::Unavailable;
         std::int32_t current{};
         if (!Value(runtime, Get(Call::WorldId), world, nullptr, current) || current != worldId_) return CompletionState::Unavailable;
-        return ServerCompletion(runtime, map, target.mapId);
+        const auto state = ServerCompletion(runtime, map, target.mapId);
+        if (state == CompletionState::Unavailable && transient) *transient = true;
+        return state;
     }
     TargetPresence ProbeTarget(const Runtime& runtime, Target& target) const {
         Object *world{}, *map{}, *local{}, *manager{};
@@ -563,29 +576,33 @@ public:
         if (!Value(runtime, Get(Call::WorldId), world, nullptr, current) || current != worldId_) return {};
         bool noData{};
         TargetPresence result{ServerCompletion(runtime, map, id, &noData)};
-        if (result.completion == CompletionState::Unavailable) return result;
+        const auto transientFailure = [&] {
+            result.transient = true;
+            return result;
+        };
+        if (result.completion == CompletionState::Unavailable) return transientFailure();
         Object *unit{}, *instance{}; bool active{}, disposed{}, hierarchy{}, logic{}, view{};
         void* parameters[]{&id};
         if (!Value(runtime, Get(Call::ObjectActive), map, parameters, active) ||
-            !Invoke(runtime, Get(Call::MapUnit), manager, parameters, unit)) return result;
+            !Invoke(runtime, Get(Call::MapUnit), manager, parameters, unit)) return transientFailure();
         if (unit) {
             std::int32_t actual{};
             if (!Value(runtime, Get(Call::UnitMapId), unit, nullptr, actual) || actual != id ||
-                !Value(runtime, Get(Call::UnitDisposed), unit, nullptr, disposed)) return result;
-            if (!disposed && !Invoke(runtime, Get(Call::UnitInstance), unit, nullptr, instance)) return result;
+                !Value(runtime, Get(Call::UnitDisposed), unit, nullptr, disposed)) return transientFailure();
+            if (!disposed && !Invoke(runtime, Get(Call::UnitInstance), unit, nullptr, instance)) return transientFailure();
             if (!disposed) {
                 if (!Value(runtime, Get(Call::UnitLogicActive), unit, nullptr, logic) ||
-                    !Value(runtime, Get(Call::UnitViewActive), unit, nullptr, view)) return result;
+                    !Value(runtime, Get(Call::UnitViewActive), unit, nullptr, view)) return transientFailure();
                 Object* scene{}; runtime.Functions().il2cpp_field_get_value(unit, unitScene_, &scene);
                 if (scene) {
                     Object *transform{}, *gameObject{}; bool found{}; void* transformArgs[]{&transform};
-                    if (!Value(runtime, Get(Call::SceneTransform), scene, transformArgs, found)) return result;
+                    if (!Value(runtime, Get(Call::SceneTransform), scene, transformArgs, found)) return transientFailure();
                     if (found && transform) {
                         if (!Invoke(runtime, Get(Call::ComponentObject), transform, nullptr, gameObject) || !gameObject ||
-                            !Value(runtime, Get(Call::ObjectHierarchyActive), gameObject, nullptr, hierarchy)) return result;
+                            !Value(runtime, Get(Call::ObjectHierarchyActive), gameObject, nullptr, hierarchy)) return transientFailure();
                         if (hierarchy && view) {
                             Vector3 position{}; void* positionArgs[]{&position};
-                            if (!Value(runtime, Get(Call::ScenePosition), scene, positionArgs, found)) return result;
+                            if (!Value(runtime, Get(Call::ScenePosition), scene, positionArgs, found)) return transientFailure();
                             if (found && ValidPosition(position)) { target.position = {position.x, position.y, position.z}; target.livePosition = true; }
                         }
                     }
@@ -629,6 +646,7 @@ private:
 public:
     InteractionState Interact(const Runtime& runtime, const Target& target) const {
         interactionDetails_.clear();
+        lastHitCollection_ = false;
         std::ostringstream details;
         details << "mapId=" << target.mapId;
         const auto finish = [&](InteractionState state, std::string_view reason) {
@@ -660,6 +678,8 @@ public:
             auto* storage = reinterpret_cast<Object*>(runtime.Functions().il2cpp_object_unbox(enumeration.get()));
             if (!storage || !Value(runtime, next, storage, nullptr, more)) return finish(InteractionState::Unavailable, "registry.MoveNext failed");
             if (!more) {
+                lastRegistered_ = registered;
+                lastTargetMatches_ = targetMatches;
                 details << " registered=" << registered << " entityHosts=" << entityHosts << " targetMatches=" << targetMatches;
                 // A puzzle owner may only expose a discovery-voice action. The
                 // configured graph finish, rather than that voice event, owns
@@ -698,6 +718,35 @@ public:
             if (klass == chestTipsAction_) { details << " reason=chest hint only"; continue; }
             if (!enabled && !chest) { waiting = true; details << " reason=native action not enabled"; continue; }
             if (!collection && !chest) {
+                // Opt-in experiment: hit-collection nodes only start a gathering process when their
+                // button is pressed, so ask the collected unit to take the hit instead. Success is
+                // still decided by the server completion transition, never by this call.
+                if (actionName.ends_with(".HitCollectionAction")) {
+                    Object* unit{};
+                    auto mapId = target.mapId;
+                    void* unitArgs[]{&mapId};
+                    for (const char* getter : {"GetBreakableItem", "GetBreakableItemByGuid"}) {
+                        const auto* getUnit = Member(runtime, action, getter, {"System.Int32"},
+                            "Azur.Gameplay.Units.World.BreakableItem");
+                        if (!getUnit) continue;
+                        if (!Invoke(runtime, getUnit, action, unitArgs, unit) || !unit) continue;
+                        const auto* destroy = Member(runtime, unit, "OnDamageToDestroy", {"UnityEngine.Vector3"});
+                        if (!destroy) continue;
+                        Vector3 point{};
+                        point.x = static_cast<float>(target.position[0]);
+                        point.y = static_cast<float>(target.position[1]);
+                        point.z = static_cast<float>(target.position[2]);
+                        void* destroyArgs[]{&point};
+                        Object* ignored{};
+                        if (Invoke(runtime, destroy, unit, destroyArgs, ignored)) {
+                            receipt_.Arm(target.mapId);
+                            lastHitCollection_ = true;
+                            return finish(InteractionState::Accepted,
+                                "hit dispatched; awaiting server completion");
+                        }
+                    }
+                    details << " reason=hit dispatch unavailable";
+                }
                 unsupported = true;
                 if (actionName.ends_with(".RandomChestAction")) { consumption = true; details << " reason=random chest reward requires user confirmation"; }
                 else if (actionName.ends_with(".RepairWorldItemAction") || actionName.ends_with(".ChangeUnitStateAction")) { consumption = true; details << " reason=repair or item consumption requires user confirmation"; }
@@ -1150,6 +1199,10 @@ private:
     CollectionCatalog catalog_;
     mutable std::string failure_;
     mutable std::string interactionDetails_;
+    mutable bool lastHitCollection_{};
+    mutable std::uint32_t lastRegistered_{};
+    mutable std::uint32_t lastTargetMatches_{};
+    bool skipCompleteChests_{true};
     mutable CabbirdIl2CppGCHandleV1 puzzleGraphs_{}, puzzleNodes_{}, puzzleSelected_{}, puzzleSelectedGraph_{}, puzzleOwner_{};
     mutable std::vector<CabbirdIl2CppGCHandleV1> puzzleChildren_;
     mutable std::unordered_set<std::uintptr_t> puzzleVisited_;
