@@ -2,27 +2,38 @@
 
 ## 开始构建
 
-需要 Windows x64、Visual Studio 2022 C++ 工具链和 CMake 3.22+。默认配置为 C++20 / C11，
+需要 Windows x64、Visual Studio C++ 工具链和 CMake 3.22+。默认配置为 C++20 / C11，
 只提供 `Debug` 与 `RelWithDebInfo`。
+
+工具链版本决定预设。装了 Visual Studio 2026（`vswhere` 报告主版本 18）时，脚本用
+`windows-vs2026`；否则用 `windows-vs2022`。两个预设都是原生 Visual Studio 生成器，
+差别只有生成器名与输出目录。
 
 ```powershell
 .\build.cmd
 ```
 
-脚本配置 `windows-vs2022`、构建 `windows-relwithdebinfo`，将 `GameRuntime` 安装到
-`.build\windows-vs2022\game-package\`。默认只构建发布内容；既有独立平台预览显式开启。
+脚本按上面的规则选预设，然后把 `GameRuntime` 安装到对应目录
+（`windows-vs2026` → `.build\windows-vs2026\game-package\`，
+`windows-vs2022` → `.build\windows-vs2022\game-package\`）。默认只构建发布内容；
+既有独立平台预览显式开启。
 
 ```powershell
 .\build.cmd fixtures
 ```
 
-也可以直接运行同一组 CMake 入口：
+也可以直接运行同一组 CMake 入口（以 Visual Studio 2022 为例；2026 把两处 `vs2022`
+换成 `vs2026`，构建预设换成 `windows-vs2026-relwithdebinfo`）：
 
 ```powershell
 cmake --preset windows-vs2022 -DCABBIRD_BUILD_TEST_FIXTURES=ON
 cmake --build --preset windows-relwithdebinfo
 cmake --install .build/windows-vs2022 --config RelWithDebInfo --component GameRuntime
 ```
+
+> [!IMPORTANT]
+> `windows-vs2026` 要求 CMake 4.1 或更新版本 —— `Visual Studio 18 2026` 这个生成器名
+> 从该版本才开始提供。CMake 太旧时脚本会明确报错并要求升级，不会静默降级到另一套构建系统。
 
 本项目的 MSBuild 调用不额外传 `--parallel`。构建脚本保留了当前工具链的这一约束。
 只构建某个模块时使用 `--target <target>`；不要创建第二套主构建树。

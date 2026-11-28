@@ -1,0 +1,51 @@
+{
+  "schemaVersion": 2,
+  "id": "initcool.no-camera-fade",
+  "name": "No Camera Fade",
+  "author": "initcool",
+  "license": "AGPL-3.0-only",
+  "version": "1.0.0",
+  "description": "Keeps the character visible on camera switches: zeros the camera distance and angle thresholds so the model is no longer faded out when the camera moves close or sweeps past.",
+  "entry": "plugin.dll",
+  "api": {
+    "major": 1,
+    "minMinor": 0,
+    "maxMinor": 0
+  },
+  "games": [
+    "ap"
+  ],
+  "builds": [
+    "ap-*"
+  ],
+  "loadPhase": "game-ready",
+  "services": [
+    {
+      "id": "cabbird.ui",
+      "minVersion": 1
+    },
+    {
+      "id": "cabbird.window",
+      "minVersion": 1
+    },
+    {
+      "id": "cabbird.unity.metadata",
+      "minVersion": 1
+    },
+    {
+      "id": "cabbird.unity.il2cpp",
+      "minVersion": 1
+    },
+    {
+      "id": "cabbird.localization",
+      "minVersion": 1,
+      "optional": true
+    }
+  ],
+  "capabilities": [
+    "ui",
+    "ui-window",
+    "unity-metadata",
+    "unity-il2cpp"
+  ]
+}

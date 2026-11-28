@@ -7,6 +7,14 @@
   },
   "configurePresets": [
     {
+      "name": "windows-vs2026",
+      "displayName": "Windows x64 / Visual Studio 2026",
+      "description": "Requires CMake 4.1 or newer: the 'Visual Studio 18 2026' generator name first shipped in that release.",
+      "generator": "Visual Studio 18 2026",
+      "architecture": "x64",
+      "binaryDir": "${sourceDir}/.build/windows-vs2026"
+    },
+    {
       "name": "windows-vs2022",
       "displayName": "Windows x64 / Visual Studio 2022",
       "generator": "Visual Studio 17 2022",
@@ -32,6 +40,16 @@
     {
       "name": "windows-relwithdebinfo",
       "configurePreset": "windows-vs2022",
+      "configuration": "RelWithDebInfo"
+    },
+    {
+      "name": "windows-vs2026-debug",
+      "configurePreset": "windows-vs2026",
+      "configuration": "Debug"
+    },
+    {
+      "name": "windows-vs2026-relwithdebinfo",
+      "configurePreset": "windows-vs2026",
       "configuration": "RelWithDebInfo"
     },
     {
