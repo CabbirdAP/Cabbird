@@ -34,6 +34,7 @@ std::mutex g_external_url_mutex;
 std::optional<std::string> g_pending_external_url;
 ThreadLocalScalar<bool> g_apply_menu_state;
 ThreadLocalScalar<bool> g_frame_menus_collapsed;
+std::atomic<bool> g_plugin_draw_suppressed{};
 std::unordered_map<ImGuiID, bool> g_window_locks;
 
 struct HostUiWindowScope {
@@ -1539,6 +1540,14 @@ void SetHostUiCurrentWindowLocked(const bool locked) noexcept {
     ImGuiWindow* const window = CurrentHostWindow();
     if (window == nullptr) return;
     g_window_locks[window->ID] = locked;
+}
+
+void SetHostUiPluginDrawSuppressed(const bool suppressed) noexcept {
+    g_plugin_draw_suppressed.store(suppressed);
+}
+
+bool HostUiPluginDrawSuppressed() noexcept {
+    return g_all_hidden.load() || g_plugin_draw_suppressed.load();
 }
 
 void PrepareHostUiFrame() noexcept {

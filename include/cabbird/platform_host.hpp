@@ -75,6 +75,7 @@ struct PlatformDiagnostics {
     std::function<cabbird::PlatformSettingsApplyResult(
         const cabbird::PlatformSettingsApplyRequest&)> settings_apply;
     std::function<bool(std::string_view route)> settings_record_route;
+    std::function<bool(std::uint32_t version)> settings_record_notice;
     // Phase 10 production evidence. The capture provider gates the GPU
     // readback work; the remaining callbacks are cheap no-op observations
     // when the evidence session is idle.

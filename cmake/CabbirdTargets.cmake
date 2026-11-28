@@ -156,6 +156,8 @@ set(CABBIRD_PORTED_SOURCES
     src/repository/repository_coordinator.cpp
     src/services/reliable_storage.cpp
     src/services/signature_updater.cpp
+    src/services/telemetry.cpp
+    src/ui/platform_notice.cpp
     src/plugin/plugin_config_watcher.cpp
     src/plugin/plugin_native_dependency.cpp
     src/plugin/plugin_runtime.cpp
@@ -207,7 +209,7 @@ target_include_directories(cabbird_ported PUBLIC include
 target_compile_definitions(cabbird_ported PUBLIC ${CABBIRD_DEFS})
 target_compile_options(cabbird_ported PRIVATE /W3 /EHsc)
 target_link_libraries(cabbird_ported PUBLIC
-    bcrypt winhttp pathcch shlwapi dbghelp ws2_32 comdlg32
+    bcrypt winhttp shell32 ole32 pathcch shlwapi dbghelp ws2_32 comdlg32
     cabbird_plugin
     cabbird_ui
     nlohmann_json::nlohmann_json

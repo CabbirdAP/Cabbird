@@ -31,6 +31,8 @@ struct AnalyzerConfig {
     std::size_t max_scan_results{1024};
     std::vector<SymbolConfig> symbols;
 
+    bool telemetry_enabled{true};
+    std::wstring telemetry_endpoint;
     bool platform_enabled{true};
     bool platform_visible{};
     bool platform_embedded{true};

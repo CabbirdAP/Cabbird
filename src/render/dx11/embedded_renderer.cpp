@@ -775,7 +775,7 @@ void RenderEmbedded(IDXGISwapChain* swap_chain, UINT flags) {
                 phase_completed - phase_started);
             phase_started = phase_completed;
         }
-        if (!cabbird::HostUiAllHidden()) {
+        if (!cabbird::HostUiPluginDrawSuppressed()) {
             state->plugins->Draw(ImGui::GetCurrentContext());
         }
         if (sampled) {

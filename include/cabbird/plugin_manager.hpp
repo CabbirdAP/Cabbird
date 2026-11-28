@@ -38,6 +38,11 @@ namespace cabbird {
 struct UiResourceWorkerGate;
 struct PluginCacheOwnerLease;
 
+struct PluginUsageObservation {
+    std::string id;
+    std::chrono::system_clock::time_point observed_at;
+};
+
 struct CallbackMetricsView {
     std::uint64_t calls{};
     std::uint64_t faults{};
@@ -193,6 +198,9 @@ public:
     // cancellation closes an owner/generation that may later be retried.
     void SetGenerationInitializer(
         std::function<bool(std::string_view, std::uint64_t)> initializer);
+    // Set before LoadAll; coalesces successful starts and active plugins once a minute
+    // The observer runs in serialized maintenance and must only enqueue work
+    void SetUsageObserver(std::function<void(std::vector<PluginUsageObservation>)> observer);
     void SetCallbackEvidenceObserver(
         std::function<void(const PluginCallbackEvidence&)> observer);
     [[nodiscard]] cabbird::PluginScope::CallbackLease AcquireCallback(
@@ -375,6 +383,9 @@ private:
     std::function<void(const PluginCallbackEvidence&)> callback_evidence_observer_;
     PluginLoadPredicate load_predicate_;
     PluginActivationObserver activation_observer_;
+    std::function<void(std::vector<PluginUsageObservation>)> usage_observer_;
+    std::unordered_map<std::string, std::chrono::system_clock::time_point> pending_usage_;
+    std::chrono::steady_clock::time_point last_usage_observation_{};
     std::function<bool(std::string_view, std::uint64_t)> generation_initializer_;
     mutable std::mutex stop_diagnostics_mutex_;
     std::vector<PluginStopDiagnostic> stop_diagnostics_;

@@ -59,6 +59,8 @@ AnalyzerConfig AnalyzerConfig::Load(const std::filesystem::path& path) {
     AnalyzerConfig result;
     result.pipe_prefix = ReadWide(path, L"Analyzer", L"PipePrefix", L"Cabbird");
     result.max_scan_results = ReadSize(path, L"Analyzer", L"MaxScanResults", 1024);
+    result.telemetry_enabled = ReadBool(path, L"Telemetry", L"Enabled", true);
+    result.telemetry_endpoint = ReadWide(path, L"Telemetry", L"Endpoint", L"");
     result.platform_enabled = ReadBool(path, L"Platform", L"Enabled", true);
     result.platform_visible = ReadBool(path, L"Platform", L"Visible", false);
     result.platform_embedded = ReadBool(path, L"Platform", L"Embedded", true);

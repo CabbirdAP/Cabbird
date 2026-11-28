@@ -152,6 +152,7 @@ nlohmann::json Serialize(
             {"interface.reduced_motion", values.interface_reduced_motion},
             {"interface.reduced_transparency", values.interface_reduced_transparency},
             {"interface.remember_last_route", values.interface_remember_last_route},
+            {"interface.notice_accepted_version", values.interface_notice_accepted_version},
             {"input.menu_toggle", values.input_menu_toggle},
             {"input.hide_all_toggle", values.input_hide_all_toggle},
             {"input.capture_policy", PlatformInputCapturePolicyName(values.input_capture_policy)},
@@ -333,6 +334,7 @@ public:
             ReadValue(values, "interface.reduced_motion", snapshot_.values.interface_reduced_motion);
             ReadValue(values, "interface.reduced_transparency", snapshot_.values.interface_reduced_transparency);
             ReadValue(values, "interface.remember_last_route", snapshot_.values.interface_remember_last_route);
+            ReadValue(values, "interface.notice_accepted_version", snapshot_.values.interface_notice_accepted_version);
             const auto persisted_toggle = values.find("input.menu_toggle");
             if (persisted_toggle != values.end()) {
                 const auto json_toggle = persisted_toggle->get<std::uint32_t>();
@@ -407,8 +409,10 @@ public:
             return result;
         }
 
+        auto values = request.values;
+        values.interface_notice_accepted_version = snapshot_.values.interface_notice_accepted_version;
         const std::uint64_t revision = snapshot_.revision + 1;
-        const std::string text = Serialize(request.values, revision, snapshot_.last_route).dump(2);
+        const std::string text = Serialize(values, revision, snapshot_.last_route).dump(2);
         const auto bytes = std::as_bytes(std::span(text.data(), text.size()));
         const bool language_changed =
             request.values.interface_language != snapshot_.values.interface_language;
@@ -458,7 +462,7 @@ public:
                 : "settings write failed and the INI rollback also failed";
             return result;
         }
-        snapshot_.values = request.values;
+        snapshot_.values = std::move(values);
         snapshot_.revision = revision;
         snapshot_.reason.clear();
         result.code = PlatformSettingsApplyCode::Applied;
@@ -476,6 +480,23 @@ public:
         const auto bytes = std::as_bytes(std::span(text.data(), text.size()));
         if (!storage_.WriteAtomic(kSettingsPath, bytes)) return false;
         snapshot_.last_route = route;
+        return true;
+    }
+
+    bool RecordNoticeAcceptance(const std::uint32_t version) {
+        if (version == 0) return false;
+        std::scoped_lock lock(mutex_);
+        if (!snapshot_.ready) return false;
+        const std::uint32_t previous = snapshot_.values.interface_notice_accepted_version;
+        if (previous >= version) return true;
+        snapshot_.values.interface_notice_accepted_version = version;
+        const std::string text =
+            Serialize(snapshot_.values, snapshot_.revision, snapshot_.last_route).dump(2);
+        const auto bytes = std::as_bytes(std::span(text.data(), text.size()));
+        if (!storage_.WriteAtomic(kSettingsPath, bytes)) {
+            snapshot_.values.interface_notice_accepted_version = previous;
+            return false;
+        }
         return true;
     }
 
@@ -502,6 +523,10 @@ PlatformSettingsApplyResult PlatformSettingsStore::Apply(
 
 bool PlatformSettingsStore::RecordLastRoute(const std::string_view route) {
     return impl_->RecordLastRoute(route);
+}
+
+bool PlatformSettingsStore::RecordNoticeAcceptance(const std::uint32_t version) {
+    return impl_->RecordNoticeAcceptance(version);
 }
 
 }  // namespace cabbird

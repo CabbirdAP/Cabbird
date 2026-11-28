@@ -12,6 +12,8 @@
 
 namespace cabbird {
 
+inline constexpr std::uint32_t kPlatformNoticeVersion = 1;
+
 inline constexpr std::uint32_t kPlatformInterfaceScaleMinimumPercent = 100;
 inline constexpr std::uint32_t kPlatformInterfaceScaleMaximumPercent = 200;
 inline constexpr std::uint32_t kPlatformInterfaceScaleStepPercent = 5;
@@ -45,6 +47,7 @@ struct PlatformSettingsValues final {
     bool interface_reduced_motion{};
     bool interface_reduced_transparency{};
     bool interface_remember_last_route{true};
+    std::uint32_t interface_notice_accepted_version{};
     std::uint32_t input_menu_toggle{0x2d};
     std::uint32_t input_hide_all_toggle{0x2e};
     PlatformInputCapturePolicy input_capture_policy{PlatformInputCapturePolicy::Automatic};
@@ -118,6 +121,7 @@ public:
     [[nodiscard]] PlatformSettingsSnapshot Snapshot() const;
     [[nodiscard]] PlatformSettingsApplyResult Apply(const PlatformSettingsApplyRequest& request);
     [[nodiscard]] bool RecordLastRoute(std::string_view route);
+    [[nodiscard]] bool RecordNoticeAcceptance(std::uint32_t version);
 
 private:
     class Impl;

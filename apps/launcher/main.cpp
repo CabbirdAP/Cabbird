@@ -10,6 +10,14 @@
 #include "cabbird/platform_ui_layout.hpp"
 #include "cabbird/config.hpp"
 #include "desktop_surface.hpp"
+#include "cabbird/launcher/release_update.hpp"
+#include "cabbird/platform_notice.hpp"
+#include "cabbird/telemetry.hpp"
+#include "cabbird/safe_zip.hpp"
+#include "cabbird/sdk/version.h"
+#include <winhttp.h>
+#include <fstream>
+#include <cstdio>
 
 #include <Windows.h>
 #include <d3d11.h>
@@ -64,6 +72,8 @@ constexpr std::array kLauncherFontScales{2.00f};
 constexpr std::array<char32_t, 7> kLauncherIcons{
     0xe838, 0xe72c, 0xe768, 0xe73e, 0xe7ba, 0xe711, 0xe8b7};
 constexpr float kDefaultDpi = 96.0f;
+constexpr std::string_view kRepositoryUrl{"https://github.com/CabbirdAP/Cabbird"};
+constexpr std::string_view kDiscordUrl{"https://discord.gg/tfeh8QQ9Vy"};
 
 ImVec4 ThemeColor(const unitymem::CabbirdUiColor& color) noexcept {
     return {color.red, color.green, color.blue, color.alpha};
@@ -98,6 +108,65 @@ struct LauncherTheme final {
     }
 };
 
+enum class LauncherUpdatePhase : std::uint8_t {
+    Idle,
+    Checking,
+    UpToDate,
+    Available,
+    Downloading,
+    Installing,
+    Installed,
+    Failed,
+};
+
+// What a failed update step was. The launcher names the ones it can explain -- an unreachable host,
+// a rate-limited API -- and leaves the rest to the installer, whose diagnostic says what could not
+// be written.
+enum class LauncherUpdateFailure : std::uint8_t {
+    None,
+    Network,
+    RateLimited,
+    Http,
+    NotRelease,
+    Check,
+    Install,
+};
+
+// What the last check found and, once it is asked for, how far the update got. Everything here is
+// read from the snapshot; the phase is the only field the page branches on.
+struct LauncherUpdateStatus final {
+    LauncherUpdatePhase phase{LauncherUpdatePhase::Idle};
+    bool auto_check{true};
+    // The release the user answered "skip this version" to: the check keeps reporting it, but the
+    // launcher does not ask about that one version again.
+    std::string skipped_version;
+    std::string remote_tag;
+    std::string remote_version;
+    std::string page_url;
+    // The package the check chose: its address, its published length and its published digest, which
+    // is what a download is verified against before anything is extracted.
+    cabbird::launcher::ReleaseAsset asset;
+    // The release notes the dialog shows before the user decides.
+    std::string notes;
+    LauncherUpdateFailure failure{LauncherUpdateFailure::None};
+    // The HTTP status of a failed lookup, and the diagnostic a failed install reported.
+    int http_status{};
+    std::string detail;
+
+    [[nodiscard]] bool Busy() const noexcept {
+        return phase == LauncherUpdatePhase::Checking ||
+            phase == LauncherUpdatePhase::Downloading ||
+            phase == LauncherUpdatePhase::Installing;
+    }
+
+    [[nodiscard]] bool CanInstall() const noexcept {
+        return !asset.download_url.empty() &&
+            (phase == LauncherUpdatePhase::Available ||
+             (phase == LauncherUpdatePhase::Failed && failure == LauncherUpdateFailure::Install));
+    }
+};
+
+
 struct LauncherSnapshot final {
     cabbird::launcher::AzurPromiliaClient selected_client{
         cabbird::launcher::AzurPromiliaClient::MainlandChina};
@@ -108,6 +177,8 @@ struct LauncherSnapshot final {
     std::vector<cabbird::launcher::AttachableProcess> processes;
     DWORD attached_process{};
     bool core_available{};
+    bool restart_pending{};
+    LauncherUpdateStatus update;
     std::string runtime_version;
     std::string runtime_message;
     std::uint32_t toggle_key{VK_INSERT};
@@ -354,6 +425,310 @@ std::shared_ptr<const LauncherTheme> LoadLauncherTheme(
     return result;
 }
 
+struct LauncherDownloadProgress final {
+    std::atomic<long long> bytes{};
+    std::atomic<long long> total{};
+    std::atomic<bool> cancel{};
+};
+
+std::string LauncherHttpGetUrl(const std::string& url, bool use_system_proxy = false,
+    int* status_code = nullptr, DWORD timeout_ms = 8000);
+bool LauncherDownloadUrl(const std::string& url, const std::filesystem::path& destination,
+    LauncherDownloadProgress* progress = nullptr);
+void LauncherUpdateLog(const std::string& line);
+std::wstring LauncherSystemProxy();
+
+// The addresses one github.com URL is asked at, best-known first: the mirror that answered last time,
+// then the direct address, then the rest. A launcher started on a network where github.com does not
+// answer would otherwise spend its whole timeout budget on the direct attempt before it ever reaches
+// the mirror that works.
+std::vector<std::string> LauncherLookupCandidates(
+    const std::string& url, const std::string& endpoint) {
+    std::vector<std::string> candidates;
+    candidates.reserve(1 + cabbird::launcher::kGithubProxyPrefixes.size());
+    if (std::ranges::find(cabbird::launcher::kGithubProxyPrefixes, endpoint) !=
+        cabbird::launcher::kGithubProxyPrefixes.end()) candidates.push_back(endpoint + url);
+    candidates.push_back(url);
+    for (const auto prefix : cabbird::launcher::kGithubProxyPrefixes) {
+        if (std::string(prefix) != endpoint) candidates.push_back(std::string(prefix) + url);
+    }
+    return candidates;
+}
+
+// Which mirror a URL was asked through: the prefix it starts with, or nothing for the direct address.
+std::string LauncherEndpointOfUrl(const std::string& url) {
+    for (const auto prefix : cabbird::launcher::kGithubProxyPrefixes) {
+        if (url.starts_with(prefix)) return std::string(prefix);
+    }
+    return {};
+}
+
+
+
+// Mod installs and launcher updates run on different workers and may overlap.
+
+LauncherDownloadProgress g_update_download;
+
+
+void LauncherUpdateLog(const std::string& line) {
+    std::error_code error;
+    const auto directory = ExecutableDirectory() / L"Cabbird" / L"logs";
+    std::filesystem::create_directories(directory, error);
+    std::ofstream(directory / L"launcher-update.log", std::ios::app)
+        << line << "\n";
+}
+
+std::string LauncherHttpGetRequest(const std::wstring& host, const std::wstring& path,
+    const INTERNET_PORT port, const bool secure, const bool use_system_proxy, int* status_code,
+    const DWORD timeout_ms) {
+    std::string result;
+    if (status_code != nullptr) *status_code = 0;
+    // Direct first: a stale or half-configured system proxy is a common cause of "works in curl,
+    // fails in WinHTTP". The caller retries with the system proxy when this returns nothing.
+    const std::wstring proxy = use_system_proxy ? std::wstring{} : LauncherSystemProxy();
+    HINTERNET session = WinHttpOpen(L"CabbirdLauncher/1.0",
+        proxy.empty() ? WINHTTP_ACCESS_TYPE_NO_PROXY : WINHTTP_ACCESS_TYPE_NAMED_PROXY,
+        proxy.empty() ? WINHTTP_NO_PROXY_NAME : proxy.c_str(), WINHTTP_NO_PROXY_BYPASS, 0);
+    if (session == nullptr) {
+        LauncherUpdateLog("open session failed: " + std::to_string(GetLastError()));
+        return result;
+    }
+    // TLS 1.2/1.3 explicitly: WinHTTP's default protocol set still excludes them on some builds,
+    // which shows up as an intermittent handshake failure.
+    DWORD protocols = WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_2 | WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_3;
+    WinHttpSetOption(session, WINHTTP_OPTION_SECURE_PROTOCOLS, &protocols, sizeof(protocols));
+    WinHttpSetTimeouts(session, static_cast<int>(timeout_ms), static_cast<int>(timeout_ms),
+        static_cast<int>(timeout_ms), static_cast<int>(timeout_ms));
+    HINTERNET connection = WinHttpConnect(session, host.c_str(), port, 0);
+    if (connection != nullptr) {
+        HINTERNET request = WinHttpOpenRequest(connection, L"GET", path.c_str(), nullptr,
+            WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES,
+            secure ? WINHTTP_FLAG_SECURE : 0);
+        if (request != nullptr) {
+            // GameBanana answers with redirects for some hosts and rejects unknown clients, so the
+            // policy follows redirects and the request presents a browser-style identity.
+            DWORD redirect_policy = WINHTTP_OPTION_REDIRECT_POLICY_ALWAYS;
+            WinHttpSetOption(request, WINHTTP_OPTION_REDIRECT_POLICY, &redirect_policy,
+                sizeof(redirect_policy));
+            const wchar_t* headers =
+                L"User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) CabbirdLauncher/1.0\r\n"
+                L"Accept: application/json\r\n"
+                L"Accept-Encoding: identity\r\n";
+            const BOOL sent = WinHttpSendRequest(request, headers, static_cast<DWORD>(-1L),
+                WINHTTP_NO_REQUEST_DATA, 0, 0, 0);
+            const DWORD send_error = sent == FALSE ? GetLastError() : 0;
+            const BOOL received = sent != FALSE ? WinHttpReceiveResponse(request, nullptr) : FALSE;
+            const DWORD receive_error = received == FALSE ? GetLastError() : 0;
+            if (sent != FALSE && received != FALSE) {
+                // The status is what separates "this repository publishes no release" from "the API
+                // refused to answer at all", and the launcher reports the difference to the user.
+                DWORD status{};
+                DWORD status_size = sizeof(status);
+                if (WinHttpQueryHeaders(request,
+                        WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+                        WINHTTP_HEADER_NAME_BY_INDEX, &status, &status_size,
+                        WINHTTP_NO_HEADER_INDEX) != FALSE && status_code != nullptr) {
+                    *status_code = static_cast<int>(status);
+                }
+                // Read until the stream reports zero bytes: QueryDataAvailable returns 0 for
+                // "nothing right now" too, which used to truncate the body mid-JSON.
+                std::string chunk(16 * 1024, '\0');
+                DWORD read{};
+                while (result.size() <= (1u << 20) &&
+                    WinHttpReadData(request, chunk.data(), static_cast<DWORD>(chunk.size()), &read) != FALSE &&
+                    read > 0) {
+                    result.append(chunk.data(), read);
+                    read = 0;
+                }
+            }
+            if (result.empty()) {
+                DWORD status{};
+                DWORD size = sizeof(status);
+                WinHttpQueryHeaders(request, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+                    WINHTTP_HEADER_NAME_BY_INDEX, &status, &size, WINHTTP_NO_HEADER_INDEX);
+                LauncherUpdateLog("get " + std::string(path.begin(), path.end()) +
+                    " empty; status=" + std::to_string(status) +
+                    " error=" + std::to_string(GetLastError()));
+            }
+            WinHttpCloseHandle(request);
+        } else {
+            LauncherUpdateLog("open request failed: " + std::to_string(GetLastError()));
+        }
+        WinHttpCloseHandle(connection);
+    } else {
+        LauncherUpdateLog("connect failed: " + std::to_string(GetLastError()));
+    }
+    WinHttpCloseHandle(session);
+    return result;
+}
+
+std::string LauncherHttpGetUrl(const std::string& url, const bool use_system_proxy,
+    int* status_code, const DWORD timeout_ms) {
+    if (status_code != nullptr) *status_code = 0;
+    const std::wstring wide(url.begin(), url.end());
+    URL_COMPONENTS parts{};
+    parts.dwStructSize = sizeof(parts);
+    parts.dwHostNameLength = static_cast<DWORD>(-1);
+    parts.dwUrlPathLength = static_cast<DWORD>(-1);
+    parts.dwSchemeLength = static_cast<DWORD>(-1);
+    parts.dwExtraInfoLength = static_cast<DWORD>(-1);
+    if (WinHttpCrackUrl(wide.c_str(), static_cast<DWORD>(wide.size()), 0, &parts) == FALSE) {
+        LauncherUpdateLog("url get: crack failed " + std::to_string(GetLastError()) +
+            " url=" + url);
+        return {};
+    }
+    const std::wstring host(parts.lpszHostName, parts.dwHostNameLength);
+    std::wstring path(parts.lpszUrlPath, parts.dwUrlPathLength);
+    if (parts.dwExtraInfoLength != 0) path.append(parts.lpszExtraInfo, parts.dwExtraInfoLength);
+    if (path.empty()) path = L"/";
+    const INTERNET_PORT port = parts.nPort == 0 ? INTERNET_DEFAULT_HTTPS_PORT : parts.nPort;
+    return LauncherHttpGetRequest(host, path, port, parts.nScheme == INTERNET_SCHEME_HTTPS,
+        use_system_proxy, status_code, timeout_ms);
+}
+
+std::wstring LauncherSystemProxy() {
+    HKEY key{};
+    if (RegOpenKeyExW(HKEY_CURRENT_USER,
+            L"Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings", 0, KEY_READ,
+            &key) != ERROR_SUCCESS) {
+        return {};
+    }
+    DWORD enabled{};
+    DWORD size = sizeof(enabled);
+    DWORD type{};
+    std::wstring proxy;
+    if (RegQueryValueExW(key, L"ProxyEnable", nullptr, &type,
+            reinterpret_cast<LPBYTE>(&enabled), &size) == ERROR_SUCCESS && enabled != 0) {
+        wchar_t buffer[512]{};
+        DWORD bytes = sizeof(buffer);
+        if (RegQueryValueExW(key, L"ProxyServer", nullptr, &type,
+                reinterpret_cast<LPBYTE>(buffer), &bytes) == ERROR_SUCCESS) {
+            proxy = buffer;
+        }
+    }
+    RegCloseKey(key);
+    return proxy;
+}
+
+bool LauncherDownloadUrl(const std::string& url, const std::filesystem::path& destination,
+    LauncherDownloadProgress* const progress) {
+    const std::wstring wide(url.begin(), url.end());
+    URL_COMPONENTS parts{};
+    parts.dwStructSize = sizeof(parts);
+    parts.dwHostNameLength = static_cast<DWORD>(-1);
+    parts.dwUrlPathLength = static_cast<DWORD>(-1);
+    parts.dwSchemeLength = static_cast<DWORD>(-1);
+    parts.dwExtraInfoLength = static_cast<DWORD>(-1);
+    if (WinHttpCrackUrl(wide.c_str(), static_cast<DWORD>(wide.size()), 0, &parts) == FALSE) {
+        LauncherUpdateLog("crack failed " + std::to_string(GetLastError()) + " url=" + url);
+        return false;
+    }
+    const std::wstring host(parts.lpszHostName, parts.dwHostNameLength);
+    std::wstring path(parts.lpszUrlPath, parts.dwUrlPathLength);
+    if (parts.dwExtraInfoLength != 0) path.append(parts.lpszExtraInfo, parts.dwExtraInfoLength);
+    if (path.empty()) path = L"/";
+    const INTERNET_PORT port = parts.nPort == 0 ? INTERNET_DEFAULT_HTTPS_PORT : parts.nPort;
+    const bool secure = parts.nScheme == INTERNET_SCHEME_HTTPS;
+
+    const std::wstring proxy = LauncherSystemProxy();
+    HINTERNET session = WinHttpOpen(L"CabbirdLauncher/1.0",
+        proxy.empty() ? WINHTTP_ACCESS_TYPE_NO_PROXY : WINHTTP_ACCESS_TYPE_NAMED_PROXY,
+        proxy.empty() ? WINHTTP_NO_PROXY_NAME : proxy.c_str(), WINHTTP_NO_PROXY_BYPASS, 0);
+    if (session == nullptr) {
+        LauncherUpdateLog("url dl: session failed " + std::to_string(GetLastError()));
+        return false;
+    }
+    DWORD protocols = WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_2 | WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_3;
+    WinHttpSetOption(session, WINHTTP_OPTION_SECURE_PROTOCOLS, &protocols, sizeof(protocols));
+    WinHttpSetTimeouts(session, 8000, 8000, 8000, 8000);
+    bool ok{};
+    HINTERNET connection = WinHttpConnect(session, host.c_str(), port, 0);
+    if (connection == nullptr) {
+        LauncherUpdateLog("url dl: connect failed " + std::to_string(GetLastError()) +
+            " host=" + std::string(host.begin(), host.end()));
+    }
+    if (connection != nullptr) {
+        HINTERNET request = WinHttpOpenRequest(connection, L"GET", path.c_str(), nullptr,
+            WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES,
+            secure ? WINHTTP_FLAG_SECURE : 0);
+        if (request != nullptr) {
+            DWORD redirect_policy = WINHTTP_OPTION_REDIRECT_POLICY_ALWAYS;
+            WinHttpSetOption(request, WINHTTP_OPTION_REDIRECT_POLICY, &redirect_policy,
+                sizeof(redirect_policy));
+            const wchar_t* headers =
+                L"User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) CabbirdLauncher/1.0\r\n"
+                L"Accept: */*\r\n";
+            if (WinHttpSendRequest(request, headers, static_cast<DWORD>(-1L), WINHTTP_NO_REQUEST_DATA,
+                    0, 0, 0) != FALSE &&
+                WinHttpReceiveResponse(request, nullptr) != FALSE) {
+                if (progress != nullptr) {
+                    progress->bytes.store(0);
+                    wchar_t length_text[32]{};
+                    DWORD length_size = sizeof(length_text);
+                    if (WinHttpQueryHeaders(request, WINHTTP_QUERY_CONTENT_LENGTH,
+                            WINHTTP_HEADER_NAME_BY_INDEX, length_text, &length_size,
+                            WINHTTP_NO_HEADER_INDEX) != FALSE) {
+                        progress->total.store(_wtoi64(length_text));
+                    } else {
+                        progress->total.store(0);
+                    }
+                }
+                std::filesystem::create_directories(destination.parent_path());
+                std::ofstream out(destination, std::ios::binary | std::ios::trunc);
+                if (out) {
+                    ok = true;
+                    // Read until zero bytes come back (true EOF); QueryDataAvailable returning 0
+                    // only means "nothing right now" and used to truncate the payload.
+                    std::string chunk(64 * 1024, '\0');
+                    const auto started = std::chrono::steady_clock::now();
+                    long long received{};
+                    DWORD read{};
+                    for (;;) {
+                        if (!WinHttpReadData(request, chunk.data(), static_cast<DWORD>(chunk.size()), &read)) {
+                            ok = false;
+                            break;
+                        }
+                        if (read == 0) break;
+                        out.write(chunk.data(), static_cast<std::streamsize>(read));
+                        if (!out) { ok = false; break; }
+                        received += static_cast<long long>(read);
+                        if (progress != nullptr) progress->bytes.fetch_add(static_cast<long long>(read));
+                        read = 0;
+                        if (progress != nullptr && progress->cancel.load()) {
+                            LauncherUpdateLog("url dl: cancelled by user");
+                            ok = false;
+                            break;
+                        }
+                        if (std::chrono::steady_clock::now() - started > std::chrono::minutes(10)) {
+                            LauncherUpdateLog("url dl: total timeout after " +
+                                std::to_string(received) + " bytes");
+                            ok = false;
+                            break;
+                        }
+                    }
+                    out.close();
+                    if (!out) ok = false;
+                    if (ok && received == 0) {
+                        LauncherUpdateLog("url dl: empty body " + url);
+                        ok = false;
+                    }
+                }
+            } else {
+                LauncherUpdateLog("url dl: request failed " + std::to_string(GetLastError()) +
+                    " url=" + url);
+            }
+            WinHttpCloseHandle(request);
+        }
+        WinHttpCloseHandle(connection);
+    }
+    WinHttpCloseHandle(session);
+    if (!ok) {
+        std::error_code error;
+        std::filesystem::remove(destination, error);
+    }
+    return ok;
+}
+
 class LauncherController final {
 public:
     explicit LauncherController(std::filesystem::path payload_root,
@@ -373,6 +748,11 @@ public:
     }
 
     ~LauncherController() {
+        g_update_download.cancel.store(true);
+        update_check_worker_.request_stop();
+        if (update_check_worker_.joinable()) update_check_worker_.join();
+        telemetry_worker_.request_stop();
+        if (telemetry_worker_.joinable()) telemetry_worker_.join();
         worker_.request_stop();
         queue_changed_.notify_all();
         worker_.join();
@@ -490,6 +870,51 @@ public:
         });
     }
 
+    void SetAutoCheckUpdates(const bool enabled) {
+        {
+            std::scoped_lock lock(state_mutex_);
+            if (configuration_.update.auto_check == enabled) return;
+            configuration_.update.auto_check = enabled;
+            state_.update.auto_check = enabled;
+            settings_dirty_ = true;
+        }
+    }
+
+    void SkipUpdateVersion(std::string version) {
+        {
+            std::scoped_lock lock(state_mutex_);
+            if (version.empty() || configuration_.update.skipped_version == version) return;
+            configuration_.update.skipped_version = std::move(version);
+            state_.update.skipped_version = configuration_.update.skipped_version;
+            settings_dirty_ = true;
+        }
+    }
+
+    void AutoCheckUpdates() {
+        {
+            std::scoped_lock lock(state_mutex_);
+            if (auto_check_done_ || state_.busy || !configuration_.update.auto_check) return;
+            auto_check_done_ = true;
+        }
+        if (!StartUpdateCheck()) {
+            std::scoped_lock lock(state_mutex_);
+            auto_check_done_ = false;  // the worker was busy; the next frame tries again
+        }
+    }
+
+    void CheckForUpdates() {
+        StartUpdateCheck();
+    }
+
+    void InstallUpdate() {
+        const auto snapshot = Snapshot();
+        if (snapshot.busy || !snapshot.update.CanInstall()) return;
+        g_update_download.cancel.store(false);
+        g_update_download.bytes.store(0);
+        g_update_download.total.store(0);
+        QueueUpdate([this] { InstallUpdateImpl(); }, LauncherUpdateFailure::Install);
+    }
+
     void SetTheme(std::string theme) {
         ChangeSettings([theme = std::move(theme)](auto& configuration) { configuration.theme = theme; });
     }
@@ -582,6 +1007,287 @@ public:
 private:
     using Work = std::function<void()>;
 
+    bool StartUpdateCheck() {
+        {
+            std::scoped_lock lock(state_mutex_);
+            if (state_.busy || state_.update.Busy()) return false;
+            state_.update.phase = LauncherUpdatePhase::Checking;
+            auto_check_done_ = true;
+        }
+        // A release lookup must not reserve the launch/install worker for every network timeout.
+        // The previous lookup has published its result before another check becomes available.
+        if (update_check_worker_.joinable()) update_check_worker_.join();
+        update_check_worker_ = std::jthread([this](std::stop_token stop) {
+            RunUpdate([this, stop] { CheckForUpdatesImpl(stop); }, LauncherUpdateFailure::Check);
+        });
+        return true;
+    }
+
+    bool QueueSilent(Work work) {
+        {
+            std::scoped_lock lock(state_mutex_);
+            if (state_.busy) return false;
+            state_.busy = true;
+        }
+        {
+            std::scoped_lock lock(queue_mutex_);
+            queue_.push_back(std::move(work));
+        }
+        queue_changed_.notify_one();
+        return true;
+    }
+
+    bool QueueUpdate(Work work, LauncherUpdateFailure failure) {
+        return QueueSilent([this, work = std::move(work), failure] {
+            RunUpdate(work, failure);
+        });
+    }
+
+    void RunUpdate(const Work& work, LauncherUpdateFailure failure) {
+        try {
+            work();
+        } catch (...) {
+            std::scoped_lock lock(state_mutex_);
+            state_.update.phase = LauncherUpdatePhase::Failed;
+            state_.update.failure = failure;
+            state_.update.detail = "update operation could not be completed";
+        }
+    }
+
+    void CheckForUpdatesImpl(std::stop_token stop) {
+        // The mirror that answered last time, if any: asked first, so a launch on a network that
+        // cannot reach api.github.com does not spend its budget on an address known not to answer.
+        std::string endpoint;
+        {
+            std::scoped_lock lock(state_mutex_);
+            endpoint = configuration_.update.endpoint;
+            state_.update.phase = LauncherUpdatePhase::Checking;
+            state_.update.failure = LauncherUpdateFailure::None;
+            state_.update.detail.clear();
+            state_.update.http_status = 0;
+        }
+        const std::string api_url = "https://api.github.com/repos/" +
+            std::string(cabbird::launcher::kReleaseRepository) + "/releases/latest";
+        std::optional<cabbird::launcher::ReleaseInfo> release;
+        std::string answered_by;
+        int status{};
+        bool answered{};
+        bool first = true;
+        for (const std::string& url : LauncherLookupCandidates(api_url, endpoint)) {
+            if (stop.stop_requested()) return;
+            // The first endpoint gets both routes -- the system proxy the machine is configured with,
+            // and a direct connection -- because a stale proxy is a common reason for a lookup to
+            // return nothing. The rest are tried once: whoever answers, answers.
+            int attempt_status{};
+            std::string body = LauncherHttpGetUrl(url, false, &attempt_status, 3000);
+            if (body.empty() && first && !stop.stop_requested())
+                body = LauncherHttpGetUrl(url, true, &attempt_status, 3000);
+            first = false;
+            if (attempt_status != 0) status = attempt_status;
+            if (body.empty()) continue;
+            answered = true;
+            if (auto parsed = cabbird::launcher::ParseLatestRelease(body); parsed.has_value()) {
+                release = std::move(parsed);
+                answered_by = url;
+                break;
+            }
+        }
+
+        {
+            std::scoped_lock lock(state_mutex_);
+            if (release.has_value() && !answered_by.empty()) {
+                // Remember which endpoint answered, so the next launch starts there instead of
+                // waiting out the addresses this network cannot reach.
+                const std::string used = LauncherEndpointOfUrl(answered_by);
+                if (configuration_.update.endpoint != used) {
+                    configuration_.update.endpoint = used;
+                    settings_dirty_ = true;
+                }
+            }
+            state_.update.http_status = status;
+            if (!release.has_value()) {
+                state_.update.phase = LauncherUpdatePhase::Failed;
+                if (status == 0 && !answered) {
+                    state_.update.failure = LauncherUpdateFailure::Network;
+                } else if (status == 403 || status == 429) {
+                    state_.update.failure = LauncherUpdateFailure::RateLimited;
+                } else if (status != 0 && status != 200) {
+                    state_.update.failure = LauncherUpdateFailure::Http;
+                } else {
+                    state_.update.failure = LauncherUpdateFailure::NotRelease;
+                }
+                return;
+            }
+            state_.update.remote_tag = release->tag;
+            state_.update.remote_version = release->version;
+            state_.update.page_url = release->page_url;
+            state_.update.notes = release->notes;
+            const auto* const asset = cabbird::launcher::FindRuntimeAsset(*release);
+            state_.update.asset = asset != nullptr
+                ? *asset : cabbird::launcher::ReleaseAsset{};
+            switch (cabbird::launcher::CompareRelease(CABBIRD_SDK_VERSION_STRING, *release)) {
+            case cabbird::launcher::ReleaseComparison::Newer:
+                if (asset != nullptr) {
+                    state_.update.phase = LauncherUpdatePhase::Available;
+                } else {
+                    state_.update.phase = LauncherUpdatePhase::Failed;
+                    state_.update.failure = LauncherUpdateFailure::Check;
+                    state_.update.detail = "release publishes no verified runtime package for this version";
+                }
+                break;
+            case cabbird::launcher::ReleaseComparison::UpToDate:
+                state_.update.phase = LauncherUpdatePhase::UpToDate;
+                break;
+            case cabbird::launcher::ReleaseComparison::Unknown:
+                state_.update.phase = LauncherUpdatePhase::Failed;
+                state_.update.failure = LauncherUpdateFailure::Check;
+                state_.update.detail = "release version could not be compared with this build";
+                break;
+            }
+        }
+    }
+
+    void InstallUpdateImpl() {
+        cabbird::launcher::ReleaseAsset asset;
+        {
+            std::scoped_lock lock(state_mutex_);
+            if (!state_.update.CanInstall()) return;
+            asset = state_.update.asset;
+            if (asset.download_url.empty()) return;
+            state_.update.phase = LauncherUpdatePhase::Downloading;
+            state_.update.failure = LauncherUpdateFailure::None;
+            state_.update.detail.clear();
+        }
+        const auto fail = [this](std::string detail) {
+            std::scoped_lock lock(state_mutex_);
+            state_.update.phase = LauncherUpdatePhase::Failed;
+            state_.update.failure = LauncherUpdateFailure::Install;
+            state_.update.detail = std::move(detail);
+        };
+        std::error_code error;
+        GUID download_id{};
+        wchar_t download_name[40]{};
+        if (FAILED(CoCreateGuid(&download_id)) ||
+            StringFromGUID2(download_id, download_name, static_cast<int>(std::size(download_name))) == 0) {
+            fail("update download directory could not be allocated");
+            return;
+        }
+        const auto directory = std::filesystem::temp_directory_path(error) /
+            (std::wstring(L"cabbird-launcher-update-") + download_name);
+        if (error) {
+            fail("temporary directory is unavailable");
+            return;
+        }
+        if (!std::filesystem::create_directory(directory, error)) {
+            fail("update download directory could not be created");
+            return;
+        }
+        struct DownloadDirectory final {
+            std::filesystem::path path;
+            ~DownloadDirectory() {
+                std::error_code ignored;
+                std::filesystem::remove_all(path, ignored);
+            }
+        } cleanup{directory};
+        const auto archive = directory / L"runtime.zip";
+
+        // The package is fetched from the release's own address, once: the gh-proxy mirrors exist to
+        // reach the API when github.com does not answer, not to carry the payload, and a package that
+        // arrived through a third party would be one more thing to trust. A user whose network cannot
+        // reach github.com at all has the netdisk buttons in this dialog for exactly that case.
+        cabbird::launcher::PackageVerification verification;
+        std::string rejected;
+        bool downloaded = LauncherDownloadUrl(asset.download_url, archive, &g_update_download);
+        if (downloaded) {
+            verification = cabbird::launcher::VerifyReleasePackage(archive, asset);
+            if (!verification.Ok()) {
+                rejected = std::string("package failed verification (") +
+                    (verification.check == cabbird::launcher::PackageCheck::Size
+                        ? "size " + std::to_string(verification.size) + " != " +
+                            std::to_string(asset.size)
+                        : verification.check == cabbird::launcher::PackageCheck::Digest
+                            ? "sha256 " + verification.sha256
+                            : std::string("unreadable")) + ')';
+                LauncherUpdateLog(rejected);
+                std::filesystem::remove(archive, error);
+                downloaded = false;
+            }
+        } else {
+            LauncherUpdateLog("package download failed: " + asset.download_url);
+        }
+        if (!downloaded || g_update_download.cancel.load()) {
+            if (g_update_download.cancel.load()) {
+                // Cancelling is not a failure: the release is still there to install, and the dialog
+                // goes back to offering it.
+                std::scoped_lock lock(state_mutex_);
+                state_.update.phase = LauncherUpdatePhase::Available;
+                state_.update.failure = LauncherUpdateFailure::None;
+                state_.update.detail.clear();
+                return;
+            }
+            fail(rejected.empty()
+                ? std::string("update package could not be downloaded")
+                : rejected);
+            return;
+        }
+        LauncherUpdateLog("package verified: " + asset.name + " size=" +
+            std::to_string(verification.size) + " sha256=" + verification.sha256);
+        {
+            std::scoped_lock lock(state_mutex_);
+            state_.update.phase = LauncherUpdatePhase::Installing;
+        }
+        if (g_update_download.cancel.load()) {
+            std::scoped_lock lock(state_mutex_);
+            state_.update.phase = LauncherUpdatePhase::Available;
+            return;
+        }
+        const auto staging = directory / L"staging";
+        const auto extracted = cabbird::ExtractZip(archive, staging);
+        if (!extracted.Ok()) {
+            fail(extracted.message);
+            return;
+        }
+        if (g_update_download.cancel.load()) {
+            std::scoped_lock lock(state_mutex_);
+            state_.update.phase = LauncherUpdatePhase::Available;
+            return;
+        }
+        const auto published =
+            cabbird::launcher::PublishStagedRelease(staging, payload_root_);
+        if (!published.Ok()) {
+            fail(published.failure);
+            return;
+        }
+        std::string restart_failure;
+        if (!RelaunchUpdatedLauncher(restart_failure)) {
+            fail(std::move(restart_failure));
+            return;
+        }
+        std::scoped_lock lock(state_mutex_);
+        state_.update.phase = LauncherUpdatePhase::Installed;
+        state_.restart_pending = true;
+    }
+
+    bool RelaunchUpdatedLauncher(std::string& failure) {
+        const auto executable = payload_root_ / cabbird::launcher::kLauncherExecutableName;
+        // Wait before reading configuration or removing the renamed image. The old controller
+        // persists its final settings during destruction, after the window closes.
+        std::wstring command = L"\"" + executable.wstring() + L"\" --wait-for-update " +
+            std::to_wstring(GetCurrentProcessId());
+        STARTUPINFOW startup{.cb = sizeof(startup)};
+        PROCESS_INFORMATION process{};
+        if (CreateProcessW(executable.c_str(), command.data(), nullptr, nullptr, FALSE,
+                CREATE_UNICODE_ENVIRONMENT, nullptr, executable.parent_path().c_str(),
+                &startup, &process) == FALSE) {
+            failure = "new launcher could not be started (Win32 " +
+                std::to_string(GetLastError()) + ')';
+            return false;
+        }
+        CloseHandle(process.hThread);
+        CloseHandle(process.hProcess);
+        return true;
+    }
+
     void ChangeSettings(std::function<void(cabbird::launcher::LauncherConfiguration&)> change,
         const bool reload_language = false) {
         Queue(cabbird::MessageId::LauncherStatusSavingSettings,
@@ -626,12 +1332,15 @@ private:
                 return;
             }
             std::scoped_lock lock(state_mutex_);
+            updated.update = configuration_.update;
             configuration_ = std::move(updated);
             state_.theme = configuration_.theme;
             state_.language = configuration_.language;
             state_.artwork = configuration_.artwork;
             state_.custom_colors = configuration_.custom_colors;
             state_.frame_rate_limit = configuration_.frame_rate_limit;
+            state_.update.auto_check = configuration_.update.auto_check;
+            state_.update.skipped_version = configuration_.update.skipped_version;
             state_.settings_error.clear();
             if (translator != nullptr) state_.translator = std::move(translator);
             if (theme != nullptr) state_.theme_layout = std::move(theme);
@@ -785,6 +1494,7 @@ private:
     }
 
     void InitializePathsImpl() {
+        cabbird::launcher::RemoveUpdateLeftovers(payload_root_);
         const auto loaded = cabbird::launcher::LoadLauncherConfiguration(configuration_path_);
         const auto game_processes = cabbird::launcher::EnumerateAttachableProcesses();
         const auto launcher_processes =
@@ -839,6 +1549,8 @@ private:
             state_.artwork = configuration_.artwork;
             state_.custom_colors = configuration_.custom_colors;
             state_.frame_rate_limit = configuration_.frame_rate_limit;
+            state_.update.auto_check = configuration_.update.auto_check;
+            state_.update.skipped_version = configuration_.update.skipped_version;
             state_.game_directory = selected.game_directory;
             state_.launcher_executable = selected.launcher_executable;
         }
@@ -851,6 +1563,7 @@ private:
         }
         RefreshRecoveryImpl();
         RefreshProcessesImpl();
+        StartTelemetryImpl();
         if (!saved.Ok()) {
             PublishMessage(cabbird::MessageId::LauncherStatusUnexpectedFailure,
                 MessageKind::Error, saved.message);
@@ -887,6 +1600,28 @@ private:
         }
         return cabbird::launcher::SaveLauncherConfiguration(
             configuration_path_, configuration);
+    }
+
+    void StartTelemetryImpl() noexcept {
+        try {
+            const auto day = cabbird::TelemetryDay(std::chrono::system_clock::now());
+            if (telemetry_attempt_day_ == day) return;
+            cabbird::TelemetryOptions options;
+            const auto config = unitymem::AnalyzerConfig::Load(runtime_directory_ / L"cabbird.ini");
+            options.enabled = config.telemetry_enabled;
+            options.endpoint = config.telemetry_endpoint;
+            if (!options.enabled || options.endpoint.empty()) return;
+            const auto snapshot = Snapshot();
+            if (!snapshot.theme_layout) return;
+            options.language = cabbird::LocaleName(cabbird::ResolveUserLocale(
+                cabbird::ParseLanguagePreference(snapshot.language).preference).locale);
+            cabbird::LauncherTelemetryUsage usage;
+            usage.theme = snapshot.theme;
+            usage.custom_background = snapshot.theme_layout->HasBackground() && !snapshot.artwork.background.empty();
+            telemetry_attempt_day_ = day;
+            telemetry_worker_ = std::jthread([options = std::move(options), usage = std::move(usage)](
+                std::stop_token stop) { cabbird::ReportLauncherUsage(options, usage, stop); });
+        } catch (...) {}
     }
 
     void RefreshProcessesImpl(ProcessAnnounce announce = ProcessAnnounce::Always) {
@@ -948,6 +1683,10 @@ private:
     std::condition_variable_any queue_changed_;
     std::deque<Work> queue_;
     std::chrono::steady_clock::time_point last_process_poll_{};
+    bool auto_check_done_{};
+    std::jthread update_check_worker_;
+    std::string telemetry_attempt_day_;
+    std::jthread telemetry_worker_;
     std::jthread worker_;
 };
 
@@ -1532,6 +2271,10 @@ struct LauncherActions final {
     std::function<void(std::filesystem::path)> select_game_directory;
     std::function<void(std::filesystem::path)> select_launcher_executable;
     std::function<void()> refresh_processes;
+    std::function<void(bool)> set_auto_check_updates;
+    std::function<void(std::string)> skip_update_version;
+    std::function<void()> check_for_updates;
+    std::function<void()> install_update;
     std::function<void()> launch_and_attach;
     std::function<void(std::uint32_t)> set_toggle_key;
     std::function<void(std::string)> set_theme;
@@ -1549,6 +2292,10 @@ LauncherActions ActionsFor(LauncherController& controller) {
         [&controller](std::filesystem::path path) { controller.SelectGameDirectory(std::move(path)); },
         [&controller](std::filesystem::path path) { controller.SelectLauncherExecutable(std::move(path)); },
         [&controller] { controller.RefreshProcesses(); },
+        [&controller](bool enabled) { controller.SetAutoCheckUpdates(enabled); },
+        [&controller](std::string version) { controller.SkipUpdateVersion(std::move(version)); },
+        [&controller] { controller.CheckForUpdates(); },
+        [&controller] { controller.InstallUpdate(); },
         [&controller] { controller.LaunchAndAttach(); },
         [&controller](std::uint32_t key) { controller.SetToggleKey(key); },
         [&controller](std::string theme) { controller.SetTheme(std::move(theme)); },
@@ -1966,6 +2713,536 @@ void DrawBackgroundSettings(HWND window, const LauncherActions& actions, const L
     ImGui::EndChild();
 }
 
+bool g_update_prompt_requested{};
+
+std::string Num(double value, int precision) {
+    char text[64]{};
+    std::snprintf(text, sizeof(text), "%.*f", precision, value);
+    return text;
+}
+
+void LauncherOpenReleasePage(const LauncherUpdateStatus& update) {
+    const std::wstring url = Utf8Wide(update.page_url.empty()
+        ? std::string(cabbird::launcher::kReleasePageUrl) : update.page_url);
+    ShellExecuteW(nullptr, L"open", url.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+}
+
+// The failure a check or an install reported, worded by the launcher where it can be. A rate-limited
+// API, an unreachable host and an answer that is not a release are different problems with
+// different answers, and the installer's own diagnostics are passed through as they were produced.
+std::string UpdateFailureText(
+    const cabbird::Translator& translator, const LauncherUpdateStatus& update) {
+    const std::string status = std::to_string(update.http_status);
+    switch (update.failure) {
+    case LauncherUpdateFailure::Network:
+        return Text(translator, cabbird::MessageId::LauncherUpdateNetworkFailed);
+    case LauncherUpdateFailure::RateLimited:
+        return Format(translator, cabbird::MessageId::LauncherUpdateRateLimited, {status});
+    case LauncherUpdateFailure::Http:
+        return Format(translator, cabbird::MessageId::LauncherUpdateHttpFailed, {status});
+    case LauncherUpdateFailure::NotRelease:
+        return Format(translator, cabbird::MessageId::LauncherUpdateNotRelease, {status});
+    case LauncherUpdateFailure::Check:
+        return Format(translator, cabbird::MessageId::LauncherUpdateCheckFailed, {update.detail});
+    case LauncherUpdateFailure::Install:
+        return Format(translator, cabbird::MessageId::LauncherUpdateFailed, {update.detail});
+    case LauncherUpdateFailure::None:
+        break;
+    }
+    return Format(translator, cabbird::MessageId::LauncherUpdateCheckFailed, {update.detail});
+}
+
+// The update's own byte counters and cancellation control, independent of a mod download.
+// A transfer without a reported length shows received bytes instead of a percentage.
+void LauncherDrawDownloadProgress(const cabbird::Translator& translator) {
+    const double done = static_cast<double>(g_update_download.bytes.load());
+    const double total = static_cast<double>(g_update_download.total.load());
+    // Seconds since this download started: the bar only appears while one runs, so a static clock
+    // reset when the transfer begins is all the elapsed time it needs.
+    static double started{};
+    static long long last_seen{};
+    static bool running{};
+    if (!running || done < last_seen) {
+        started = ImGui::GetTime();
+        running = true;
+    }
+    last_seen = static_cast<long long>(done);
+    const double seconds = ImGui::GetTime() - started;
+    const double megabytes = done / (1024.0 * 1024.0);
+    if (total > 0.0) {
+        const std::string overlay = Format(translator,
+            cabbird::MessageId::LauncherBrowseProgressPercent,
+            {Num(megabytes, 1), Num(total / (1024.0 * 1024.0), 1),
+                Num(done * 100.0 / total, 0), Num(seconds, 0)});
+        ImGui::ProgressBar(static_cast<float>(done / total), ImVec2(Scale(260.0f), 0.0f),
+            overlay.c_str());
+    } else {
+        ImGui::AlignTextToFramePadding();
+        ImGui::TextDisabled("%s", Format(translator,
+            cabbird::MessageId::LauncherBrowseProgressBytes,
+            {Num(megabytes, 1), Num(seconds, 0)}).c_str());
+    }
+    ImGui::SameLine();
+    // The one command that makes sense beside a running transfer.
+    if (LauncherChip((std::string(Text(translator, cabbird::MessageId::LauncherModsCancel)) +
+            "##cancel-update-download").c_str(), {})) {
+        g_update_download.cancel.store(true);
+    }
+}
+
+// The state of the running update, as both the page and the dialog report it.
+std::string UpdatePhaseText(
+    const cabbird::Translator& translator, const LauncherUpdateStatus& update) {
+    switch (update.phase) {
+    case LauncherUpdatePhase::Idle:
+        return {};
+    case LauncherUpdatePhase::Checking:
+        return Text(translator, cabbird::MessageId::LauncherUpdateChecking);
+    case LauncherUpdatePhase::UpToDate:
+        return Format(translator, cabbird::MessageId::LauncherUpdateUpToDate,
+            {update.remote_version});
+    case LauncherUpdatePhase::Available:
+        return Format(translator, cabbird::MessageId::LauncherUpdateAvailable,
+            {update.remote_version});
+    case LauncherUpdatePhase::Downloading:
+        return Text(translator, cabbird::MessageId::LauncherUpdateDownloading);
+    case LauncherUpdatePhase::Installing:
+        return Text(translator, cabbird::MessageId::LauncherUpdateInstalling);
+    case LauncherUpdatePhase::Installed:
+        return Text(translator, cabbird::MessageId::LauncherUpdateInstalled);
+    case LauncherUpdatePhase::Failed:
+        return UpdateFailureText(translator, update);
+    }
+    return {};
+}
+
+ImVec4 UpdatePhaseInk(const LauncherUpdatePhase phase) {
+    const auto& theme = unitymem::CabbirdUiTheme();
+    switch (phase) {
+    case LauncherUpdatePhase::Available: return ThemeColor(theme.warning);
+    case LauncherUpdatePhase::Installed: return ThemeColor(theme.success);
+    case LauncherUpdatePhase::Failed: return ThemeColor(theme.danger);
+    default: return LauncherMutedInk();
+    }
+}
+
+// The launcher's own updates: the version this build is, the newest release it found, and the two
+// commands that follow from them. The update replaces the files of this folder and restarts the
+// window, so the button that starts it names the version it installs.
+void DrawUpdateSettings(
+    const LauncherActions& actions, const LauncherSnapshot& snapshot,
+    const cabbird::Translator& translator) {
+    const LauncherUpdateStatus& update = snapshot.update;
+    ImGui::Spacing();
+    ImGui::Separator();
+    ImGui::Spacing();
+    ImGui::TextDisabled("%s", Text(translator, cabbird::MessageId::LauncherSectionUpdates));
+    ImGui::AlignTextToFramePadding();
+    ImGui::TextUnformatted(Text(translator, cabbird::MessageId::LauncherSettingAutoUpdate));
+    ImGui::SameLine(ImGui::GetContentRegionMax().x - Scale(70.0f) - Scale(10.0f));
+    bool auto_check = update.auto_check;
+    if (cabbird::glass::Switch("##launcher-auto-update", &auto_check)) {
+        actions.set_auto_check_updates(auto_check);
+    }
+    ImGui::TextDisabled("%s", Format(translator, cabbird::MessageId::LauncherUpdateCurrent,
+        {CABBIRD_SDK_VERSION_STRING}).c_str());
+    const bool busy = snapshot.busy || update.Busy();
+    if (LauncherChip(Text(translator, update.phase == LauncherUpdatePhase::Checking
+            ? cabbird::MessageId::LauncherUpdateChecking
+            : cabbird::MessageId::LauncherUpdateCheck), {}, !busy)) {
+        actions.check_for_updates();
+    }
+    // The update command exists only while there is a release to install, so the row never offers
+    // something the launcher has no version for.
+    if (update.CanInstall()) {
+        ImGui::SameLine();
+        if (LauncherChip(Format(translator, cabbird::MessageId::LauncherUpdateInstall,
+                {update.remote_version}).c_str(), {}, !busy)) {
+            actions.install_update();
+        }
+    }
+    ImGui::SameLine();
+    // The release page is the only place that says what a new version changes, and it is where a
+    // user goes when they would rather read about it before installing.
+    if (LauncherChip(Text(translator, cabbird::MessageId::LauncherUpdateOpenPage), {})) {
+        LauncherOpenReleasePage(update);
+    }
+    const std::string status = UpdatePhaseText(translator, update);
+    if (update.phase == LauncherUpdatePhase::Downloading) {
+        LauncherDrawDownloadProgress(translator);
+    } else if (!status.empty()) {
+        ImGui::PushTextWrapPos();
+        ImGui::TextColored(UpdatePhaseInk(update.phase), "%s", status.c_str());
+        ImGui::PopTextWrapPos();
+    }
+}
+
+// The release notes are markdown, and the shell already owns the parser for the markdown it draws
+// (the first-run notice is authored in it). The launcher reuses that parser and draws the blocks
+// itself, in its own ink: the same document, rendered the way the rest of this window is.
+//
+// Emphasis is faux bold -- the run drawn twice -- because the launcher bakes one font weight, and a
+// run that wrapped is not doubled: the second draw would land on the line above it.
+void LauncherDrawEmphasis(const std::string& text) {
+    ImGui::TextUnformatted(text.c_str());
+    if (ImGui::GetItemRectSize().y > ImGui::GetTextLineHeight() * 1.6f) return;
+    const ImVec2 origin = ImGui::GetItemRectMin();
+    ImGui::GetWindowDrawList()->AddText(ImGui::GetFont(), ImGui::GetFontSize(),
+        ImVec2(origin.x + (std::max)(0.5f, Scale(0.5f)), origin.y),
+        ImGui::GetColorU32(ImGuiCol_Text), text.c_str());
+}
+
+// One line of a block: the runs stay in a single sentence, so emphasis and links keep their place.
+void LauncherDrawNoticeRuns(const std::vector<cabbird::NoticeRun>& runs) {
+    const auto& theme = unitymem::CabbirdUiTheme();
+    ImGui::PushTextWrapPos();
+    for (std::size_t index = 0; index < runs.size(); ++index) {
+        if (index > 0) ImGui::SameLine(0.0f, 0.0f);
+        const cabbird::NoticeRun& run = runs[index];
+        switch (run.style) {
+        case cabbird::NoticeRunStyle::Text:
+            ImGui::TextUnformatted(run.text.c_str());
+            break;
+        case cabbird::NoticeRunStyle::Emphasis:
+            LauncherDrawEmphasis(run.text);
+            break;
+        case cabbird::NoticeRunStyle::Code:
+            ImGui::TextColored(LauncherMutedInk(), "%s", run.text.c_str());
+            break;
+        case cabbird::NoticeRunStyle::Link:
+            ImGui::TextColored(ThemeColor(theme.accent), "%s", run.text.c_str());
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+                ImGui::SetTooltip("%s", run.url.c_str());
+            }
+            // A link in a release note is the one thing here that leaves the machine: it goes to the
+            // shell like every other address this window opens.
+            if (ImGui::IsItemClicked(ImGuiMouseButton_Left) && !run.url.empty()) {
+                const std::wstring url = Utf8Wide(run.url);
+                ShellExecuteW(nullptr, L"open", url.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+            }
+            break;
+        }
+    }
+    ImGui::PopTextWrapPos();
+}
+
+// A heading: the same text a little larger and painted twice a hair apart, which is the whole of the
+// emphasis this window has -- it bakes one font weight, so "bold" is the glyphs drawn again and
+// "larger" is the atlas drawn at a bigger size. A heading that would not fit the pane keeps the body
+// size and wraps like any other line, because a clipped heading is worse than a plain one.
+void LauncherDrawHeading(const std::vector<cabbird::NoticeRun>& runs, const bool muted) {
+    std::string text;
+    for (const cabbird::NoticeRun& run : runs) text += run.text;
+    if (text.empty()) return;
+    ImFont* const font = ImGui::GetFont();
+    const float size = ImGui::GetFontSize() * 1.18f;
+    const ImVec2 measured = font->CalcTextSizeA(size, FLT_MAX, 0.0f, text.c_str());
+    const ImVec4 ink = muted ? LauncherMutedInk() : LauncherInk();
+    if (measured.x > ImGui::GetContentRegionAvail().x) {
+        ImGui::TextWrapped("%s", text.c_str());
+        return;
+    }
+    const ImVec2 origin = ImGui::GetCursorScreenPos();
+    ImDrawList* const draw = ImGui::GetWindowDrawList();
+    const ImU32 color = ImGui::GetColorU32(ink);
+    const float bold = (std::max)(0.6f, Scale(0.6f));
+    draw->AddText(font, size, origin, color, text.c_str());
+    draw->AddText(font, size, ImVec2(origin.x + bold, origin.y), color, text.c_str());
+    ImGui::Dummy(measured);
+}
+
+void LauncherDrawReleaseNotes(const cabbird::NoticeDocument& document) {
+    for (std::size_t index = 0; index < document.blocks.size(); ++index) {
+        const cabbird::NoticeBlock& block = document.blocks[index];
+        switch (block.kind) {
+        case cabbird::NoticeBlockKind::Heading:
+        case cabbird::NoticeBlockKind::Subheading: {
+            // The release opens with its own name and date, which is context rather than a section;
+            // every heading is the same emphasis, only the first is quieter.
+            LauncherDrawHeading(block.runs, index == 0);
+            ImGui::Spacing();
+            break;
+        }
+        case cabbird::NoticeBlockKind::Paragraph:
+            LauncherDrawNoticeRuns(block.runs);
+            ImGui::Spacing();
+            break;
+        case cabbird::NoticeBlockKind::Bullet:
+            ImGui::Bullet();
+            ImGui::SameLine();
+            LauncherDrawNoticeRuns(block.runs);
+            ImGui::Spacing();
+            break;
+        case cabbird::NoticeBlockKind::Numbered:
+            ImGui::TextUnformatted(block.marker.c_str());
+            ImGui::SameLine();
+            LauncherDrawNoticeRuns(block.runs);
+            ImGui::Spacing();
+            break;
+        case cabbird::NoticeBlockKind::Separator:
+            ImGui::Separator();
+            break;
+        }
+    }
+}
+
+// The parsed notes, kept across frames: the document only changes when the release does, and parsing
+// a few kilobytes of markdown every frame for a dialog that is usually closed is wasted work.
+// git-cliff marks a change's scope with single asterisks -- "*(autotaxi)* Add ..." -- which is not
+// emphasis in the shell's markdown subset, so the markers would reach the screen. Keeping "**" (real
+// bold) and the asterisk a bullet starts with, and dropping every other one, leaves the scope text
+// readable and the bold intact.
+std::string LauncherNotesMarkdown(const std::string& notes) {
+    std::string cleaned;
+    cleaned.reserve(notes.size());
+    for (std::size_t index = 0; index < notes.size(); ++index) {
+        const char character = notes[index];
+        if (character != '*') {
+            cleaned.push_back(character);
+            continue;
+        }
+        const bool line_start = index == 0 || notes[index - 1] == '\n' ||
+            (notes[index - 1] == ' ' && index > 1 && notes[index - 2] == '\n');
+        if (line_start) {
+            cleaned.push_back(character);
+            continue;
+        }
+        if (index + 1 < notes.size() && notes[index + 1] == '*') {
+            cleaned.append("**");
+            ++index;
+        }
+    }
+    return cleaned;
+}
+
+const cabbird::NoticeDocument* LauncherReleaseNotes(const std::string& version,
+    const std::string& notes) {
+    static std::string parsed_for;
+    static cabbird::NoticeDocument document;
+    const std::string key = version + ':' + std::to_string(notes.size());
+    if (key != parsed_for) {
+        document = cabbird::ParseNoticeMarkdown(LauncherNotesMarkdown(notes), 0);
+        parsed_for = key;
+    }
+    return &document;
+}
+
+// The prompt an update check ends in: the release's own notes in a pane, and two answers below --
+// skipping that version on the left, updating on the right. Nothing is installed until the right one
+// is pressed, which is the difference between an update and a silent one.
+void DrawUpdatePrompt(
+    const LauncherActions& actions, const LauncherSnapshot& snapshot,
+    const cabbird::Translator& translator) {
+    const LauncherUpdateStatus& update = snapshot.update;
+    // The dialog's name is its id, and nothing else: its title is drawn below, four pixels lower than
+    // the title bar would have put it, so the line under it keeps the place it has always had. The two
+    // strings still have to be the same one -- OpenPopup and BeginPopupModal pair on this id.
+    const std::string title = Format(translator, cabbird::MessageId::LauncherUpdateAvailable,
+        {update.remote_version});
+    const std::string name = "##update-available";
+    // One question per release, and none for a release the user already skipped: a version answered
+    // once is not asked about again, this session or a later one. The band's chip asks for the same
+    // dialog explicitly, which is why that path opens it even when this session already saw the
+    // automatic one.
+    static std::string prompted_version;
+    const bool asked = std::exchange(g_update_prompt_requested, false);
+    if (update.phase == LauncherUpdatePhase::Available && !update.remote_version.empty() &&
+        (asked || (update.skipped_version != update.remote_version &&
+            prompted_version != update.remote_version))) {
+        prompted_version = update.remote_version;
+        ImGui::OpenPopup(name.c_str());
+    }
+    // The popup's padding: its left edge is the inset the title bar uses (FramePadding.x), so the
+    // first line of content sits exactly under the title instead of a few pixels left of it, and
+    // the bottom of it gives the last row the same room the top gives the first.
+    const ImGuiStyle& dialog_style = ImGui::GetStyle();
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,
+        ImVec2(dialog_style.FramePadding.x, Scale(2.0f)));
+    // Centred on the launcher's canvas -- not on the OS window, which reaches up into the transparent
+    // band above it -- and held there: a question is not a window the user should have to put back.
+    const ImVec2 canvas_min = ImGui::GetWindowPos();
+    const ImVec2 canvas_size = ImGui::GetWindowSize();
+    ImGui::SetNextWindowPos(
+        ImVec2(canvas_min.x + canvas_size.x * 0.5f, canvas_min.y + canvas_size.y * 0.5f),
+        ImGuiCond_Always, ImVec2(0.5f, 0.5f));
+    // Sized by its contents, like the mod settings dialog, so it grows with the language it is drawn
+    // in rather than clipping a localized label.
+    if (!ImGui::BeginPopupModal(name.c_str(), nullptr,
+            ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoMove |
+                ImGuiWindowFlags_NoResize)) {
+        ImGui::PopStyleVar();
+        return;
+    }
+    // The title bar itself draws nothing: its text is put here instead, a few pixels lower than the
+    // bar would have placed it, so the line below keeps the position it has always had. The clip is
+    // widened for it -- a window clips its items to the content area, and the title bar is above that
+    // -- or the text would be drawn and never seen.
+    {
+        const ImVec2 origin = ImGui::GetWindowPos();
+        const ImVec2 corner(origin.x + ImGui::GetWindowSize().x,
+            origin.y + ImGui::GetFontSize() + dialog_style.FramePadding.y * 2.0f);
+        ImDrawList* const draw = ImGui::GetWindowDrawList();
+        draw->PushClipRect(origin, corner, false);
+        draw->AddText(ImGui::GetFont(), ImGui::GetFontSize(),
+            ImVec2(origin.x + dialog_style.FramePadding.x,
+                origin.y + dialog_style.FramePadding.y + Scale(4.0f)),
+            ImGui::GetColorU32(LauncherInk()), title.c_str());
+        draw->PopClipRect();
+    }
+    // The version being left behind, under the title that names the one being installed.
+    ImGui::TextDisabled("%s", Format(translator, cabbird::MessageId::LauncherUpdateCurrent,
+        {CABBIRD_SDK_VERSION_STRING}).c_str());
+    ImGui::Spacing();
+
+    // The notes sit in a pane of their own, on the same material as the page's cards but quieter: it
+    // is a recess inside the dialog, not another object floating over it.
+    const float pane_width = Scale(760.0f);
+    const bool has_notes = !update.notes.empty();
+    if (has_notes) {
+        const float pane_height = Scale(380.0f);
+        const ImVec2 pane_min = ImGui::GetCursorScreenPos();
+        const ImVec2 pane_max(pane_min.x + pane_width, pane_min.y + pane_height);
+        // A plain recess, not a second pane of glass: the material belongs to the surface a window is
+        // cut from, and another layer of it inside the first only muddies both. A tinted fill with a
+        // hairline is what a panel inside a dialog reads as, and it keeps the notes legible.
+        const auto& theme = unitymem::CabbirdUiTheme();
+        ImDrawList* const draw = ImGui::GetWindowDrawList();
+        draw->AddRectFilled(pane_min, pane_max,
+            ImGui::GetColorU32(ThemeColorWithAlpha(theme.child_background, 0.72f)),
+            Scale(12.0f));
+        draw->AddRect(pane_min, pane_max,
+            ImGui::GetColorU32(ThemeColorWithAlpha(theme.border, 0.55f)),
+            Scale(12.0f), ImDrawFlags_None, Scale(1.0f));
+        ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.0f, 0.0f, 0.0f, 0.0f));
+        // A child without a border ignores style.WindowPadding unless it is asked to use it, which is
+        // how the notes ended up written against the pane's edges. AlwaysUseWindowPadding gives the
+        // text the inset it needs, and the wrap position follows that inset instead of the window edge.
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, Scale(18.0f, 14.0f));
+        ImGui::BeginChild("##update-notes", ImVec2(pane_width, pane_height),
+            ImGuiChildFlags_AlwaysUseWindowPadding, ImGuiWindowFlags_None);
+        // The release publishes markdown; the shell's own parser turns it into blocks, and the blocks
+        // are drawn here in this window's ink rather than dumped as a wall of hashes and asterisks.
+        LauncherDrawReleaseNotes(*LauncherReleaseNotes(update.remote_version, update.notes));
+        ImGui::EndChild();
+        ImGui::PopStyleVar();
+        ImGui::PopStyleColor();
+        ImGui::Spacing();
+    }
+
+    const bool busy = snapshot.busy || update.Busy();
+    const std::string status = UpdatePhaseText(translator, update);
+    if (update.phase == LauncherUpdatePhase::Downloading) {
+        LauncherDrawDownloadProgress(translator);
+    } else if (!status.empty() && update.phase != LauncherUpdatePhase::Available) {
+        ImGui::PushTextWrapPos();
+        ImGui::TextColored(UpdatePhaseInk(update.phase), "%s", status.c_str());
+        ImGui::PopTextWrapPos();
+    }
+    // The two answers are centred as one pair with a gap between them: a dialog asks a question, and
+    // its answers read as the pair that answers it rather than as two corners of the window. The update
+    // is the launcher's primary command -- accent inside the glass, with the download mark -- so the
+    // pair also carries the hierarchy.
+    const float row_height = ButtonHeight(44.0f);
+    const char* const skip_label = Text(translator, cabbird::MessageId::LauncherUpdateSkip);
+    const std::string update_label = Format(translator, cabbird::MessageId::LauncherUpdateInstall,
+        {update.remote_version});
+    // Both widths are measured the way the two controls size themselves -- the chip from its caption,
+    // the command from its mark and label -- so the pair stays centred in every language.
+    const float skip_width = ImGui::CalcTextSize(skip_label).x + Scale(30.0f);
+    const float update_width = ImGui::CalcTextSize(Glyph(0xe8b7)).x +
+        ImGui::CalcTextSize(update_label.c_str()).x + Scale(46.0f);
+    float pair_width = skip_width + update_width + Scale(16.0f);
+    if (!has_notes) {
+        // A release without notes has nothing to read here, so the page that does have something to
+        // read joins the pair instead of leaving an empty pane on screen.
+        pair_width += ImGui::CalcTextSize(
+            Text(translator, cabbird::MessageId::LauncherUpdateOpenPage)).x + Scale(46.0f);
+    }
+    const float pair_left = ImGui::GetCursorPosX() +
+        (std::max)(0.0f, (ImGui::GetContentRegionAvail().x - pair_width) * 0.5f);
+    ImGui::SetCursorPosX(pair_left);
+    ImGui::BeginDisabled(busy);
+    if (LauncherChip(skip_label, ImVec2(skip_width, row_height))) {
+        actions.skip_update_version(update.remote_version);
+        ImGui::CloseCurrentPopup();
+    }
+    ImGui::EndDisabled();
+    if (!has_notes) {
+        ImGui::SameLine(0.0f, Scale(8.0f));
+        if (LauncherChip(Text(translator, cabbird::MessageId::LauncherUpdateOpenPage),
+                ImVec2(0.0f, row_height))) {
+            LauncherOpenReleasePage(update);
+        }
+    }
+    ImGui::SameLine(0.0f, Scale(16.0f));
+    ImGui::BeginDisabled(busy);
+    if (CommandButton("update-install", 0xe8b7, update_label.c_str(), true, true,
+            ImVec2(update_width / g_launcher_dpi_scale, 44.0f))) {
+        actions.install_update();
+    }
+    ImGui::EndDisabled();
+    // The package is downloaded from github.com, which a network behind the wrong wall may not reach
+    // at all. These are the same release published where it can be fetched, offered next to the
+    // launcher's own download instead of in place of it. No extra spacing above them: the line after
+    // the answers already carries the row spacing, and a Spacing here doubled it.
+    {
+        const float quark_width = ImGui::CalcTextSize(
+            Text(translator, cabbird::MessageId::LauncherUpdateQuark)).x + Scale(30.0f);
+        const float baidu_width = ImGui::CalcTextSize(
+            Text(translator, cabbird::MessageId::LauncherUpdateBaidu)).x + Scale(30.0f);
+        const float links_width = quark_width + baidu_width + Scale(8.0f);
+        const float links_left = ImGui::GetCursorPosX() +
+            (std::max)(0.0f, (ImGui::GetContentRegionAvail().x - links_width) * 0.5f);
+        ImGui::SetCursorPosX(links_left);
+        if (LauncherChip(Text(translator, cabbird::MessageId::LauncherUpdateQuark),
+                ImVec2(quark_width, row_height), !cabbird::launcher::kReleaseQuarkUrl.empty())) {
+            const std::wstring url(cabbird::launcher::kReleaseQuarkUrl);
+            ShellExecuteW(nullptr, L"open", url.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+        }
+        ImGui::SameLine(0.0f, Scale(8.0f));
+        if (LauncherChip(Text(translator, cabbird::MessageId::LauncherUpdateBaidu),
+                ImVec2(baidu_width, row_height), !cabbird::launcher::kReleaseBaiduUrl.empty())) {
+            const std::wstring url(cabbird::launcher::kReleaseBaiduUrl);
+            ShellExecuteW(nullptr, L"open", url.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+        }
+    }
+    // The padding no longer gives the bottom the room the top does not need, so the last row keeps a
+    // reserve of its own instead of sitting on the window's edge.
+    ImGui::Dummy(ImVec2(0.0f, Scale(10.0f)));
+    ImGui::EndPopup();
+    ImGui::PopStyleVar();
+}
+
+
+void DrawAboutSettings(const cabbird::Translator& translator) {
+    DrawSettingsSection(translator, cabbird::MessageId::LauncherSectionAbout);
+    struct Address final {
+        cabbird::MessageId label;
+        const char* id;
+        std::string_view url;
+    };
+    constexpr std::array<Address, 2> addresses{{
+        {cabbird::MessageId::LauncherAboutGithub, "##about-github", kRepositoryUrl},
+        {cabbird::MessageId::LauncherAboutDiscord, "##about-discord", kDiscordUrl},
+    }};
+    const float row_height = ButtonHeight(40.0f);
+    for (std::size_t index = 0; index < addresses.size(); ++index) {
+        const Address& address = addresses[index];
+        const char* const label = Text(translator, address.label);
+        const float width = ImGui::CalcTextSize(label).x + Scale(40.0f);
+        if (index > 0) ImGui::SameLine(0.0f, Scale(12.0f));
+        const std::string chip = std::string(label) + address.id;
+        if (LauncherChip(chip.c_str(), ImVec2(width, row_height))) {
+            const std::wstring url = Utf8Wide(address.url);
+            ShellExecuteW(nullptr, L"open", url.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+        }
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("%.*s", static_cast<int>(address.url.size()), address.url.data());
+        }
+    }
+}
+
 void DrawSettingsMode(HWND window, const LauncherActions& actions, const LauncherSnapshot& snapshot,
     const cabbird::Translator& translator) {
     DrawAppearanceSettings(actions, snapshot, translator);
@@ -1980,11 +3257,8 @@ void DrawSettingsMode(HWND window, const LauncherActions& actions, const Launche
     DrawPerformanceSettings(actions, snapshot, translator);
     ImGui::Dummy(Scale(0.0f, 12.0f)); ImGui::Separator(); ImGui::Dummy(Scale(0.0f, 8.0f));
     DrawStartupSettings(snapshot, translator);
-    if (!snapshot.runtime_version.empty()) {
-        ImGui::Dummy(Scale(0.0f, 12.0f));
-        const auto runtime = Format(translator, cabbird::MessageId::LauncherRuntimeVersion, {snapshot.runtime_version});
-        ImGui::TextColored(LauncherMutedInk(), "%s", runtime.c_str());
-    }
+    DrawUpdateSettings(actions, snapshot, translator);
+    DrawAboutSettings(translator);
     DrawRecoveryState(actions, snapshot, translator);
 }
 
@@ -2035,15 +3309,18 @@ void DrawLauncher(HWND window, Graphics& graphics, const LauncherSnapshot& snaps
     } else DrawSettingsMode(window, actions, snapshot, translator);
     ImGui::EndChild(); ImGui::PopStyleVar();
     DrawLauncherThemeImages(graphics, snapshot.theme_layout, origin, size, true);
+    DrawUpdatePrompt(actions, snapshot, translator);
     ImGui::End(); ImGui::PopStyleVar();
 }
 
 int DrawLauncher(HWND window, Graphics& graphics, LauncherController& controller,
     LauncherMode& mode, const cabbird::Translator& translator) {
     controller.PollProcesses();
+    controller.AutoCheckUpdates();
     const auto snapshot = controller.Snapshot();
     DrawLauncher(window, graphics, snapshot, ActionsFor(controller), mode,
         snapshot.translator != nullptr ? *snapshot.translator : translator);
+    if (snapshot.restart_pending) PostMessageW(window, WM_CLOSE, 0, 0);
     if (!ImGui::IsAnyMouseDown()) controller.FlushSettings();
     return snapshot.frame_rate_limit;
 }
@@ -2077,6 +3354,33 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR command_line, int) {
     static_cast<void>(SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2));
     const auto administrator = EnsureAdministrator(command_line);
     if (!administrator.run_current_process) return administrator.exit_code;
+
+    int argument_count{};
+    LPWSTR* arguments = CommandLineToArgvW(GetCommandLineW(), &argument_count);
+    DWORD parent_process{};
+    if (arguments != nullptr) {
+        if (argument_count == 3 && std::wstring_view(arguments[1]) == L"--wait-for-update") {
+            wchar_t* end{};
+            parent_process = wcstoul(arguments[2], &end, 10);
+            if (end == arguments[2] || *end != L'\0' || parent_process == GetCurrentProcessId()) {
+                LocalFree(arguments);
+                return ERROR_INVALID_PARAMETER;
+            }
+        }
+        LocalFree(arguments);
+    }
+    if (parent_process != 0) {
+        const HANDLE parent = OpenProcess(SYNCHRONIZE, FALSE, parent_process);
+        if (parent != nullptr) {
+            const DWORD waited = WaitForSingleObject(parent, 60000);
+            CloseHandle(parent);
+            if (waited != WAIT_OBJECT_0) return ERROR_TIMEOUT;
+        } else if (GetLastError() != ERROR_INVALID_PARAMETER) {
+            return static_cast<int>(GetLastError());
+        }
+    }
+
+
 
     // Pin the system dwmapi before ImGui's delay imports are resolved.  The pin costs one
     // LoadLibrary and keeps this program independent of whatever appears next to it later.

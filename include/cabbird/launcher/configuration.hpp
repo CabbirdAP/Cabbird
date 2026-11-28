@@ -42,6 +42,12 @@ inline constexpr int kLauncherDefaultFrameRate = 120;
     return kLauncherFrameRates.back();
 }
 
+struct LauncherUpdateConfiguration final {
+    bool auto_check{true};
+    std::string endpoint;
+    std::string skipped_version;
+};
+
 struct LauncherConfiguration final {
     AzurPromiliaClient selected_client{AzurPromiliaClient::MainlandChina};
     // Launcher appearance is independent of the in-game platform settings.
@@ -49,6 +55,7 @@ struct LauncherConfiguration final {
     // Empty preserves the runtime ini language when upgrading an older launcher.
     std::string language;
     LauncherThemeArtwork artwork;
+    LauncherUpdateConfiguration update;
     CabbirdUiCustomColors custom_colors;
     int frame_rate_limit{kLauncherDefaultFrameRate};
     LauncherClientConfiguration mainland_china;

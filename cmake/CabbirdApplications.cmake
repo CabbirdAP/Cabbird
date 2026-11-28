@@ -64,6 +64,7 @@ endif()
 
 add_executable(cabbird_launcher WIN32
     apps/launcher/main.cpp
+    src/launcher/release_update.cpp
     apps/launcher/desktop_surface.hpp
     "${CABBIRD_LAUNCHER_RESOURCES_RC}"
     ${CABBIRD_IMGUI_DX11_SOURCES}

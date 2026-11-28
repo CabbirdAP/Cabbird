@@ -1,4 +1,5 @@
 #include "cabbird/launcher/configuration.hpp"
+#include "cabbird/launcher/release_update.hpp"
 #include "cabbird/cabbird_ui_theme.hpp"
 #include "cabbird/i18n.hpp"
 
@@ -482,6 +483,18 @@ LauncherConfigurationLoadResult LoadLauncherConfiguration(
                 limit != view->end() && limit->is_number_integer())
                 result.configuration.frame_rate_limit = LauncherFrameRatePreset(limit->get<double>());
         }
+        if (document.contains("update") && document.at("update").is_object()) {
+            const auto& update = document.at("update");
+            result.configuration.update.auto_check =
+                update.value("autoCheck", result.configuration.update.auto_check);
+            result.configuration.update.endpoint =
+                update.value("endpoint", std::string{});
+            result.configuration.update.skipped_version =
+                update.value("skippedVersion", std::string{});
+        }
+        if (!result.configuration.update.endpoint.empty() &&
+            std::ranges::find(kGithubProxyPrefixes, result.configuration.update.endpoint) == kGithubProxyPrefixes.end())
+            result.configuration.update.endpoint.clear();
         result.loaded = true;
         result.message = "launcher configuration loaded";
     } catch (const std::exception& error) {
@@ -536,6 +549,11 @@ LauncherConfigurationSaveResult SaveLauncherConfiguration(
                 {"windowBackground", HexColorText(configuration.custom_colors.window_background)},
                 {"childBackground", HexColorText(configuration.custom_colors.child_background)},
                 {"border", HexColorText(configuration.custom_colors.border)},
+            }},
+            {"update", {
+                {"autoCheck", configuration.update.auto_check},
+                {"endpoint", configuration.update.endpoint},
+                {"skippedVersion", configuration.update.skipped_version},
             }},
             {"view", {{"frameRateLimit", LauncherFrameRatePreset(configuration.frame_rate_limit)}}},
             {"selectedClient", configuration.selected_client == AzurPromiliaClient::Global

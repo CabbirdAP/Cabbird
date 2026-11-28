@@ -14,7 +14,7 @@
  * game, a process target or an injected thread.  It does NOT prove the pixels match Anomaly,
  * which is a question about the theme sources rather than about a screenshot.
  *
- * DELIBERATE DEPARTURE FROM UPSTREAM, and the only one: `--frames=N` renders N frames and exits,
+ * `--frames=N` renders N frames and exits,
  * so the regression suite can run this unattended.  It is implemented through the documented
  * PlatformDiagnostics::performance_probe hook, which the host already calls once per frame, so
  * no host code is modified and no behaviour changes when the flag is absent.
@@ -137,12 +137,25 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
     std::filesystem::create_directories(root / L"config");
     auto settings = std::make_shared<cabbird::PlatformSettingsStore>(root);
     static_cast<void>(settings->Start());
-    diagnostics.settings_snapshot = [settings] { return settings->Snapshot(); };
-    diagnostics.settings_apply = [settings](const cabbird::PlatformSettingsApplyRequest& request) {
-        return settings->Apply(request);
+    // Every preview run starts at the notice; acceptance belongs to this session only.
+    auto notice_version = std::make_shared<std::atomic<std::uint32_t>>(0);
+    diagnostics.settings_snapshot = [settings, notice_version] {
+        auto snapshot = settings->Snapshot();
+        snapshot.values.interface_notice_accepted_version = notice_version->load();
+        return snapshot;
+    };
+    diagnostics.settings_apply = [settings, notice_version](const cabbird::PlatformSettingsApplyRequest& request) {
+        auto result = settings->Apply(request);
+        result.snapshot.values.interface_notice_accepted_version = notice_version->load();
+        return result;
     };
     diagnostics.settings_record_route = [settings](const std::string_view route) {
         return settings->RecordLastRoute(route);
+    };
+
+    diagnostics.settings_record_notice = [notice_version](const std::uint32_t version) {
+        notice_version->store(version);
+        return true;
     };
     cabbird::RunPlatform(root, config, {}, {}, {}, std::move(diagnostics), plugins);
 

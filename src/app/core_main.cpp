@@ -17,6 +17,7 @@
 #include "cabbird/service_graph_diagnostics.hpp"
 #include "cabbird/structured_logger.hpp"
 #include "cabbird/config.hpp"
+#include "cabbird/telemetry.hpp"
 #include "cabbird/pipe_server.hpp"
 #include "cabbird/platform_host.hpp"
 #include "cabbird/plugin_manager.hpp"
@@ -56,6 +57,7 @@ struct CoreContext {
     std::filesystem::path log_directory;
     unitymem::AnalyzerConfig config;
     std::shared_ptr<const cabbird::Translator> translator;
+    std::shared_ptr<cabbird::TelemetryClient> telemetry;
     cabbird::CoreMemoryServices memory_services;
     std::unique_ptr<cabbird::CrashReporter> crash_reporter;
     std::shared_ptr<cabbird::DiagnosticPipeService> diagnostic_pipe;
@@ -309,6 +311,16 @@ DWORD InitializeCore(const std::shared_ptr<CoreContext>& context, std::stop_toke
             "catalog_path=" + diagnostic.path + " reason=" + diagnostic.message);
     }
     context->translator = std::move(translator.translator);
+    if (context->config.telemetry_enabled && !context->config.telemetry_endpoint.empty()) {
+        try {
+            cabbird::TelemetryOptions options;
+            options.endpoint = context->config.telemetry_endpoint;
+            options.language = cabbird::LocaleName(context->translator->locale());
+            options.mode = "inject";
+            context->telemetry = std::make_shared<cabbird::TelemetryClient>(std::move(options));
+        } catch (...) {} // Optional telemetry must never fail runtime startup.
+    }
+
     cabbird::RuntimeRecoveryStore recovery(context->runtime_root);
     const auto recovery_state = recovery.Load();
     if (recovery_state.Ok()) {
@@ -900,6 +912,20 @@ DWORD PreparePluginHost(
                 }
             });
         plugins->SetTranslator(context->translator);
+        if (context->telemetry) {
+            plugins->SetUsageObserver([session = context->session, telemetry = context->telemetry](
+                std::vector<unitymem::PluginUsageObservation> observations) {
+                if (const auto runtime = session.lock()) {
+                    static_cast<void>(runtime->Dispatchers().Post(
+                        cabbird::ExecutionDomain::Worker, "cabbird.telemetry", 1,
+                        [telemetry, observations = std::move(observations)] {
+                            for (const auto& observation : observations)
+                                telemetry->ObservePlugins({observation.id}, observation.observed_at);
+                        }));
+                }
+            });
+        }
+
         const auto session = context->session;
         plugins->SetQueuedCallbackCanceller(
             [session](std::string_view owner, std::uint64_t generation) {
@@ -1090,6 +1116,12 @@ DWORD RunPlatform(const std::shared_ptr<CoreContext>& context, std::stop_token s
             const std::string_view route) {
             const auto settings = weak.lock();
             return settings != nullptr && settings->RecordLastRoute(route);
+        };
+    diagnostics.settings_record_notice =
+        [weak = std::weak_ptr<cabbird::PlatformSettingsStore>(context->settings)](
+            const std::uint32_t version) {
+            const auto settings = weak.lock();
+            return settings != nullptr && settings->RecordNoticeAcceptance(version);
         };
     diagnostics.lifecycle_invoke = [context](std::function<void()> operation) -> std::uint32_t {
         const auto session = context->session.lock();
@@ -1515,6 +1547,10 @@ cabbird::RuntimeSessionOptions BuildSessionOptions(
         return StopPluginHost(context, timeout);
     };
     options.shutdown = [context] { ShutdownCore(context); };
+    options.workers.push_back({"telemetry", [context](std::stop_token stop_token) {
+        if (context->telemetry) context->telemetry->Run(stop_token);
+        return ERROR_SUCCESS;
+    }});
     options.workers.push_back({"pipe", [context](std::stop_token stop_token) {
         return RunDiagnosticPipe(context, stop_token);
     }});

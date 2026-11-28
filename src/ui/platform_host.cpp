@@ -1,5 +1,6 @@
 #include "cabbird/unitymem_compat.hpp"
 #include "cabbird/platform_host.hpp"
+#include "cabbird/platform_notice.hpp"
 
 #include "cabbird/host_ui_service.hpp"
 #include "cabbird/adapter_service_registry.hpp"
@@ -829,6 +830,15 @@ public:
                 cabbird::ParseHostCatalog(cabbird::Locale::EnUs).translator;
         }
         cabbird::SetHostUiDeveloperMode(false);
+        // Read once, off the render thread.
+        if (auto document = cabbird::LoadNoticeDocument(diagnostics_.runtime_root,
+                cabbird::kFirstRunNoticeDocument,
+                cabbird::LocaleName(diagnostics_.translator->locale()),
+                cabbird::kPlatformNoticeVersion)) {
+            notice_document_ = std::make_shared<const cabbird::NoticeDocument>(
+                std::move(*document));
+        }
+
         // Keep route, tab and selection outside the renderer-owned ImGui
         // context so a device rebuild does not reset the management surface.
         model_.State() = std::move(state);
@@ -1108,6 +1118,20 @@ public:
         std::scoped_lock operation_lock(operation_mutex_);
         RecordPerformance(
             PlatformUiPerformanceStage::OperationLockWait, phase_started);
+        // Set before the early returns: it must answer while the shell is closed.
+        const bool notice_pending = NoticeGateClosed();
+        cabbird::SetHostUiPluginDrawSuppressed(notice_pending);
+        // First sight of an unanswered notice: open the shell and take the mouse
+        // the way an expanded menu does, so the card is clickable without pressing
+        // the toggle key first. The key still hides and restores it.
+        if (notice_pending && !notice_revealed_) {
+            notice_revealed_ = true;
+            static_cast<void>(plugins_.UiResources().OpenWindow(
+                management_window_scope_, management_window_));
+            cabbird::SetHostUiMenusCollapsed(false);
+        }
+        const bool notice_visible = notice_pending && !cabbird::HostUiMenusCollapsed();
+
         phase_started = measure ? std::chrono::steady_clock::now()
                                 : std::chrono::steady_clock::time_point{};
         const auto window = plugins_.UiResources().WindowState(
@@ -1186,7 +1210,10 @@ public:
         ImGui::SetNextWindowPos(
             ImVec2(shell_margin, shell_margin),
             fill_viewport ? ImGuiCond_Always : ImGuiCond_FirstUseEver);
-        if (globally_collapsed) {
+        if (notice_pending) {
+            ui->set_next_window_size_constraints(ui->user, 1.0f, 1.0f, 1.0f, 1.0f);
+            ui->set_next_window_size(ui->user, 1.0f, 1.0f, ImGuiCond_Always);
+        } else if (globally_collapsed) {
             ui->set_next_window_size_constraints(
                 ui->user, shell_width, shell_height, shell_width, shell_height);
             ui->set_next_window_size(
@@ -1227,40 +1254,43 @@ public:
         if (visible) {
             const ImVec2 management_window_origin = ImGui::GetWindowPos();
             const ImVec2 management_window_size = ImGui::GetWindowSize();
-            // The canvas belongs to the host, not the game's backbuffer. The
-            // local glass controls may refract this surface, but never reveal
-            // raw gameplay underneath an otherwise opaque management window.
-            ImGui::GetWindowDrawList()->AddRectFilled(management_window_origin,
-                Offset(management_window_origin, management_window_size.x, management_window_size.y),
-                ImGui::GetColorU32(ThemeColor(cabbird::CabbirdUiSurfaceColor())),
-                ImGui::GetStyle().WindowRounding);
-            DrawThemeImages(management_window_origin, management_window_size, false);
-            if (!ManagementShellCollapsed()) DrawThemeImages(management_window_origin, management_window_size, true);
-            management_shell_locked_ = cabbird::HostUiCurrentWindowLocked();
-            UpdateLayout();
-            HandleShellShortcuts();
-            const bool shell_was_collapsed = ManagementShellCollapsed();
-            cabbird::glass::CaptureBackdrop(ImGui::GetWindowDrawList());
-            RecordPerformance(PlatformUiPerformanceStage::FrameSetup, phase_started);
-            phase_started = measure ? std::chrono::steady_clock::now()
-                                    : std::chrono::steady_clock::time_point{};
-            DrawManagementShell();
-            RecordPerformance(PlatformUiPerformanceStage::ManagementShell, phase_started);
-            phase_started = measure ? std::chrono::steady_clock::now()
-                                    : std::chrono::steady_clock::time_point{};
-            if (!shell_was_collapsed && !ManagementShellCollapsed()) {
-                DrawConfirmationPopup();
-                DrawRepositoryUninstallPopup();
-                DrawOperationDetailsPopup();
-                DrawMemoryConfirmationPopup();
-                DrawSettingsLeavePopup();
+            if (!notice_pending) {
+                // The canvas belongs to the host, not the game's backbuffer. The
+                // local glass controls may refract this surface, but never reveal
+                // raw gameplay underneath an otherwise opaque management window.
+                ImGui::GetWindowDrawList()->AddRectFilled(management_window_origin,
+                    Offset(management_window_origin, management_window_size.x, management_window_size.y),
+                    ImGui::GetColorU32(ThemeColor(cabbird::CabbirdUiSurfaceColor())),
+                    ImGui::GetStyle().WindowRounding);
+                DrawThemeImages(management_window_origin, management_window_size, false);
+                if (!ManagementShellCollapsed()) DrawThemeImages(management_window_origin, management_window_size, true);
+                management_shell_locked_ = cabbird::HostUiCurrentWindowLocked();
+                UpdateLayout();
+                HandleShellShortcuts();
+                const bool shell_was_collapsed = ManagementShellCollapsed();
+                cabbird::glass::CaptureBackdrop(ImGui::GetWindowDrawList());
+                RecordPerformance(PlatformUiPerformanceStage::FrameSetup, phase_started);
+                phase_started = measure ? std::chrono::steady_clock::now()
+                                        : std::chrono::steady_clock::time_point{};
+                DrawManagementShell();
+                RecordPerformance(PlatformUiPerformanceStage::ManagementShell, phase_started);
+                phase_started = measure ? std::chrono::steady_clock::now()
+                                        : std::chrono::steady_clock::time_point{};
+                if (!shell_was_collapsed && !ManagementShellCollapsed()) {
+                    DrawConfirmationPopup();
+                    DrawRepositoryUninstallPopup();
+                    DrawOperationDetailsPopup();
+                    DrawMemoryConfirmationPopup();
+                    DrawSettingsLeavePopup();
+                }
+                DrawStatusToast(management_window_origin, management_window_size);
+                RecordPerformance(PlatformUiPerformanceStage::Popups, phase_started);
+                phase_started = measure ? std::chrono::steady_clock::now()
+                                        : std::chrono::steady_clock::time_point{};
             }
-            DrawStatusToast(management_window_origin, management_window_size);
-            RecordPerformance(PlatformUiPerformanceStage::Popups, phase_started);
-            phase_started = measure ? std::chrono::steady_clock::now()
-                                    : std::chrono::steady_clock::time_point{};
+            DrawFirstRunNoticePopup(notice_visible);
         }
-        if (!shell_collapsed && !ManagementShellCollapsed()) {
+        if (!notice_pending && !shell_collapsed && !ManagementShellCollapsed()) {
             float width{};
             float height{};
             ui->get_window_size(ui->user, &width, &height);
@@ -1282,7 +1312,7 @@ public:
                     management_shell_expanded_size_.x, management_shell_expanded_size_.y));
             }
         }
-        if (!globally_collapsed) management_shell_apply_initial_size_ = false;
+        if (!notice_pending && !globally_collapsed) management_shell_apply_initial_size_ = false;
         management_shell_was_collapsed_ = shell_collapsed;
         management_shell_ui_scale_ = ui_scale;
         ui->end_window(ui->user);
@@ -1598,6 +1628,11 @@ private:
     struct RepositoryChannelRow {
         std::array<char, 1024> url{};
         bool enabled{true};
+    };
+
+    struct NoticeAcceptMailbox final {
+        std::mutex mutex;
+        std::optional<bool> result;
     };
 
     struct SettingsApplyMailbox final {
@@ -6086,6 +6121,302 @@ private:
         ImGui::EndPopup();
     }
 
+    static constexpr ImVec4 kNoticePaneTint{1.000f, 0.989f, 0.954f, 1.0f};
+    static constexpr ImVec4 kNoticeInk{0.106f, 0.110f, 0.122f, 1.0f};
+    static constexpr ImVec4 kNoticeMutedInk{0.361f, 0.373f, 0.400f, 1.0f};
+    static constexpr ImVec4 kNoticeCautionInk{0.620f, 0.412f, 0.020f, 1.0f};
+    static constexpr ImVec4 kNoticeCautionMark{0.949f, 0.718f, 0.020f, 1.0f};
+    static constexpr ImVec4 kNoticeLinkInk{0.078f, 0.404f, 0.784f, 1.0f};
+    static constexpr ImVec4 kNoticeDangerInk{0.702f, 0.149f, 0.118f, 1.0f};
+
+    [[nodiscard]] bool NoticeGateClosed() const {
+        if (notice_accepted_) return false;
+        const cabbird::PlatformSettingsSnapshot published = diagnostics_.settings_snapshot
+            ? diagnostics_.settings_snapshot() : settings_snapshot_;
+        return published.ready &&
+            published.values.interface_notice_accepted_version <
+                cabbird::kPlatformNoticeVersion;
+    }
+
+    void AcceptNotice() {
+        notice_accepted_ = true;
+        notice_accept_pending_ = cabbird::kPlatformNoticeVersion;
+        status_ = Text(cabbird::MessageId::NoticeWelcome);
+        status_failure_ = false;
+    }
+
+    void DrawNoticeEmphasis(const std::string& text) const {
+        ImGui::TextUnformatted(text.c_str());
+        if (ImGui::GetItemRectSize().y > ImGui::GetTextLineHeight() * 1.6f) return;
+        const ImVec2 origin = ImGui::GetItemRectMin();
+        ImGui::GetWindowDrawList()->AddText(ImGui::GetFont(), ImGui::GetFontSize(),
+            ImVec2(origin.x + std::max(0.5f, Scaled(0.5f)), origin.y),
+            ImGui::GetColorU32(ImGuiCol_Text), text.c_str());
+    }
+
+    void DrawNoticeRuns(const std::vector<cabbird::NoticeRun>& runs) {
+        ImGui::PushTextWrapPos(0.0f);
+        for (std::size_t index = 0; index < runs.size(); ++index) {
+            if (index > 0) ImGui::SameLine(0.0f, 0.0f);
+            const cabbird::NoticeRun& run = runs[index];
+            switch (run.style) {
+            case cabbird::NoticeRunStyle::Text:
+                ImGui::TextUnformatted(run.text.c_str());
+                break;
+            case cabbird::NoticeRunStyle::Emphasis:
+                DrawNoticeEmphasis(run.text);
+                break;
+            case cabbird::NoticeRunStyle::Code:
+                ImGui::TextColored(kNoticeMutedInk, "%s", run.text.c_str());
+                break;
+            case cabbird::NoticeRunStyle::Link:
+                ImGui::PushStyleColor(ImGuiCol_Text, kNoticeLinkInk);
+                ImGui::TextUnformatted(run.text.c_str());
+                ImGui::PopStyleColor();
+                if (ImGui::IsItemHovered()) {
+                    ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+                    ImGui::SetTooltip("%s", run.url.c_str());
+                }
+                if (ImGui::IsItemClicked(ImGuiMouseButton_Left)) {
+                    pending_external_url_ = run.url;
+                }
+                break;
+            }
+        }
+        ImGui::PopTextWrapPos();
+    }
+
+    void DrawNoticeDocument(const cabbird::NoticeDocument& document) {
+        // Baked tiers, not window scaling: scaling a baked atlas blurs the glyphs.
+        const float ui_scale = PlatformUiScale();
+        ImFont* const body_font = FontForScale(ui_scale * 1.12f);
+        ImFont* const heading_font = FontForScale(ui_scale * 1.55f);
+        ImFont* const subheading_font = FontForScale(ui_scale * 1.28f);
+        const auto draw_block = [&](const cabbird::NoticeBlock& block) {
+            ImFont* font = body_font;
+            if (block.kind == cabbird::NoticeBlockKind::Heading) font = heading_font;
+            else if (block.kind == cabbird::NoticeBlockKind::Subheading) font = subheading_font;
+            const bool pushed = font != nullptr;
+            if (pushed) ImGui::PushFont(font);
+            switch (block.kind) {
+            case cabbird::NoticeBlockKind::Heading:
+                DrawNoticeRuns(block.runs);
+                ImGui::Spacing();
+                break;
+            case cabbird::NoticeBlockKind::Subheading:
+                DrawNoticeRuns(block.runs);
+                ImGui::Spacing();
+                break;
+            case cabbird::NoticeBlockKind::Paragraph:
+                DrawNoticeRuns(block.runs);
+                ImGui::Spacing();
+                break;
+            case cabbird::NoticeBlockKind::Bullet:
+                ImGui::Bullet();
+                ImGui::SameLine();
+                DrawNoticeRuns(block.runs);
+                ImGui::Spacing();
+                break;
+            case cabbird::NoticeBlockKind::Numbered:
+                ImGui::TextUnformatted(block.marker.c_str());
+                ImGui::SameLine();
+                DrawNoticeRuns(block.runs);
+                ImGui::Spacing();
+                break;
+            case cabbird::NoticeBlockKind::Separator:
+                ImGui::Separator();
+                break;
+            }
+            if (pushed) ImGui::PopFont();
+        };
+        for (const cabbird::NoticeBlock& block : document.blocks) {
+            if (block.alert == cabbird::NoticeAlert::None) {
+                draw_block(block);
+                continue;
+            }
+            // Alert lines are indented and carry a rule, so consecutive blocks
+            // read as one callout. A caution or warning is the one thing on the
+            // card that must be impossible to skim past, so it is set in gold and
+            // marked with the bright yellow rule; the informational alerts keep
+            // the body ink and only mark themselves with a muted rule.
+            const bool severe = block.alert == cabbird::NoticeAlert::Caution ||
+                block.alert == cabbird::NoticeAlert::Warning;
+            const ImVec4 alert_ink = severe ? kNoticeCautionInk : kNoticeInk;
+            const float indent = Scaled(14.0f);
+            const ImVec2 start = ImGui::GetCursorScreenPos();
+            ImGui::PushStyleColor(ImGuiCol_Text, alert_ink);
+            ImGui::Indent(indent);
+            draw_block(block);
+            ImGui::Unindent(indent);
+            ImGui::PopStyleColor();
+            const ImVec2 end = ImGui::GetCursorScreenPos();
+            ImGui::GetWindowDrawList()->AddRectFilled(
+                ImVec2(start.x, start.y - Scaled(2.0f)),
+                ImVec2(start.x + Scaled(3.0f), end.y - Scaled(4.0f)),
+                ImGui::GetColorU32(severe ? kNoticeCautionMark : kNoticeMutedInk),
+                Scaled(1.5f));
+        }
+    }
+
+    void DrawFirstRunNoticePopup(const bool pending) {
+        if (!pending) {
+            notice_popup_opened_ = false;
+            return;
+        }
+        // Id is not localized; the document heading is the title.
+        constexpr const char* kNoticePopupId = "first-run-notice";
+        if (!notice_popup_opened_) {
+            ImGui::OpenPopup(kNoticePopupId);
+            notice_popup_opened_ = true;
+        }
+        // Sized against the viewport, not the shell: while the notice stands the
+        // shell window is a 1x1 stub.
+        const ImVec2 viewport_size = ImGui::GetMainViewport()->Size;
+        const float modal_width = std::min(
+            Scaled(700.0f), std::max(Scaled(360.0f), viewport_size.x - Scaled(48.0f)));
+        const float modal_height = std::min(
+            Scaled(620.0f), std::max(Scaled(320.0f), viewport_size.y - Scaled(56.0f)));
+        ImGui::SetNextWindowSize(ImVec2(modal_width, modal_height), ImGuiCond_Appearing);
+        // Centred on the viewport: there is no shell to anchor to.
+        const ImGuiViewport* const viewport = ImGui::GetMainViewport();
+        ImGui::SetNextWindowPos(
+            ImVec2(viewport->Pos.x + viewport->Size.x * 0.5f,
+                viewport->Pos.y + viewport->Size.y * 0.5f),
+            ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+        // No Escape handling and no close button.
+        if (!ImGui::BeginPopupModal(kNoticePopupId, nullptr,
+                ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
+                    ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoMove |
+                    // Only the body scrolls; the footer stays put.
+                    ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse)) {
+            return;
+        }
+        // The card floats on the game frame, with no themed shell behind it to
+        // carry the palette's ink, so it names its own pane. The options below
+        // are this card's alone -- an own copy of SurfaceOptions handed to
+        // RegisterWindowSurface, exactly as a plugin window does it -- so the
+        // shell's surfaces and the plugin windows keep resolving theirs and are
+        // untouched. The material matches a plugin window over the game (deep
+        // backdrop, heavy face, soft rim, and the variant's own saturation); only
+        // the veil is a few points stronger, because near-black type needs a
+        // paler face than a dark-ink window does.
+        cabbird::glass::SurfaceOptions surface;
+        surface.variant = cabbird::glass::Variant::Regular;
+        surface.rounding = ImGui::GetStyle().PopupRounding;
+        surface.scale = ImGui::GetIO().FontGlobalScale > 0.0f
+            ? ImGui::GetIO().FontGlobalScale : 1.0f;
+        surface.clip = false;
+        surface.shadow = true;
+        surface.tint = kNoticePaneTint;
+        surface.tint_strength = 0.56f;
+        surface.face_blur = 2.0f;
+        surface.rim_blur = 1.7f;
+        surface.deep_backdrop = true;
+        cabbird::glass::RegisterWindowSurface(surface);
+        ImGui::PushStyleColor(ImGuiCol_Text, kNoticeInk);
+        ImFont* const footer_font = FontForScale(PlatformUiScale() * 1.12f);
+        const bool footer_pushed = footer_font != nullptr;
+        if (footer_pushed) ImGui::PushFont(footer_font);
+        const float button_height = std::max(Scaled(40.0f), ImGui::GetFrameHeight());
+        const float agree_height = std::max(ImGui::GetFrameHeight(), cabbird::glass::SwitchSize().y);
+        if (footer_pushed) ImGui::PopFont();
+        // Reserve the actual footer rows and leave ten logical pixels below the buttons.
+        const float footer_height = agree_height + button_height +
+            ImGui::GetStyle().ItemSpacing.y * 3.0f + Scaled(10.0f) - ImGui::GetStyle().WindowPadding.y;
+        const float body_height = std::max(
+            Scaled(110.0f), ImGui::GetContentRegionAvail().y - footer_height);
+        ImGui::BeginChild("FirstRunNoticeBody", ImVec2(0.0f, body_height), false);
+        if (notice_document_ != nullptr) {
+            DrawNoticeDocument(*notice_document_);
+        } else {
+            // Missing document: show the expected path, keep the gate closed.
+            ImGui::TextColored(kNoticeDangerInk, "!  %s",
+                cabbird::NoticeDocumentPath(diagnostics_.runtime_root,
+                    cabbird::kFirstRunNoticeDocument,
+                    cabbird::LocaleName(diagnostics_.translator->locale()))
+                    .string().c_str());
+        }
+        ImGui::EndChild();
+        ImGui::PushStyleColor(ImGuiCol_Separator, ImVec4(0.0f, 0.0f, 0.0f, 0.14f));
+        ImGui::Separator();
+        ImGui::PopStyleColor();
+        if (footer_pushed) ImGui::PushFont(footer_font);
+        const std::string agree = StableLabel(
+            cabbird::MessageId::NoticeAgree, "first-run-notice-agree");
+        cabbird::glass::Switch(agree.c_str(), &notice_agreed_);
+        const std::string exit_label =
+            StableLabel(cabbird::MessageId::NoticeExit, "first-run-notice-exit");
+        const std::string confirm_label =
+            StableLabel(cabbird::MessageId::NoticeConfirm, "first-run-notice-confirm");
+        const float frame_padding = ImGui::GetStyle().FramePadding.x * 2.0f;
+        const float button_width = std::max({Scaled(160.0f),
+            ImGui::CalcTextSize(exit_label.c_str(), nullptr, true).x + frame_padding,
+            ImGui::CalcTextSize(confirm_label.c_str(), nullptr, true).x + frame_padding});
+        const ImVec2 button_size(button_width, button_height);
+        const float spacing = Scaled(20.0f);
+        const float footer_width = button_width * 2.0f + spacing;
+        ImGui::SetCursorPosX(ImGui::GetCursorPosX() +
+            std::max(0.0f, (ImGui::GetContentRegionAvail().x - footer_width) * 0.5f));
+        ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, CapsuleRounding(button_size));
+        const auto notice_button = [&](const std::string& label, const bool primary) {
+            const auto& theme = cabbird::CabbirdUiTheme();
+            ImGui::PushStyleColor(ImGuiCol_Button,
+                primary ? AccentColor() : ImVec4(0.0f, 0.0f, 0.0f, 0.07f));
+            ImGui::PushStyleColor(ImGuiCol_ButtonHovered,
+                primary ? AccentColor() : ImVec4(0.0f, 0.0f, 0.0f, 0.12f));
+            ImGui::PushStyleColor(ImGuiCol_ButtonActive,
+                primary ? ThemeColor(theme.accent_active) : ImVec4(0.0f, 0.0f, 0.0f, 0.18f));
+            ImGui::PushStyleColor(ImGuiCol_Text, kClear);
+            const bool pressed = ImGui::Button(label.c_str(), button_size);
+            ImGui::PopStyleColor(4);
+            // Centre the visible glyphs rather than the font's ascent/descent box.
+            ImFont* const font = ImGui::GetFont();
+            const float font_size = ImGui::GetFontSize();
+            const float font_scale = font_size / font->FontSize;
+            const char* const text_end = ImGui::FindRenderedTextEnd(label.c_str());
+            ImVec2 ink_min(FLT_MAX, FLT_MAX), ink_max(-FLT_MAX, -FLT_MAX);
+            float advance = 0.0f;
+            for (const char* text = label.c_str(); text < text_end;) {
+                unsigned int codepoint{};
+                text += ImTextCharFromUtf8(&codepoint, text, text_end);
+                const ImFontGlyph* const glyph = font->FindGlyph(static_cast<ImWchar>(codepoint));
+                if (glyph->Visible) {
+                    ink_min.x = std::min(ink_min.x, advance + glyph->X0 * font_scale);
+                    ink_min.y = std::min(ink_min.y, glyph->Y0 * font_scale);
+                    ink_max.x = std::max(ink_max.x, advance + glyph->X1 * font_scale);
+                    ink_max.y = std::max(ink_max.y, glyph->Y1 * font_scale);
+                }
+                advance += glyph->AdvanceX * font_scale;
+            }
+            const ImVec2 min = ImGui::GetItemRectMin(), max = ImGui::GetItemRectMax();
+            ImGui::GetWindowDrawList()->AddText(font, font_size,
+                ImVec2((min.x + max.x - ink_min.x - ink_max.x) * 0.5f,
+                    (min.y + max.y - ink_min.y - ink_max.y) * 0.5f),
+                ImGui::GetColorU32(primary ? ThemeColor(theme.inverse_text) : kNoticeInk),
+                label.c_str(), text_end);
+            return pressed;
+        };
+        if (notice_button(exit_label, false)) {
+            notice_agreed_ = false;
+            notice_popup_opened_ = false;
+            ImGui::CloseCurrentPopup();
+            if (plugins_.UiResources().CloseWindow(management_window_scope_, management_window_))
+                cabbird::SetHostUiMenusCollapsed(true);
+        }
+        ImGui::SameLine(0.0f, spacing);
+        ImGui::BeginDisabled(!notice_agreed_ || notice_document_ == nullptr);
+        if (notice_button(confirm_label, true)) {
+            AcceptNotice();
+            notice_popup_opened_ = false;
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::EndDisabled();
+        ImGui::PopStyleVar();
+        if (footer_pushed) ImGui::PopFont();
+        ImGui::PopStyleColor();
+        ImGui::EndPopup();
+    }
+
     void DrawSettingsShell() {
         const std::string subtitle = settings_snapshot_.ready
             ? std::string{}
@@ -6990,6 +7321,7 @@ private:
     }
 
     void FlushSettingsActions() {
+        std::optional<std::uint32_t> notice_version;
         std::optional<cabbird::PlatformSettingsApplyRequest> apply;
         std::optional<cabbird::PluginRepositoryConfig> repository_configure;
         std::optional<std::string> route;
@@ -6997,6 +7329,7 @@ private:
         {
             std::scoped_lock operation_lock(operation_mutex_);
             apply.swap(pending_settings_apply_);
+            notice_version.swap(notice_accept_pending_);
             repository_configure.swap(pending_repository_configure_);
             route.swap(settings_route_to_record_);
             external_url.swap(pending_external_url_);
@@ -7054,6 +7387,23 @@ private:
                 std::scoped_lock lock(mailbox->mutex);
                 mailbox->result = RepositoryConfigureResult{
                     *repository_configure, std::move(submission)};
+            }
+        }
+        if (notice_version) {
+            // File I/O goes through the lifecycle domain and reports via the mailbox.
+            const auto mailbox = notice_accept_mailbox_;
+            const auto provider = diagnostics_.settings_record_notice;
+            const auto operation = [mailbox, provider, version = *notice_version] {
+                const bool stored = provider ? provider(version) : false;
+                std::scoped_lock lock(mailbox->mutex);
+                mailbox->result = stored;
+            };
+            std::uint32_t error = ERROR_SUCCESS;
+            if (submit) error = submit(operation);
+            else operation();
+            if (error != ERROR_SUCCESS) {
+                std::scoped_lock lock(mailbox->mutex);
+                mailbox->result = false;
             }
         }
         if (route && diagnostics_.settings_record_route) {
@@ -7615,6 +7965,15 @@ private:
     std::string settings_apply_error_;
     bool settings_save_pending_{};
     bool settings_route_restored_{};
+    bool notice_accepted_{};
+    bool notice_agreed_{};
+    bool notice_popup_opened_{};
+    bool notice_revealed_{};
+    // Notice document; null when the installation is missing it.
+    std::shared_ptr<const cabbird::NoticeDocument> notice_document_;
+    std::optional<std::uint32_t> notice_accept_pending_;
+    std::shared_ptr<NoticeAcceptMailbox> notice_accept_mailbox_{
+        std::make_shared<NoticeAcceptMailbox>()};
     std::optional<std::string> pending_external_url_;
     bool settings_hotkey_capture_{};
     bool settings_hotkey_hide_all_{};
@@ -8323,7 +8682,7 @@ void RunPlatform(
         {
             std::scoped_lock lock(*plugin_mutex);
             DrawPlatformUi();
-            if (!cabbird::HostUiAllHidden()) plugins.Draw(ImGui::GetCurrentContext());
+            if (!cabbird::HostUiPluginDrawSuppressed()) plugins.Draw(ImGui::GetCurrentContext());
         }
         ImGui::Render();
         cabbird::glass::PrepareDrawData(ImGui::GetDrawData());
