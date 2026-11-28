@@ -97,6 +97,11 @@ cabbird_add_plugin(CameraTools
 target_link_libraries(CameraTools PRIVATE nlohmann_json::nlohmann_json)
 target_compile_options(CameraTools PRIVATE /utf-8)
 
+cabbird_add_plugin(NoSkillCD
+    SOURCES plugins/NoSkillCD/plugin.cpp
+    MANIFEST plugins/NoSkillCD/manifest.json
+    PACKAGE_NAME NoSkillCD)
+
 endif()
 
 # Each preview build refreshes the same package inventory as the release.
