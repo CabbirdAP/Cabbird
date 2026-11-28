@@ -1,0 +1,8 @@
+{
+  "schemaVersion": 1,
+  "locale": "zh-CN",
+  "messages": {
+    "window.title": "技能无冷却",
+    "plugin.description": "通过宿主插件开关，清除当前角色与奇波的技能冷却与充能。"
+  }
+}
