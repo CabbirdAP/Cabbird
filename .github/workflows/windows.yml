@@ -123,3 +123,17 @@ jobs:
             .build/release/Cabbird-*-tools.zip
           fail_on_unmatched_files: true
           body_path: CHANGES.md
+      - name: Announce release on Discord
+        uses: actions/github-script@v7
+        continue-on-error: true
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          DISCORD_RELEASE_NAME: Cabbird ${{ github.ref_name }}
+          DISCORD_RELEASE_URL: ${{ github.server_url }}/${{ github.repository }}/releases/tag/${{ github.ref_name }}
+        with:
+          script: |
+            if (!process.env.DISCORD_WEBHOOK_URL) {
+              core.info('DISCORD_WEBHOOK_URL is not configured; skipping Discord announcement.');
+              return;
+            }
+            await require('./.github/scripts/announce-discord.cjs')();
