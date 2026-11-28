@@ -91,6 +91,7 @@ target_compile_options(cabbird_core PRIVATE
 target_link_libraries(cabbird_core PUBLIC d3d11 dxgi dxguid cabbird_imgui cabbird_ui minhook)
 
 add_library(cabbird_plugin STATIC
+    src/plugin/plugin_manual_map.cpp
     src/plugin/plugin_scope.cpp
     src/plugin/plugin_host.cpp
 )

@@ -18,6 +18,8 @@
  */
 #include "cabbird/plugin_host.hpp"
 
+#include "cabbird/plugin_manual_map.hpp"
+
 #include <Windows.h>
 
 #include <cstring>
@@ -56,7 +58,7 @@ const char* PluginStateName(PluginState state) noexcept {
 
 struct PluginHost::Loaded {
     PluginRecord record;
-    HMODULE module{};
+    std::unique_ptr<MappedPluginImage> module;
     CabbirdPluginDescriptorV1 descriptor{};
     std::shared_ptr<PluginScope> scope;
     void* context{};
@@ -66,12 +68,15 @@ struct PluginHost::Loaded {
 PluginHost::PluginHost() : ledger_(std::make_shared<ResourceLedger>()) {}
 PluginHost::~PluginHost() {
     // Best effort: a plugin that will not stop is left loaded rather than forced out.
-    // FreeLibrary with a live callback is a crash; leaking a module at process exit is
+    // Unmapping with a live callback is a crash; leaking a module at process exit is
     // not.  The asymmetry is the point.
     for (auto& plugin : plugins_) {
         if (!plugin->unloaded) {
             Stop(plugin->record.id, std::chrono::milliseconds(200));
-            Unload(plugin->record.id, std::chrono::milliseconds(200));
+            if (!Unload(plugin->record.id, std::chrono::milliseconds(200)) &&
+                plugin->module) {
+                static_cast<void>(plugin->module.release());
+            }
         }
     }
 }
@@ -108,24 +113,24 @@ std::string PluginHost::Load(const std::filesystem::path& dll_path) {
         return {};
     }
 
-    const HMODULE module = ::LoadLibraryW(dll_path.wstring().c_str());
-    if (module == nullptr) {
-        last_error_ = "LoadLibrary failed (err=" + std::to_string(::GetLastError()) + ")";
+    auto mapped = MappedPluginImage::Load(dll_path);
+    if (!mapped.Ok()) {
+        last_error_ = "manual map failed: " + mapped.error;
         return {};
     }
 
     auto entry = reinterpret_cast<CabbirdPluginEntryV1Fn>(
-        ::GetProcAddress(module, CABBIRD_PLUGIN_V1_ENTRY_NAME));
+        mapped.image->ExportAddress(CABBIRD_PLUGIN_V1_ENTRY_NAME));
     if (entry == nullptr) {
         // Report the missing symbol rather than the module name: "this DLL is not a
         // Cabbird plugin" is the actionable statement, and it is the common mistake.
         last_error_ = std::string("missing export ") + CABBIRD_PLUGIN_V1_ENTRY_NAME;
-        ::FreeLibrary(module);
+        mapped.image->Unload();
         return {};
     }
 
     auto loaded = std::make_unique<Loaded>();
-    loaded->module = module;
+    loaded->module = std::move(mapped.image);
     loaded->record.path = dll_path;
     loaded->record.generation = next_generation_++;
 
@@ -141,7 +146,7 @@ std::string PluginHost::Load(const std::filesystem::path& dll_path) {
     if (status.code != CABBIRD_STATUS_V1_OK) {
         last_error_ = "entry point returned status ";
         last_error_ += std::to_string(status.code);
-        ::FreeLibrary(module);
+        loaded->module->Unload();
         return {};
     }
 
@@ -150,12 +155,12 @@ std::string PluginHost::Load(const std::filesystem::path& dll_path) {
     // call through a null pointer two steps later.
     if (loaded->descriptor.id.data == nullptr || loaded->descriptor.id.size == 0) {
         last_error_ = "plugin reported no id";
-        ::FreeLibrary(module);
+        loaded->module->Unload();
         return {};
     }
     if (loaded->descriptor.on_load == nullptr) {
         last_error_ = "plugin reported no on_load";
-        ::FreeLibrary(module);
+        loaded->module->Unload();
         return {};
     }
     // Major mismatch is fatal and is checked BEFORE on_load: a plugin compiled against
@@ -164,7 +169,7 @@ std::string PluginHost::Load(const std::filesystem::path& dll_path) {
     if (loaded->descriptor.api_major != CABBIRD_PLUGIN_API_V1_MAJOR) {
         last_error_ = "plugin api major " + std::to_string(loaded->descriptor.api_major) +
                       " != host " + std::to_string(CABBIRD_PLUGIN_API_V1_MAJOR);
-        ::FreeLibrary(module);
+        loaded->module->Unload();
         return {};
     }
 
@@ -183,7 +188,7 @@ std::string PluginHost::Load(const std::filesystem::path& dll_path) {
 
     if (Get(loaded->record.id) != nullptr) {
         last_error_ = "duplicate plugin id: " + loaded->record.id;
-        ::FreeLibrary(module);
+        loaded->module->Unload();
         return {};
     }
 
@@ -197,7 +202,7 @@ std::string PluginHost::Load(const std::filesystem::path& dll_path) {
         loaded->record.last_error = last_error_;
         // on_unload is NOT called after a failed on_load: the plugin never reached a
         // state where it could have acquired anything, and the SDK contract says so.
-        ::FreeLibrary(module);
+        loaded->module->Unload();
         return {};
     }
 
@@ -312,8 +317,8 @@ bool PluginHost::Unload(std::string_view id, std::chrono::milliseconds deadline)
     plugin->descriptor = CabbirdPluginDescriptorV1{};
 
     if (plugin->module != nullptr) {
-        ::FreeLibrary(plugin->module);
-        plugin->module = nullptr;
+        plugin->module->Unload();
+        plugin->module.reset();
     }
     plugin->unloaded = true;
     plugin->record.state = PluginState::Stopped;

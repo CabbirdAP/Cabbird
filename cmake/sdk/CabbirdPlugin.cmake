@@ -37,7 +37,12 @@ function(cabbird_add_plugin target)
         CABBIRD_PACKAGE_DIRECTORY "${CABBIRD_OUTPUT_DIRECTORY}"
         CABBIRD_PACKAGE_MANIFEST "${CABBIRD_MANIFEST}")
     if(MSVC)
-        target_compile_options(${target} PRIVATE /W4 $<$<COMPILE_LANGUAGE:CXX>:/permissive->)
+        # Plugins are manually mapped in-process like Cabbird.Core: disable
+        # compiler-generated _Init_thread_epoch static TLS for function-local statics.
+        target_compile_options(${target} PRIVATE
+            /W4
+            $<$<COMPILE_LANGUAGE:C,CXX>:/Zc:threadSafeInit->
+            $<$<COMPILE_LANGUAGE:CXX>:/permissive->)
         if(NOT CABBIRD_C_ONLY)
             target_compile_options(${target} PRIVATE /EHsc)
         endif()
