@@ -5,8 +5,10 @@
 #include "cabbird/sdk/services/ui_resources.h"
 #include "cabbird/sdk/services/unity.h"
 #include "cabbird/sdk/config_save_queue.hpp"
+#include "catalog.hpp"
 
 #include <Windows.h>
+#include <shellapi.h>
 #include <nlohmann/json.hpp>
 #include <cmath>
 #include <cstring>
@@ -19,12 +21,14 @@ using cabbird::sdk::Ok;
 using cabbird::sdk::StringView;
 using cabbird::sdk::Succeeded;
 constexpr const char* kSchemaId = "unity-dump-settings";
-constexpr const char* kSchema = R"({"type":"object","required":["includeFields","includeMethods","recoverMetadata","imageFilter","outputPath","metadataPath","pollEveryFrames","windowWidth","windowHeight"],"properties":{"includeFields":{"type":"boolean"},"includeMethods":{"type":"boolean"},"recoverMetadata":{"type":"boolean"},"imageFilter":{"type":"string","maxLength":511},"outputPath":{"type":"string","maxLength":4095},"metadataPath":{"type":"string","maxLength":4095},"pollEveryFrames":{"type":"integer","minimum":1,"maximum":600},"windowWidth":{"type":"number","minimum":320,"maximum":8192},"windowHeight":{"type":"number","minimum":240,"maximum":8192}},"additionalProperties":false})";
+constexpr const char* kSchema = R"({"type":"object","required":["includeFields","includeMethods","recoverMetadata","imageFilter","outputPath","metadataPath","pollEveryFrames","windowWidth","windowHeight"],"properties":{"includeFields":{"type":"boolean"},"includeMethods":{"type":"boolean"},"includeProperties":{"type":"boolean"},"includeInterfaces":{"type":"boolean"},"recoverMetadata":{"type":"boolean"},"imageFilter":{"type":"string","maxLength":511},"outputPath":{"type":"string","maxLength":4095},"metadataPath":{"type":"string","maxLength":4095},"catalogPath":{"type":"string","maxLength":4095},"pollEveryFrames":{"type":"integer","minimum":1,"maximum":600},"windowWidth":{"type":"number","minimum":320,"maximum":8192},"windowHeight":{"type":"number","minimum":240,"maximum":8192}},"additionalProperties":false})";
 struct Settings {
     int fields{1}, methods{1}, metadata{1};
+    int properties{}, interfaces{};
     char filter[512]{}; // Empty means all loaded images, including Assembly-CSharp.
     char output[4096]{"C:\\AzurPromilia-dump.cs"};
     char metadata_path[4096]{"C:\\global-metadata.decrypted.dat"};
+    char catalog_path[4096]{"C:\\AzurPromilia-catalog"};
     std::uint32_t poll_frames{30};
     float width{620}, height{580};
 };
@@ -36,12 +40,22 @@ struct Context {
     CabbirdGenerationHandleV1 window{};
     const CabbirdUnityDumpServiceV1* dump{};
     const CabbirdConfigServiceV1* config{};
+    const CabbirdSchedulerServiceV1* scheduler{};
     cabbird::sdk::ConfigSaveQueue saves;
+    unity_dump::Catalog catalog;
     Settings settings;
     CabbirdDumpResultV1 result{sizeof(CabbirdDumpResultV1), CABBIRD_DUMP_V1_RESULT_IDLE};
     std::uint32_t frames{};
     std::uint32_t poll_error{};
     bool running{}, requested{}, save_failed{};
+    struct PathAction {
+        std::atomic<bool> pending{};
+        bool copy{};
+        HWND owner{};
+        std::string directory;
+        std::mutex mutex;
+        std::string failure;
+    } path_action;
 };
 CabbirdStatusV1 Failed() { return {CABBIRD_STATUS_V1_FAILED, 0, {}}; }
 void LogFailure(Context& ctx, std::string_view message) {
@@ -58,7 +72,8 @@ void LogStatus(Context& ctx, std::string_view operation, CabbirdStatusV1 status)
 }
 std::string Serialize(const Settings& s) {
     return nlohmann::json{{"includeFields", s.fields != 0}, {"includeMethods", s.methods != 0}, {"recoverMetadata", s.metadata != 0},
-        {"imageFilter", s.filter}, {"outputPath", s.output}, {"metadataPath", s.metadata_path}, {"pollEveryFrames", s.poll_frames},
+        {"includeProperties", s.properties != 0}, {"includeInterfaces", s.interfaces != 0},
+        {"imageFilter", s.filter}, {"outputPath", s.output}, {"metadataPath", s.metadata_path}, {"catalogPath", s.catalog_path}, {"pollEveryFrames", s.poll_frames},
         {"windowWidth", s.width}, {"windowHeight", s.height}}.dump();
 }
 void Save(Context& ctx) {
@@ -86,11 +101,13 @@ bool LoadSettings(Context& ctx) {
         const auto json = nlohmann::json::parse(bytes.begin(), bytes.begin() + size);
         Settings loaded;
         loaded.fields = json.at("includeFields").get<bool>(); loaded.methods = json.at("includeMethods").get<bool>();
+        loaded.properties = json.value("includeProperties", false); loaded.interfaces = json.value("includeInterfaces", false);
         loaded.metadata = json.at("recoverMetadata").get<bool>(); loaded.poll_frames = json.at("pollEveryFrames").get<std::uint32_t>();
         loaded.width = json.value("windowWidth", 620.0f); loaded.height = json.value("windowHeight", 580.0f);
         if (!CopyString(loaded.filter, json.at("imageFilter").get<std::string>()) ||
             !CopyString(loaded.output, json.at("outputPath").get<std::string>()) ||
             !CopyString(loaded.metadata_path, json.at("metadataPath").get<std::string>()) ||
+            !CopyString(loaded.catalog_path, json.value("catalogPath", std::string(loaded.catalog_path))) ||
             loaded.poll_frames < 1 || loaded.poll_frames > 600 || !std::isfinite(loaded.width) || !std::isfinite(loaded.height) ||
             loaded.width < 320 || loaded.height < 240 || loaded.width > 8192 || loaded.height > 8192) throw std::runtime_error("invalid settings");
         ctx.settings = loaded;
@@ -127,10 +144,57 @@ bool Widen(const char* input, std::wstring& output) {
     output.resize(static_cast<std::size_t>(size));
     return MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, input, static_cast<int>(std::strlen(input)), output.data(), size) == size;
 }
+void PathActionFailure(Context& ctx, std::string_view detail) {
+    const auto line = ctx.text.Format("error.path-action", "Path action failed: {0}", std::array<std::string_view, 1>{detail});
+    ctx.core->log(ctx.core->user, CABBIRD_CORE_LOG_LEVEL_V1_ERROR, StringView(line));
+    std::lock_guard lock(ctx.path_action.mutex); ctx.path_action.failure = line;
+}
+void CABBIRD_CALL RunPathAction(void* raw, CabbirdGenerationHandleV1) noexcept {
+    auto& ctx = *static_cast<Context*>(raw); auto& action = ctx.path_action;
+    try {
+        std::wstring decoded;
+        if (!Widen(action.directory.c_str(), decoded)) throw std::runtime_error("Directory must be valid UTF-8");
+        const auto directory = std::filesystem::path(decoded).lexically_normal();
+        if (!directory.is_absolute()) throw std::runtime_error("Catalog directory must be an absolute path");
+        if (action.copy) {
+            const auto path = (directory / L"index.json").wstring();
+            if (!action.owner || !OpenClipboard(action.owner)) throw std::runtime_error("Cannot open clipboard");
+            struct Close { ~Close() { CloseClipboard(); } } close;
+            const auto memory = GlobalAlloc(GMEM_MOVEABLE, (path.size() + 1) * sizeof(wchar_t));
+            if (!memory) throw std::runtime_error("Cannot allocate clipboard text");
+            const auto text = GlobalLock(memory);
+            if (!text) { GlobalFree(memory); throw std::runtime_error("Cannot access clipboard text"); }
+            std::memcpy(text, path.c_str(), (path.size() + 1) * sizeof(wchar_t)); GlobalUnlock(memory);
+            if (!EmptyClipboard() || !SetClipboardData(CF_UNICODETEXT, memory)) {
+                GlobalFree(memory); throw std::runtime_error("Cannot copy index path");
+            }
+        } else {
+            SHELLEXECUTEINFOW request{sizeof(request)};
+            request.fMask = SEE_MASK_FLAG_NO_UI; request.hwnd = action.owner; request.lpVerb = L"open";
+            request.lpFile = directory.c_str(); request.nShow = SW_SHOWNORMAL;
+            if (!ShellExecuteExW(&request)) throw std::runtime_error("Cannot open catalog directory (Windows error " + std::to_string(GetLastError()) + ")");
+        }
+    } catch (const std::exception& error) { try { PathActionFailure(ctx, error.what()); } catch (...) {} }
+    catch (...) { try { PathActionFailure(ctx, "Unexpected path action exception"); } catch (...) {} }
+    action.pending.store(false);
+}
+void QueuePathAction(Context& ctx, bool copy) {
+    std::string directory(ctx.settings.catalog_path);
+    auto& action = ctx.path_action;
+    if (action.pending.exchange(true)) return;
+    action.directory = std::move(directory); action.copy = copy; action.owner = GetForegroundWindow();
+    { std::lock_guard lock(action.mutex); action.failure.clear(); }
+    CabbirdGenerationHandleV1 task{};
+    if (!Succeeded(ctx.scheduler->schedule(ctx.scheduler->user, 0, RunPathAction, &ctx, &task))) {
+        action.pending.store(false); PathActionFailure(ctx, "Cannot schedule path action");
+    }
+}
 void Request(Context& ctx, bool metadata_only) {
     CabbirdDumpRequestV1 request{}; request.struct_size = sizeof(request);
     if (!metadata_only && ctx.settings.fields) request.flags |= CABBIRD_DUMP_V1_FIELDS;
     if (!metadata_only && ctx.settings.methods) request.flags |= CABBIRD_DUMP_V1_METHODS;
+    if (!metadata_only && ctx.settings.properties) request.flags |= CABBIRD_DUMP_V1_PROPERTIES;
+    if (!metadata_only && ctx.settings.interfaces) request.flags |= CABBIRD_DUMP_V1_INTERFACES;
     if (metadata_only || ctx.settings.metadata) request.flags |= CABBIRD_DUMP_V1_METADATA;
     request.image_filter = ctx.settings.filter; request.image_filter_size = static_cast<std::uint32_t>(std::strlen(ctx.settings.filter));
     std::wstring output, metadata;
@@ -159,18 +223,19 @@ CabbirdStatusV1 CABBIRD_CALL Load(const CabbirdHostApiV1* host, void** output) {
         ctx->ui = services.Query<CabbirdUiServiceV1>(CABBIRD_UI_SERVICE_V1_ID, 1).get();
         ctx->windows = services.Query<CabbirdWindowServiceV1>(CABBIRD_WINDOW_SERVICE_V1_ID, 1).get();
         ctx->config = services.Query<CabbirdConfigServiceV1>(CABBIRD_CONFIG_SERVICE_V1_ID, 1).get();
-        const auto scheduler = services.Query<CabbirdSchedulerServiceV1>(CABBIRD_SCHEDULER_SERVICE_V1_ID, 1);
+        ctx->scheduler = services.Query<CabbirdSchedulerServiceV1>(CABBIRD_SCHEDULER_SERVICE_V1_ID, 1).get();
         if (!ctx->core || ctx->core->struct_size < offsetof(CabbirdCoreServiceV1, log) + sizeof(ctx->core->log) || !ctx->core->log ||
             !ctx->ui || ctx->ui->struct_size < offsetof(CabbirdUiServiceV1, button_enabled) + sizeof(ctx->ui->button_enabled) ||
             !ctx->ui->input_text || !ctx->ui->checkbox || !ctx->ui->button_enabled ||
             !ctx->windows || ctx->windows->struct_size < sizeof(*ctx->windows) || !ctx->windows->register_window || !ctx->windows->begin || !ctx->windows->end ||
             !ctx->config || ctx->config->struct_size < sizeof(*ctx->config) || !ctx->config->register_schema || !ctx->config->read || !ctx->config->write_atomic ||
-            !scheduler || scheduler->struct_size < sizeof(*scheduler.get()) || !scheduler->schedule)
+            !ctx->scheduler || ctx->scheduler->struct_size < sizeof(*ctx->scheduler) || !ctx->scheduler->schedule)
             return {CABBIRD_STATUS_V1_UNAVAILABLE, 0, {}};
         ctx->dump = services.Query<CabbirdUnityDumpServiceV1>(CABBIRD_UNITY_DUMP_SERVICE_V1_ID, 1).get();
         if (ctx->dump && (ctx->dump->struct_size < offsetof(CabbirdUnityDumpServiceV1, state) + sizeof(ctx->dump->state) || !ctx->dump->run || !ctx->dump->state)) ctx->dump = nullptr;
         if (!LoadSettings(*ctx)) return Failed();
         ctx->saves.Bind(host, ctx->config, kSchemaId, 1);
+        if (!ctx->catalog.Bind(host, &ctx->text)) return {CABBIRD_STATUS_V1_UNAVAILABLE, 0, {}};
         *output = ctx.release(); return Ok();
     } catch (...) { return Failed(); }
 }
@@ -188,6 +253,9 @@ CabbirdStatusV1 CABBIRD_CALL Stop(void* raw, std::uint32_t) {
     try { auto& ctx = *static_cast<Context*>(raw); ctx.running = false; return ctx.saves.Flush() ? Ok() : Failed(); } catch (...) { return Failed(); }
 }
 void CABBIRD_CALL Unload(void* raw) { try { delete static_cast<Context*>(raw); } catch (...) {} }
+void CABBIRD_CALL Update(void* raw, double) noexcept {
+    try { static_cast<Context*>(raw)->catalog.Update(); } catch (...) {}
+}
 void CABBIRD_CALL Draw(void* raw, const CabbirdUiServiceV1*) {
     try {
         auto& ctx = *static_cast<Context*>(raw); auto* ui = ctx.ui; auto& s = ctx.settings;
@@ -205,21 +273,39 @@ void CABBIRD_CALL Draw(void* raw, const CabbirdUiServiceV1*) {
         }
         changed |= ui->checkbox(ui->user, StringView(ctx.text.Text("settings.fields", "Fields (names, types, offsets)")), &s.fields) != 0;
         changed |= ui->checkbox(ui->user, StringView(ctx.text.Text("settings.methods", "Methods (+ signatures, RVAs)")), &s.methods) != 0;
+        changed |= ui->checkbox(ui->user, StringView(ctx.text.Text("settings.properties", "Properties (types, accessors)")), &s.properties) != 0;
+        changed |= ui->checkbox(ui->user, StringView(ctx.text.Text("settings.interfaces", "Implemented interfaces")), &s.interfaces) != 0;
         changed |= ui->checkbox(ui->user, StringView(ctx.text.Text("settings.metadata", "Recover plaintext metadata")), &s.metadata) != 0;
-        changed |= ui->input_text(ui->user, StringView(ctx.text.Text("settings.filter", "Image filter")), s.filter, sizeof(s.filter), 0) != 0;
+        changed |= ui->input_text(ui->user, StringView(ctx.text.Text("settings.filter", "Method image filter")), s.filter, sizeof(s.filter), 0) != 0;
+        if (ui->button_enabled(ui->user, StringView(ctx.text.Text("action.all-images", "All method images")), 0, 0, *s.filter != 0)) { s.filter[0] = 0; changed = true; }
         changed |= ui->input_text(ui->user, StringView(ctx.text.Text("settings.output", "Output file")), s.output, sizeof(s.output), 0) != 0;
         changed |= ui->input_text(ui->user, StringView(ctx.text.Text("settings.metadata-path", "Metadata file")), s.metadata_path, sizeof(s.metadata_path), 0) != 0;
+        changed |= ui->input_text(ui->user, StringView(ctx.text.Text("settings.catalog-path", "Resource / Lua directory")), s.catalog_path, sizeof(s.catalog_path), 0) != 0;
+        const int path_enabled = ctx.running && *s.catalog_path && !ctx.path_action.pending.load();
+        if (ui->button_enabled(ui->user, StringView(ctx.text.Text("action.open-catalog", "Open catalog directory")), 0, 0, path_enabled)) QueuePathAction(ctx, false);
+        if (ui->button_enabled(ui->user, StringView(ctx.text.Text("action.copy-index", "Copy index path")), 0, 0, path_enabled)) QueuePathAction(ctx, true);
+        std::string path_failure;
+        { std::lock_guard lock(ctx.path_action.mutex); path_failure = ctx.path_action.failure; }
+        if (!path_failure.empty()) ui->text(ui->user, StringView(path_failure));
         if (changed) Save(ctx);
         const bool busy = ctx.result.state == CABBIRD_DUMP_V1_RESULT_PENDING;
         const int enabled = ctx.running && ctx.dump && !busy;
-        if (ui->button_enabled(ui->user, StringView(ctx.text.Text("action.dump", "Dump now")), 0, 0, enabled && (s.fields || s.methods || s.metadata))) Request(ctx, false);
+        if (ui->button_enabled(ui->user, StringView(ctx.text.Text("action.dump", "Dump now")), 0, 0, enabled && (s.fields || s.methods || s.properties || s.interfaces || s.metadata))) Request(ctx, false);
         if (ui->button_enabled(ui->user, StringView(ctx.text.Text("action.metadata", "Metadata only")), 0, 0, enabled)) Request(ctx, true);
+        if (ui->button_enabled(ui->user, StringView(ctx.text.Text("action.catalog", "Export resource / Lua catalog")), 0, 0, ctx.running && !ctx.catalog.Busy() && *s.catalog_path)) ctx.catalog.Request(s.catalog_path);
+        const auto catalog_result = ctx.catalog.Result();
+        if (!catalog_result.empty()) {
+            if (ui->struct_size >= offsetof(CabbirdUiServiceV1, text_wrapped) + sizeof(ui->text_wrapped) && ui->text_wrapped)
+                ui->text_wrapped(ui->user, StringView(catalog_result));
+            else ui->text(ui->user, StringView(catalog_result));
+        }
     } catch (...) {}
 }
 } // namespace
 CABBIRD_SDK_EXPORT CabbirdStatusV1 CABBIRD_CALL CabbirdPluginEntryV1(CabbirdPluginDescriptorV1* descriptor) {
-    if (!descriptor || descriptor->struct_size < sizeof(*descriptor)) return {CABBIRD_STATUS_V1_INVALID_ARGUMENT, 0, {}};
+    if (!descriptor || descriptor->struct_size < sizeof(*descriptor) || descriptor->api_major != CABBIRD_PLUGIN_API_V1_MAJOR)
+        return {CABBIRD_STATUS_V1_INVALID_ARGUMENT, 0, {}};
     *descriptor = {sizeof(*descriptor), CABBIRD_PLUGIN_API_V1_MAJOR, CABBIRD_PLUGIN_API_V1_MINOR,
-        StringView("cabbird.unity-dump"), StringView("IL2CPP Dump"), StringView("Cabbird"), StringView("1.0.0"), Load, Start, Stop, Unload, nullptr, Draw};
+        StringView("cabbird.unity-dump"), StringView("IL2CPP Dump"), StringView("Cabbird"), StringView("1.1.3"), Load, Start, Stop, Unload, Update, Draw};
     return Ok();
 }

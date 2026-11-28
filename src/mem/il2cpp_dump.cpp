@@ -777,6 +777,7 @@ bool CollectTypeSystemBatch(DumpSnapshot& snapshot, DumpCaptureCursor& cursor,
             DumpImageSnapshot target;
             const char* image_name = api.il2cpp_image_get_name ? api.il2cpp_image_get_name(image) : nullptr;
             target.name = image_name ? image_name : "?";
+            target.methods_filtered = options.include_methods && !MethodImageMatches(target.name, options.method_image_filter);
             target.class_count = api.il2cpp_image_get_class_count(image);
             if (!target.class_count) continue;
             const auto limit = options.max_classes_per_image ? std::min(target.class_count, options.max_classes_per_image) : target.class_count;
@@ -792,6 +793,7 @@ bool CollectTypeSystemBatch(DumpSnapshot& snapshot, DumpCaptureCursor& cursor,
             auto* klass = api.il2cpp_image_get_class ? api.il2cpp_image_get_class(image, cursor.class_index) : nullptr;
             if (!klass) continue;
             DumpClassSnapshot next;
+            const auto faults_before = g_contained_faults.load();
             next.name = QualifyClass(klass);
             next.value_type = api.il2cpp_class_is_valuetype && api.il2cpp_class_is_valuetype(klass);
             auto* parent = api.il2cpp_class_get_parent ? api.il2cpp_class_get_parent(klass) : nullptr;
@@ -799,7 +801,7 @@ bool CollectTypeSystemBatch(DumpSnapshot& snapshot, DumpCaptureCursor& cursor,
             if (options.include_interfaces && api.il2cpp_class_get_interfaces) {
                 void* iterator{};
                 while (auto* iface = GuardedGetInterfaces(api, klass, &iterator)) {
-                    if (next.interfaces.size() == kMaxInterfacesPerClass) break;
+                    if (next.interfaces.size() == kMaxInterfacesPerClass) { next.interfaces_truncated = true; break; }
                     next.interfaces.push_back(QualifyClass(iface));
                 }
             }
@@ -864,6 +866,7 @@ bool CollectTypeSystemBatch(DumpSnapshot& snapshot, DumpCaptureCursor& cursor,
                     ++stats.properties;
                 }
             }
+            next.capture_faulted = g_contained_faults.load() != faults_before;
             target.classes.push_back(std::move(next));
             ++stats.classes;
             report(false);
@@ -897,6 +900,7 @@ void FormatTypeSystem(std::string& out, const DumpSnapshot& snapshot, const Dump
     AppendProvenanceHeader(out, stats, options);
     for (const auto& image : snapshot.images) {
         out += "\n// ===== image: " + image.name + " (" + std::to_string(image.class_count) + " classes)\n\n";
+        if (image.methods_filtered) out += "// METHODS OMITTED: excluded by method_image_filter; empty method lists do not imply stripped code\n\n";
         for (const auto& klass : image.classes) {
             out += klass.value_type ? "public struct " : "public class ";
             out += klass.name;
@@ -904,6 +908,8 @@ void FormatTypeSystem(std::string& out, const DumpSnapshot& snapshot, const Dump
             if (base) out += " : " + klass.parent;
             for (const auto& iface : klass.interfaces) { out += base ? ", " : " : "; out += iface; base = true; }
             out += "\n{\n";
+            if (klass.capture_faulted) out += "    // INCOMPLETE: a runtime metadata call faulted while capturing this class\n";
+            if (klass.interfaces_truncated) out += "    // ... more interfaces elided\n";
             for (const auto& field : klass.fields) {
                 out += "    " + FieldModifiers(field.flags) + field.type + " " + field.name + "; // ";
                 const bool thread_static = (field.flags & kFieldAttributeStatic) && field.offset == kThreadStaticOffset;

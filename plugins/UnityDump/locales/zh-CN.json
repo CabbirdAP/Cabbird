@@ -3,14 +3,24 @@
   "locale": "zh-CN",
   "messages": {
     "window.title": "IL2CPP 导出",
-    "plugin.description": "导出 IL2CPP 类型、方法和元数据",
+    "plugin.description": "导出 IL2CPP 类型、方法、属性、接口、元数据及资源 / Lua 清单",
     "settings.fields": "字段（名称、类型、偏移）",
     "settings.methods": "方法（含签名、RVA）",
+    "settings.properties": "属性（类型、访问器）",
+    "settings.interfaces": "实现的接口",
     "settings.metadata": "恢复明文元数据",
-    "settings.filter": "程序集筛选",
+    "settings.filter": "方法程序集筛选",
     "settings.output": "输出文件",
     "settings.metadata-path": "元数据文件路径",
+    "settings.catalog-path": "资源 / Lua 清单目录",
     "action.dump": "立即导出",
-    "action.metadata": "仅导出元数据"
+    "action.metadata": "仅导出元数据",
+    "action.all-images": "全部方法程序集",
+    "action.catalog": "导出资源 / Lua 清单",
+    "action.open-catalog": "打开清单目录",
+    "action.copy-index": "复制索引路径",
+    "error.path-action": "路径操作失败：{0}",
+    "log.catalog-failed": "资源清单导出失败：{0}",
+    "log.catalog-written": "已将 {0} 个资源和 {1} 个 Lua 模块写入 {2}"
   }
 }

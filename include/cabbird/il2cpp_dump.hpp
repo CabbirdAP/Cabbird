@@ -295,7 +295,7 @@ struct DumpPropertySnapshot {
 };
 struct DumpClassSnapshot {
     std::string name, parent;
-    bool value_type{}, fields_truncated{}, methods_truncated{}, properties_truncated{};
+    bool value_type{}, fields_truncated{}, methods_truncated{}, properties_truncated{}, interfaces_truncated{}, capture_faulted{};
     std::vector<std::string> interfaces;
     std::vector<DumpFieldSnapshot> fields;
     std::vector<DumpMethodSnapshot> methods;
@@ -304,6 +304,7 @@ struct DumpClassSnapshot {
 struct DumpImageSnapshot {
     std::string name;
     std::size_t class_count{};
+    bool methods_filtered{};
     std::vector<DumpClassSnapshot> classes;
 };
 struct DumpSnapshot {
