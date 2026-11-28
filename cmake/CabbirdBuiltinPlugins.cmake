@@ -74,6 +74,12 @@ cabbird_add_plugin(GodMode
     MANIFEST plugins/GodMode/manifest.json
     PACKAGE_NAME GodMode)
 
+cabbird_add_plugin(NoCameraFade
+    SOURCES plugins/NoCameraFade/plugin.cpp
+    MANIFEST plugins/NoCameraFade/manifest.json
+    PACKAGE_NAME NoCameraFade)
+target_compile_options(NoCameraFade PRIVATE /utf-8)
+
 cabbird_add_plugin(Collectibles
     SOURCES plugins/Collectibles/plugin.cpp
     MANIFEST plugins/Collectibles/manifest.json
@@ -96,6 +102,11 @@ cabbird_add_plugin(CameraTools
     PACKAGE_NAME CameraTools)
 target_link_libraries(CameraTools PRIVATE nlohmann_json::nlohmann_json)
 target_compile_options(CameraTools PRIVATE /utf-8)
+
+cabbird_add_plugin(NoSkillCD
+    SOURCES plugins/NoSkillCD/plugin.cpp
+    MANIFEST plugins/NoSkillCD/manifest.json
+    PACKAGE_NAME NoSkillCD)
 
 endif()
 
