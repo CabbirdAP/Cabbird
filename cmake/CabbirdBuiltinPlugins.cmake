@@ -74,6 +74,12 @@ cabbird_add_plugin(GodMode
     MANIFEST plugins/GodMode/manifest.json
     PACKAGE_NAME GodMode)
 
+cabbird_add_plugin(NoCameraFade
+    SOURCES plugins/NoCameraFade/plugin.cpp
+    MANIFEST plugins/NoCameraFade/manifest.json
+    PACKAGE_NAME NoCameraFade)
+target_compile_options(NoCameraFade PRIVATE /utf-8)
+
 cabbird_add_plugin(Collectibles
     SOURCES plugins/Collectibles/plugin.cpp
     MANIFEST plugins/Collectibles/manifest.json

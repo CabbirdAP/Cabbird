@@ -1,0 +1,10 @@
+{
+  "schemaVersion": 1,
+  "locale": "zh-CN",
+  "messages": {
+    "plugin.description": "视角切换时不再虚化角色模型：把相机距离与角度阈值归零，镜头贴近或掠过角色时保持可见",
+    "window.title": "反虚化",
+    "toggle.enabled": "反虚化",
+    "status.label": "状态"
+  }
+}
