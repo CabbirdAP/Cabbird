@@ -28,6 +28,7 @@ constexpr std::size_t kMaximumSections = 96U;
 struct PeImage {
     std::vector<std::uint8_t> bytes;
     DWORD size_of_headers{};
+    DWORD entry_point_rva{};
     std::array<IMAGE_DATA_DIRECTORY, IMAGE_NUMBEROF_DIRECTORY_ENTRIES> directories{};
     std::vector<IMAGE_SECTION_HEADER> sections;
 
@@ -95,21 +96,6 @@ struct LoadedModule {
         EqualInsensitive(value.substr(0, prefix.size()), prefix);
 }
 
-[[nodiscard]] std::filesystem::path NormalizedPath(const std::filesystem::path& path) {
-    std::error_code error;
-    std::filesystem::path normalized = std::filesystem::absolute(path, error);
-    if (error) return path.lexically_normal();
-    const std::filesystem::path canonical =
-        std::filesystem::weakly_canonical(normalized, error);
-    return error ? normalized.lexically_normal() : canonical;
-}
-
-[[nodiscard]] bool SamePath(
-    const std::filesystem::path& left,
-    const std::filesystem::path& right) {
-    return EqualInsensitive(NormalizedPath(left).wstring(), NormalizedPath(right).wstring());
-}
-
 [[nodiscard]] bool IsRegularFile(const std::filesystem::path& path) noexcept {
     std::error_code error;
     return std::filesystem::is_regular_file(path, error) && !error;
@@ -166,6 +152,7 @@ struct LoadedModule {
         return std::nullopt;
     }
     image.size_of_headers = optional_header.SizeOfHeaders;
+    image.entry_point_rva = optional_header.AddressOfEntryPoint;
     const DWORD directory_count = (std::min)(
         optional_header.NumberOfRvaAndSizes,
         static_cast<DWORD>(image.directories.size()));
@@ -446,6 +433,35 @@ private:
             return;
         }
 
+        const IMAGE_DATA_DIRECTORY& tls_directory =
+            image->directories[IMAGE_DIRECTORY_ENTRY_TLS];
+        if (tls_directory.VirtualAddress != 0) {
+            const auto tls_offset = image->OffsetFromRva(tls_directory.VirtualAddress);
+            IMAGE_TLS_DIRECTORY64 tls{};
+            if (tls_directory.Size < sizeof(IMAGE_TLS_DIRECTORY64) ||
+                !tls_offset || !image->Read(*tls_offset, tls)) {
+                Add(
+                    PluginNativeDependencyDiagnosticCode::InvalidPe,
+                    image_path,
+                    image_name,
+                    {},
+                    {},
+                    "PE TLS directory is malformed");
+                return;
+            }
+            if (tls.StartAddressOfRawData != tls.EndAddressOfRawData ||
+                tls.SizeOfZeroFill != 0) {
+                Add(
+                    PluginNativeDependencyDiagnosticCode::UnsupportedStaticTls,
+                    image_path,
+                    image_name,
+                    {},
+                    {},
+                    "plugin images must not declare loader-managed static TLS");
+                return;
+            }
+        }
+
         std::vector<std::string> imports;
         PluginNativeDependencyDiagnosticCode import_code{};
         if (!ReadImports(*image, imports, import_code, failure)) {
@@ -453,6 +469,7 @@ private:
             return;
         }
 
+        bool has_dynamic_crt_import{};
         for (const std::string& import : imports) {
             const auto module_name = NormalizeImportName(import);
             if (!module_name) {
@@ -464,6 +481,9 @@ private:
                     {},
                     "PE import module name is not a plain DLL file name");
                 return;
+            }
+            if (HasPrefix(*module_name, L"api-ms-win-crt-")) {
+                has_dynamic_crt_import = true;
             }
             if (IsApiSetModule(*module_name)) continue;
 
@@ -482,6 +502,7 @@ private:
                 return;
             }
             if (IsCrtModule(*module_name)) {
+                has_dynamic_crt_import = true;
                 if (has_private_candidate) {
                     Add(
                         PluginNativeDependencyDiagnosticCode::PrivateCrtModule,
@@ -532,17 +553,9 @@ private:
 #endif
 
             if (has_private_candidate) {
-                if (const LoadedModule* loaded = FindLoaded(*module_name);
-                    loaded != nullptr && !SamePath(loaded->path, private_candidate)) {
-                    Add(
-                        PluginNativeDependencyDiagnosticCode::ModuleNameConflict,
-                        image_path,
-                        *module_name,
-                        private_candidate,
-                        loaded->path,
-                        "a different module with this private DLL name is already loaded");
-                    return;
-                }
+                // Package-private DLLs are manually mapped in-process rather than bound
+                // through the Windows PEB loader, so they do not collide with modules
+                // already loaded under the same filename elsewhere in the process.
                 Visit(private_candidate);
                 if (!result_.Ok()) return;
                 continue;
@@ -568,6 +581,17 @@ private:
                 "the import is neither a Windows system module nor a sibling private DLL");
             return;
         }
+
+        if (image->entry_point_rva != 0 && !has_dynamic_crt_import) {
+            Add(
+                PluginNativeDependencyDiagnosticCode::UnsupportedStaticCrt,
+                image_path,
+                image_name,
+                {},
+                {},
+                "plugin images must link the dynamic CRT (/MD) for manual mapping");
+            return;
+        }
     }
 
     std::filesystem::path system_directory_;
@@ -586,6 +610,10 @@ std::string_view PluginNativeDependencyDiagnosticCodeName(
             return "invalid-import-name";
         case PluginNativeDependencyDiagnosticCode::UnsupportedDelayImport:
             return "unsupported-delay-import";
+        case PluginNativeDependencyDiagnosticCode::UnsupportedStaticTls:
+            return "unsupported-static-tls";
+        case PluginNativeDependencyDiagnosticCode::UnsupportedStaticCrt:
+            return "unsupported-static-crt";
         case PluginNativeDependencyDiagnosticCode::PrivateCrtModule:
             return "private-crt-module";
         case PluginNativeDependencyDiagnosticCode::PrivateSystemModule:

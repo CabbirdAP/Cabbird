@@ -5,6 +5,7 @@
 #include "cabbird/i18n.hpp"
 #include "cabbird/plugin_capability_policy.hpp"
 #include "cabbird/plugin_dependency_resolver.hpp"
+#include "cabbird/plugin_manual_map.hpp"
 #include "cabbird/plugin_native_dependency.hpp"
 #include "cabbird/plugin_package.hpp"
 #include "cabbird/plugin_profile.hpp"
@@ -4349,7 +4350,7 @@ bool RecoverPluginUiStack(
 }  // namespace
 
 struct PluginManager::LoadedPlugin {
-    HMODULE module{};
+    std::unique_ptr<cabbird::MappedPluginImage> module;
     CabbirdPluginDescriptorV1 descriptor_v1{};
     void* plugin_context{};
     bool waiting_for_service{};
@@ -5221,26 +5222,26 @@ bool PluginManager::LoadBinary(
         return false;
     }
 
-    HMODULE module{};
-    DWORD load_error{ERROR_SUCCESS};
+    cabbird::MappedPluginImage::LoadResult mapped;
     RunPluginLoadStep([&] {
-        const DLL_DIRECTORY_COOKIE search_cookie = AddDllDirectory(binary.parent_path().c_str());
-        module = LoadLibraryExW(
-            binary.c_str(), nullptr, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR |
-                LOAD_LIBRARY_SEARCH_USER_DIRS | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
-        if (module == nullptr) load_error = GetLastError();
-        if (search_cookie != nullptr) RemoveDllDirectory(search_cookie);
+        mapped = cabbird::MappedPluginImage::Load(binary);
     });
-    if (module == nullptr) {
-        reject("load failed for " + source.string() + ": " + std::to_string(load_error));
+    if (!mapped.Ok()) {
+        reject("manual map failed for " + source.string() + ": " + mapped.error);
         discard_shadow();
         return false;
     }
-    const auto unload_module = [&] {
-        RunPluginLoadStep([&] { FreeLibrary(module); });
+    std::unique_ptr<cabbird::MappedPluginImage> module = std::move(mapped.image);
+    const auto unload_module = [&](std::unique_ptr<cabbird::MappedPluginImage>& target) {
+        RunPluginLoadStep([&] {
+            if (target) {
+                target->Unload();
+                target.reset();
+            }
+        });
     };
     const auto entry_v1 = reinterpret_cast<CabbirdPluginEntryV1Fn>(
-        GetProcAddress(module, CABBIRD_PLUGIN_V1_ENTRY_NAME));
+        module->ExportAddress(CABBIRD_PLUGIN_V1_ENTRY_NAME));
     if (entry_v1 != nullptr) {
         CabbirdPluginDescriptorV1 descriptor{};
         // DIVERGENCE FROM UPSTREAM (a bug fix).  Upstream -- and this port,
@@ -5289,7 +5290,7 @@ bool PluginManager::LoadBinary(
                     " struct_size=" + std::to_string(descriptor.struct_size) +
                     " api=" + std::to_string(descriptor.api_major) + "." +
                     std::to_string(descriptor.api_minor));
-            unload_module();
+            unload_module(module);
             discard_shadow();
             return false;
         }
@@ -5297,7 +5298,7 @@ bool PluginManager::LoadBinary(
             return value.data == nullptr ? std::string{} : std::string(value.data, value.size);
         };
         auto plugin = std::make_unique<LoadedPlugin>();
-        plugin->module = module;
+        plugin->module = std::move(module);
         plugin->descriptor_v1 = descriptor;
         plugin->view.id = copy_view(descriptor.id);
         plugin->view.name = copy_view(descriptor.name);
@@ -5310,7 +5311,7 @@ bool PluginManager::LoadBinary(
         if (plugin->view.id != shadow_generation.plugin_id) {
             reject("plugin identity mismatch: manifest=" + shadow_generation.plugin_id +
                     " descriptor=" + plugin->view.id);
-            unload_module();
+            unload_module(plugin->module);
             discard_shadow();
             return false;
         }
@@ -5336,7 +5337,7 @@ bool PluginManager::LoadBinary(
                 [&](const auto& loaded) { return loaded->view.id == plugin->view.id; })) {
             reject("duplicate plugin id: " + plugin->view.id);
             static_cast<void>(plugin->scope->RevokeAll());
-            unload_module();
+            unload_module(plugin->module);
             shadow_store_.Retire(plugin->shadow_generation);
             return false;
         }
@@ -5348,17 +5349,22 @@ bool PluginManager::LoadBinary(
                 quarantined_plugins_.push_back(std::move(plugin));
                 return false;
             }
-            unload_module();
+            unload_module(plugin->module);
             shadow_store_.Retire(plugin->shadow_generation);
             return false;
         }
-        Log(CABBIRD_CORE_LOG_LEVEL_V1_INFO,
-            "loaded ABI v1 " + plugin->view.name + " " + plugin->view.version);
+        {
+            std::ostringstream detail;
+            detail << "loaded ABI v1 " << plugin->view.name << ' ' << plugin->view.version
+                   << " (mapped base=0x" << std::hex << plugin->module->BaseAddress()
+                   << std::dec << " size=" << plugin->module->ImageSize() << ')';
+            Log(CABBIRD_CORE_LOG_LEVEL_V1_INFO, detail.str());
+        }
         plugins_.push_back(std::move(plugin));
         return true;
     }
     reject("plugin does not export the current ABI entry: " + source.string());
-    unload_module();
+    unload_module(module);
     discard_shadow();
     return false;
 }
@@ -5907,7 +5913,10 @@ bool PluginManager::UnloadIndicesWithDeadline(
             stop_diagnostics_.push_back({
                 plugin.view.id, generation, drained, false, 0, resources_before, {}});
         }
-        FreeLibrary(plugin.module);
+        if (plugin.module) {
+            plugin.module->Unload();
+            plugin.module.reset();
+        }
         if (retire_shadow_generations) shadow_store_.Retire(plugin.shadow_generation);
         plugins_.erase(plugins_.begin() + static_cast<std::ptrdiff_t>(index));
     }

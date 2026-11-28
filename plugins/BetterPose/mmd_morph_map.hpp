@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <span>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -61,8 +62,8 @@ struct MorphAliasEntry {
 
 // Standard MMD VMD facial morphs -> common Unity / VRM / ARKit / anime-game BlendShape aliases.
 // Japanese strings below are VMD format identifiers (game/format data), not UI copy.
-inline const std::vector<MorphAliasEntry>& StandardMorphAliasTable() {
-    static const std::vector<MorphAliasEntry> kTable{
+inline std::span<const MorphAliasEntry> StandardMorphAliasTable() noexcept {
+    static constexpr MorphAliasEntry kTable[]{
         // Eyes: blink / smile / wink
         {"まばたき", {"eyeblink", "eyeblinkleft", "eyeblinkright", "eyeclose", "blink", "eye_close", "close", "eyelidclose"}, 1.f}, // i18n-data
         {"笑い", {"eyejoy", "eyesmile", "eyehappy", "joy", "smileeye", "eye_joy", "eye_smile", "happyeye"}, 1.f}, // i18n-data
@@ -131,7 +132,7 @@ inline std::vector<MorphBinding> BuildMorphBindings(const std::vector<VmdMorphTr
         if (!norm.empty()) normMap[norm].push_back(i);
     }
 
-    const auto& aliases = StandardMorphAliasTable();
+    const auto aliases = StandardMorphAliasTable();
     std::unordered_map<std::string_view, const MorphAliasEntry*> aliasLookup;
     for (const auto& entry : aliases) aliasLookup.emplace(entry.mmdName, &entry);
 

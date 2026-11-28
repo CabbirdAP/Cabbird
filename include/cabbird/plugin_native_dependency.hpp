@@ -11,6 +11,8 @@ enum class PluginNativeDependencyDiagnosticCode {
     InvalidPe,
     InvalidImportName,
     UnsupportedDelayImport,
+    UnsupportedStaticTls,
+    UnsupportedStaticCrt,
     PrivateCrtModule,
     PrivateSystemModule,
     CrtRuntimeUnavailable,
